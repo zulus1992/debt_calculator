@@ -6,12 +6,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import unittest
 from typing import Any
 
 from bot import DebtBot, HeuristicParser, handle_text, is_allowed
-from config import Settings, load_settings
+from config import Settings, jwt_role, load_settings, supabase_key_problem
 from debts import name_key, net_balances, normalize_name, totals_by_person
 from deepseek import ParsedMessage, detect_currency, heuristic_parse
 from storage import Debt, InMemoryStorage, StorageError, SupabaseStorage
@@ -512,6 +513,64 @@ class SupabaseStorageTests(unittest.TestCase):
         with self.assertRaises(StorageError) as ctx:
             self.storage.list_debts(1)
         self.assertIn("schema.sql", str(ctx.exception))
+
+
+class SupabaseKeyValidationTests(unittest.TestCase):
+    """Проверка ключа Supabase: anon вместо service_role выявляется ещё до запросов."""
+
+    @staticmethod
+    def make_jwt(role: str) -> str:
+        """Собирает JWT с нужной ролью (подпись не проверяется)."""
+
+        def encode(data: dict) -> str:
+            raw = json.dumps(data).encode("utf-8")
+            return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+        return f"{encode({'alg': 'HS256', 'typ': 'JWT'})}.{encode({'role': role})}.signature"
+
+    def test_jwt_role_detection(self) -> None:
+        self.assertEqual(jwt_role(self.make_jwt("anon")), "anon")
+        self.assertEqual(jwt_role(self.make_jwt("service_role")), "service_role")
+        self.assertIsNone(jwt_role("не-jwt"))
+        self.assertIsNone(jwt_role(""))
+
+    def test_anon_key_is_reported(self) -> None:
+        problem = supabase_key_problem(self.make_jwt("anon")) or ""
+        self.assertIn("anon", problem)
+        self.assertIn("service_role", problem)
+
+    def test_good_keys_pass(self) -> None:
+        self.assertIsNone(supabase_key_problem(self.make_jwt("service_role")))
+        self.assertIsNone(supabase_key_problem("sb_secret_abc123"))
+        self.assertIsNone(supabase_key_problem(""))
+
+    def test_publishable_and_garbage_are_reported(self) -> None:
+        self.assertIn("publishable", supabase_key_problem("sb_publishable_abc") or "")
+        self.assertIn("не похож", supabase_key_problem("просто-строка") or "")
+
+    def test_settings_problems_mention_wrong_role(self) -> None:
+        settings = load_settings(
+            {
+                "TELEGRAM_BOT_TOKEN": "1:abc",
+                "DEEPSEEK_API_KEY": "sk-x",
+                "SUPABASE_URL": "https://example.supabase.co",
+                "SUPABASE_SERVICE_KEY": self.make_jwt("anon"),
+            },
+            use_env_file=False,
+        )
+        self.assertIn("anon", " ".join(settings.problems()))
+
+    def test_settings_accept_service_role(self) -> None:
+        settings = load_settings(
+            {
+                "TELEGRAM_BOT_TOKEN": "1:abc",
+                "DEEPSEEK_API_KEY": "sk-x",
+                "SUPABASE_URL": "https://example.supabase.co",
+                "SUPABASE_SERVICE_KEY": self.make_jwt("service_role"),
+            },
+            use_env_file=False,
+        )
+        self.assertEqual(settings.problems(), [])
 
 
 if __name__ == "__main__":

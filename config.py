@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,8 +77,10 @@ class Settings:
             issues.append("SUPABASE_URL не задан (например https://xxxx.supabase.co)")
         if not self.supabase_key:
             issues.append("SUPABASE_SERVICE_KEY не задан (ключ service_role из настроек проекта)")
-        if self.supabase_key and not self.supabase_key.startswith("ey") and self.supabase_key.count(".") != 2:
-            issues.append("SUPABASE_SERVICE_KEY не похож на JWT-ключ Supabase")
+        else:
+            key_problem = supabase_key_problem(self.supabase_key)
+            if key_problem:
+                issues.append(key_problem)
         return issues
 
 
@@ -93,6 +97,46 @@ def _parse_user_ids(raw: str) -> frozenset[int]:
         if chunk.lstrip("-").isdigit():
             ids.add(int(chunk))
     return frozenset(ids)
+
+
+def jwt_role(token: str) -> str | None:
+    """Роль из payload JWT Supabase: 'anon', 'service_role' или None, если это не JWT."""
+    parts = str(token or "").split(".")
+    if len(parts) != 3:
+        return None
+    payload = parts[1]
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (ValueError, TypeError):
+        return None
+    role = data.get("role") if isinstance(data, dict) else None
+    return str(role) if role else None
+
+
+def supabase_key_problem(key: str) -> str | None:
+    """Проверяет ключ Supabase и возвращает текст проблемы (None — ключ подходит)."""
+    if not key:
+        return None
+    role = jwt_role(key)
+    if role == "service_role":
+        return None
+    if role:
+        return (
+            f"SUPABASE_SERVICE_KEY — ключ с ролью «{role}». Нужен service_role: "
+            "Supabase → Project Settings → API Keys → «Legacy anon, service_role API keys» → "
+            "service_role → Reveal (или новый secret-ключ sb_secret_…)."
+        )
+    if key.startswith("sb_secret_"):
+        return None
+    if key.startswith("sb_publishable_"):
+        return (
+            "SUPABASE_SERVICE_KEY — publishable (публичный) ключ, запись будет отклонена. "
+            "Нужен secret-ключ (sb_secret_…) или legacy service_role."
+        )
+    return (
+        "SUPABASE_SERVICE_KEY не похож ни на JWT (eyJ…), ни на secret-ключ (sb_secret_…): "
+        "проверьте, что скопирован ключ целиком."
+    )
 
 
 def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = True) -> Settings:
