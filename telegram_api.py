@@ -26,11 +26,15 @@ class TelegramBot:
         self._timeout = timeout
         self._session = session or requests
 
-    def call(self, method: str, *, timeout: float | None = None, **payload: Any) -> Any:
-        """Вызывает метод Bot API и возвращает поле result."""
+    def call(self, method: str, *, http_timeout: float | None = None, **payload: Any) -> Any:
+        """Вызывает метод Bot API и возвращает поле result.
+
+        HTTP-таймаут вынесен в отдельный параметр http_timeout: у самого Telegram
+        тоже есть параметр timeout (ожидание апдейтов), и имена не должны пересекаться.
+        """
         url = TELEGRAM_API.format(token=self._token, method=method)
         try:
-            response = self._session.post(url, json=payload, timeout=timeout or self._timeout)
+            response = self._session.post(url, json=payload, timeout=http_timeout or self._timeout)
         except requests.RequestException as exc:
             raise TelegramError(f"Telegram недоступен: {exc}") from exc
 
@@ -75,7 +79,7 @@ class TelegramBot:
         if offset is not None:
             payload["offset"] = offset
         # HTTP-таймаут должен быть больше времени ожидания на стороне Telegram
-        result = self.call("getUpdates", timeout=max(self._timeout, poll_timeout + 10), **payload)
+        result = self.call("getUpdates", http_timeout=max(self._timeout, poll_timeout + 10), **payload)
         return list(result or [])
 
     def send_message(

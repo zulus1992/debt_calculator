@@ -6,14 +6,16 @@
 
 from __future__ import annotations
 
+import json
 import unittest
+from typing import Any
 
 from bot import DebtBot, HeuristicParser, handle_text, is_allowed
 from config import Settings, load_settings
 from debts import name_key, net_balances, normalize_name, totals_by_person
 from deepseek import ParsedMessage, detect_currency, heuristic_parse
-from storage import Debt, InMemoryStorage
-from telegram_api import split_message
+from storage import Debt, InMemoryStorage, StorageError, SupabaseStorage
+from telegram_api import TelegramBot, TelegramError, split_message
 
 CHAT = 555
 
@@ -359,6 +361,157 @@ class RunOnceTests(unittest.TestCase):
         bot.run_once()
         self.assertEqual(storage.list_debts(7), [])
         self.assertIn("настроен только", telegram.sent[0][1])
+
+
+class FakeResponse:
+    """Ответ HTTP-сессии: заданный JSON и статус."""
+
+    def __init__(self, payload: Any, status: int = 200) -> None:
+        self.status_code = status
+        self._payload = payload
+        self.text = json.dumps(payload, ensure_ascii=False)
+        self.content = self.text.encode("utf-8")
+
+    def json(self) -> Any:
+        """Тело ответа как объект."""
+        return self._payload
+
+
+class FakeSession:
+    """Подменяет requests: записывает вызовы и отдаёт заготовленные ответы."""
+
+    def __init__(self, responses: list[FakeResponse] | None = None) -> None:
+        self.responses = list(responses or [])
+        self.calls: list[dict] = []
+
+    def _next(self) -> FakeResponse:
+        """Следующий заготовленный ответ."""
+        if self.responses:
+            return self.responses.pop(0)
+        return FakeResponse({"ok": True, "result": []})
+
+    def post(self, url: str, json: Any = None, timeout: float | None = None,
+             **kwargs: Any) -> FakeResponse:
+        """Имитация requests.post (Telegram, DeepSeek)."""
+        self.calls.append({"method": "POST", "url": url, "payload": json, "timeout": timeout})
+        return self._next()
+
+    def request(self, method: str, url: str, params: Any = None, json: Any = None,
+                headers: Any = None, timeout: float | None = None,
+                **kwargs: Any) -> FakeResponse:
+        """Имитация requests.request (PostgREST/Supabase)."""
+        self.calls.append({
+            "method": method, "url": url, "params": params, "payload": json,
+            "headers": dict(headers or {}), "timeout": timeout,
+        })
+        return self._next()
+
+
+class TelegramClientTests(unittest.TestCase):
+    """Сетевой слой Telegram: проверяем содержимое запросов.
+
+    Регрессия: раньше get_updates падал с TypeError, потому что HTTP-таймаут и
+    параметр Telegram timeout передавались в call() под одним именем.
+    """
+
+    def setUp(self) -> None:
+        self.session = FakeSession()
+        self.bot = TelegramBot("123:abc", session=self.session)
+
+    def test_get_updates_payload(self) -> None:
+        self.session.responses = [FakeResponse({"ok": True, "result": [{"update_id": 1}]})]
+        updates = self.bot.get_updates(5, poll_timeout=25)
+        self.assertEqual(updates, [{"update_id": 1}])
+        call = self.session.calls[0]
+        self.assertTrue(call["url"].endswith("/getUpdates"))
+        self.assertEqual(call["payload"]["timeout"], 25)
+        self.assertEqual(call["payload"]["offset"], 5)
+        self.assertGreater(call["timeout"], 25)  # HTTP-таймаут больше ожидания Telegram
+
+    def test_get_me(self) -> None:
+        self.session.responses = [FakeResponse({"ok": True, "result": {"id": 1, "username": "bot"}})]
+        self.assertEqual(self.bot.get_me()["username"], "bot")
+
+    def test_send_message_splits_and_replies_only_once(self) -> None:
+        self.session.responses = [
+            FakeResponse({"ok": True, "result": {"message_id": 1}}),
+            FakeResponse({"ok": True, "result": {"message_id": 2}}),
+        ]
+        sent = self.bot.send_message(7, "строка\n" * 1000, reply_to=42)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(self.session.calls[0]["payload"]["reply_to_message_id"], 42)
+        self.assertNotIn("reply_to_message_id", self.session.calls[1]["payload"])
+
+    def test_error_mapping(self) -> None:
+        self.session.responses = [FakeResponse({"ok": False, "description": "nope"}, status=401)]
+        with self.assertRaises(TelegramError) as ctx:
+            self.bot.get_me()
+        self.assertIn("401", str(ctx.exception))
+
+        self.session.responses = [FakeResponse({"ok": False, "description": "conflict"}, status=409)]
+        with self.assertRaises(TelegramError) as ctx:
+            self.bot.get_updates()
+        self.assertIn("409", str(ctx.exception))
+
+        self.session.responses = [FakeResponse({"ok": False, "description": "bad"}, status=400)]
+        with self.assertRaises(TelegramError):
+            self.bot.send_message(1, "привет")
+
+
+class SupabaseStorageTests(unittest.TestCase):
+    """Сетевой слой Supabase: payload и параметры запросов PostgREST."""
+
+    def setUp(self) -> None:
+        self.session = FakeSession()
+        self.storage = SupabaseStorage(
+            "https://example.supabase.co/", "service-key", session=self.session,
+        )
+
+    def test_add_debt_payload(self) -> None:
+        self.session.responses = [FakeResponse([{
+            "id": 5, "chat_id": 7, "from_name": "Леша", "to_name": "Дима",
+            "currency": "BYN", "amount": 3.0, "created_at": "2026-01-01T00:00:00+00:00",
+        }])]
+        debt = self.storage.add_debt(7, "Леша", "Дима", "byn", 3, "исходный текст")
+        self.assertEqual((debt.id, debt.currency, debt.amount), (5, "BYN", 3.0))
+        call = self.session.calls[0]
+        self.assertTrue(call["url"].endswith("/rest/v1/debts"))
+        self.assertEqual(call["payload"]["currency"], "BYN")
+        self.assertEqual(call["payload"]["amount"], 3.0)
+        self.assertIn("return=representation", call["headers"]["Prefer"])
+
+    def test_list_and_delete_params(self) -> None:
+        self.session.responses = [FakeResponse([]), FakeResponse([{"id": 1}, {"id": 2}])]
+        self.assertEqual(self.storage.list_debts(7), [])
+        self.assertEqual(self.session.calls[0]["params"]["chat_id"], "eq.7")
+        self.assertEqual(self.session.calls[0]["params"]["order"], "created_at.asc")
+        self.assertEqual(self.storage.delete_debts(7), 2)
+
+    def test_state_roundtrip(self) -> None:
+        self.session.responses = [FakeResponse([]), FakeResponse([]), FakeResponse([{"value": "42"}])]
+        self.assertIsNone(self.storage.get_state("last_update_id"))
+        self.storage.set_state("last_update_id", 42)
+        upsert = self.session.calls[1]
+        self.assertTrue(upsert["url"].endswith("/rest/v1/bot_state"))
+        self.assertEqual(upsert["params"]["on_conflict"], "key")
+        self.assertEqual(upsert["payload"], {"key": "last_update_id", "value": "42"})
+        self.assertEqual(self.storage.get_state("last_update_id"), "42")
+
+    def test_currency_settings(self) -> None:
+        self.session.responses = [FakeResponse([{"default_currency": "usd"}])]
+        self.assertEqual(self.storage.get_default_currency(7, "BYN"), "USD")
+        self.assertEqual(self.session.calls[0]["params"]["select"], "default_currency")
+
+    def test_error_messages(self) -> None:
+        self.session.responses = [FakeResponse({"message": "no"}, status=401)]
+        with self.assertRaises(StorageError) as ctx:
+            self.storage.list_debts(1)
+        self.assertIn("service_role", str(ctx.exception))
+
+        self.session.responses = [FakeResponse({"message": "missing"}, status=404)]
+        with self.assertRaises(StorageError) as ctx:
+            self.storage.list_debts(1)
+        self.assertIn("schema.sql", str(ctx.exception))
 
 
 if __name__ == "__main__":
