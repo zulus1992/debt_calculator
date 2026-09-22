@@ -112,7 +112,8 @@ chmod 600 .env
 python bot.py --check
 ```
 
-Ожидаемый результат — три строки `✓ Telegram`, `✓ DeepSeek`, `✓ Supabase` и `• Telegram: вебхук не установлен`.
+Ожидаемый результат — три строки `✓ Telegram`, `✓ DeepSeek`, `✓ Supabase` (в том числе
+`таблица chat_members доступна`) и `• Telegram: вебхук не установлен`.
 Если какой-то запрос блокируется allowlist'ом, вы увидите ошибку прокси (403/503) или таймаут —
 для такого домена нужна заявка на добавление (форма «Anaconda Notebooks/PythonAnywhere Allow List
 Request» со ссылкой на документацию API), платный аккаунт или Vercel.
@@ -158,6 +159,9 @@ python bot.py --webhook-info        # url, pending 0, без last error
 
 **11. Обновление кода:** `cd ~/debt_calculator && git pull origin hosting`,
 при новых зависимостях `pip install -r requirements.txt`, затем **Reload** на вкладке *Web*.
+Если в обновлении менялась схема БД (появились таблицы или колонки), не забудьте ещё раз выполнить
+`db/schema.sql` в Supabase → SQL Editor: скрипт идемпотентный и просто добавит недостающее
+(например, таблицу `chat_members` и колонки `from_user_id`/`to_user_id`).
 
 **12. Логи:** *Web → Error log* — туда попадают наши логи с таймстампами (старт бота, ошибки
 DeepSeek/Supabase, «Повтор апдейта …»). Быстрая диагностика без логов — `python bot.py --check`
@@ -200,6 +204,7 @@ python bot.py                             # постоянный процесс,
 | В группе бот молчит | так задумано: нужен «@бот …», «/debts@бот» или ответ на сообщение бота. Чтобы он разбирал любые сообщения — `REQUIRE_MENTION=0` и privacy mode **Disable** у @BotFather (`/setprivacy`), иначе Telegram не отдаёт боту обычные сообщения |
 | На PythonAnywhere `--check` ругается на DeepSeek/Supabase (403/503, ошибка прокси) | домен не в allowlist бесплатного аккаунта: заявка на добавление, платный аккаунт или Vercel |
 | На PythonAnywhere в error log `ImportError: No module named webhook` | в WSGI-файле неверный путь к проекту (должен быть `/home/USERNAME/debt_calculator`) или не сделан **Reload** |
+| `Таблица не найдена (HTTP 404): chat_members` | не применена свежая схема: выполните `db/schema.sql` в Supabase → SQL Editor (таблица добавляется идемпотентно) |
 | Хочется «пинговать» сервис, чтобы не остывал | `GET https://<адрес>/api/telegram` отвечает `ok` — годится для uptime-мониторов |
 
 Дальше в этом файле описан **способ 1** — постоянный процесс на панели хостинга.

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 import requests
@@ -25,6 +26,8 @@ class Debt:
     currency: str
     amount: float
     kind: str = "debt"                 # debt — долг, repayment — возврат («Леша вернул Диме 3»)
+    from_user_id: int | None = None    # Telegram user id должника (если узнан среди участников чата)
+    to_user_id: int | None = None      # Telegram user id кредитора
     raw_text: str | None = None
     created_at: str | None = None
     id: int | None = None
@@ -41,6 +44,14 @@ class Debt:
         return f"{self.from_name} → {self.to_name}: {self.amount:.2f} {self.currency}"
 
 
+def _to_int(value: Any) -> int | None:
+    """Приводит значение из БД к int (None, если пусто или не число)."""
+    try:
+        return int(value) if value is not None and str(value).strip() != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _row_to_debt(row: dict[str, Any]) -> Debt:
     """Преобразует строку из БД в Debt."""
     return Debt(
@@ -51,23 +62,65 @@ def _row_to_debt(row: dict[str, Any]) -> Debt:
         currency=str(row.get("currency") or DEFAULT_CURRENCY).upper(),
         amount=float(row.get("amount") or 0),
         kind=str(row.get("kind") or "debt").lower(),
+        from_user_id=_to_int(row.get("from_user_id")),
+        to_user_id=_to_int(row.get("to_user_id")),
         raw_text=row.get("raw_text"),
         created_at=str(row.get("created_at") or "") or None,
     )
 
 
+@dataclass
+class ChatMember:
+    """Участник чата: по нему бот понимает, кто такой «Лешак» или «Дима»."""
+
+    chat_id: int
+    user_id: int
+    username: str = ""                 # без @
+    display_name: str = ""             # «Леша Козлов»
+    aliases: list[str] = field(default_factory=list)   # «Леша», «Лёха» — подсказки для сопоставления
+    last_seen: str | None = None
+
+    @property
+    def label(self) -> str:
+        """Как показывать участника в ответах: «Леша Козлов (@kozlovAlex)»."""
+        name = self.display_name.strip()
+        if self.username:
+            return f"{name} (@{self.username})" if name else f"@{self.username}"
+        return name or (f"id{self.user_id}" if self.user_id else "?")
+
+
+def _row_to_member(row: dict[str, Any]) -> ChatMember:
+    """Преобразует строку chat_members в ChatMember."""
+    aliases = row.get("aliases") or []
+    if isinstance(aliases, str):
+        aliases = [part.strip() for part in aliases.split(",") if part.strip()]
+    return ChatMember(
+        chat_id=int(row.get("chat_id") or 0),
+        user_id=int(row.get("user_id") or 0),
+        username=str(row.get("username") or "").lstrip("@"),
+        display_name=str(row.get("display_name") or ""),
+        aliases=[str(alias) for alias in aliases],
+        last_seen=str(row.get("last_seen") or "") or None,
+    )
+
+
 class Storage(Protocol):
-    """Интерфейс хранилища долгов и настроек чата."""
+    """Интерфейс хранилища долгов, участников чата и настроек."""
 
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
                  amount: float, raw_text: str | None = None,
-                 kind: str = "debt") -> Debt: ...
+                 kind: str = "debt", from_user_id: int | None = None,
+                 to_user_id: int | None = None) -> Debt: ...
 
     def list_debts(self, chat_id: int) -> list[Debt]: ...
 
     def delete_debts(self, chat_id: int) -> int: ...
 
     def delete_last_debt(self, chat_id: int) -> Debt | None: ...
+
+    def remember_member(self, member: ChatMember) -> None: ...
+
+    def list_members(self, chat_id: int) -> list[ChatMember]: ...
 
     def get_default_currency(self, chat_id: int, fallback: str = DEFAULT_CURRENCY) -> str: ...
 
@@ -89,6 +142,7 @@ class SupabaseStorage:
         debts_table: str = "debts",
         settings_table: str = "bot_settings",
         state_table: str = "bot_state",
+        members_table: str = "chat_members",
         timeout: float = 30.0,
         session: Any = None,
     ) -> None:
@@ -101,6 +155,7 @@ class SupabaseStorage:
         self._debts_table = debts_table
         self._settings_table = settings_table
         self._state_table = state_table
+        self._members_table = members_table
         self._timeout = timeout
         self._session = session or requests
 
@@ -164,7 +219,8 @@ class SupabaseStorage:
 
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
                  amount: float, raw_text: str | None = None,
-                 kind: str = "debt") -> Debt:
+                 kind: str = "debt", from_user_id: int | None = None,
+                 to_user_id: int | None = None) -> Debt:
         """Сохраняет запись (долг или возврат) и возвращает её."""
         kind = str(kind or "debt").lower()
         rows = self._request(
@@ -174,6 +230,8 @@ class SupabaseStorage:
                 "chat_id": chat_id,
                 "from_name": from_name,
                 "to_name": to_name,
+                "from_user_id": from_user_id,
+                "to_user_id": to_user_id,
                 "currency": currency.upper(),
                 "amount": round(float(amount), 2),
                 "kind": kind,
@@ -186,7 +244,7 @@ class SupabaseStorage:
         return Debt(
             chat_id=chat_id, from_name=from_name, to_name=to_name,
             currency=currency.upper(), amount=round(float(amount), 2), kind=kind,
-            raw_text=raw_text,
+            from_user_id=from_user_id, to_user_id=to_user_id, raw_text=raw_text,
         )
 
     def list_debts(self, chat_id: int) -> list[Debt]:
@@ -236,6 +294,37 @@ class SupabaseStorage:
             prefer="return=representation",
         )
         return debt
+
+    def remember_member(self, member: ChatMember) -> None:
+        """Запоминает участника чата (upsert по паре chat_id + user_id)."""
+        self._request(
+            "POST",
+            self._members_table,
+            params={"on_conflict": "chat_id,user_id"},
+            payload={
+                "chat_id": member.chat_id,
+                "user_id": member.user_id,
+                "username": member.username or None,
+                "display_name": member.display_name,
+                "aliases": list(member.aliases),
+                "last_seen": member.last_seen or datetime.now(timezone.utc).isoformat(),
+            },
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+    def list_members(self, chat_id: int) -> list[ChatMember]:
+        """Участники чата, которых бот успел запомнить (для сопоставления имён)."""
+        rows = self._request(
+            "GET",
+            self._members_table,
+            params={
+                "chat_id": f"eq.{chat_id}",
+                "select": "chat_id,user_id,username,display_name,aliases,last_seen",
+                "order": "display_name.asc",
+                "limit": 200,
+            },
+        )
+        return [_row_to_member(row) for row in rows or []]
 
     def get_default_currency(self, chat_id: int, fallback: str = DEFAULT_CURRENCY) -> str:
         """Валюта по умолчанию для чата."""
@@ -288,11 +377,13 @@ class InMemoryStorage:
     debts: list[Debt] = field(default_factory=list)
     currencies: dict[int, str] = field(default_factory=dict)
     state: dict[str, str] = field(default_factory=dict)
+    members: dict[tuple[int, int], ChatMember] = field(default_factory=dict)
     _next_id: int = 1
 
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
                  amount: float, raw_text: str | None = None,
-                 kind: str = "debt") -> Debt:
+                 kind: str = "debt", from_user_id: int | None = None,
+                 to_user_id: int | None = None) -> Debt:
         """Добавляет запись (долг или возврат) в память."""
         debt = Debt(
             id=self._next_id,
@@ -302,6 +393,8 @@ class InMemoryStorage:
             currency=currency.upper(),
             amount=round(float(amount), 2),
             kind=str(kind or "debt").lower(),
+            from_user_id=from_user_id,
+            to_user_id=to_user_id,
             raw_text=raw_text,
             created_at="1970-01-01T00:00:00+00:00",
         )
@@ -325,6 +418,24 @@ class InMemoryStorage:
             if self.debts[index].chat_id == chat_id:
                 return self.debts.pop(index)
         return None
+
+    def remember_member(self, member: ChatMember) -> None:
+        """Запоминает участника чата в памяти."""
+        self.members[(member.chat_id, member.user_id)] = ChatMember(
+            chat_id=member.chat_id,
+            user_id=member.user_id,
+            username=member.username,
+            display_name=member.display_name or member.username or f"id{member.user_id}",
+            aliases=list(member.aliases),
+            last_seen=member.last_seen or "1970-01-01T00:00:00+00:00",
+        )
+
+    def list_members(self, chat_id: int) -> list[ChatMember]:
+        """Участники чата из памяти."""
+        return [
+            member for (member_chat, _), member in self.members.items()
+            if member_chat == chat_id
+        ]
 
     def get_default_currency(self, chat_id: int, fallback: str = DEFAULT_CURRENCY) -> str:
         """Валюта по умолчанию для чата."""

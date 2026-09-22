@@ -5,9 +5,10 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
-from storage import Debt
+from members import label_for, member_by_id
+from storage import ChatMember, Debt
 
 MAX_ROWS_IN_HISTORY = 15
 
@@ -54,27 +55,50 @@ def name_key(name: str) -> str:
     return key
 
 
-def canonical_names(debts: Sequence[Debt]) -> dict[str, str]:
-    """Ключ имени -> отображаемое имя (предпочитается именительная форма)."""
-    names: dict[str, str] = {}
+def identity_of(user_id: int | None, name: str) -> str:
+    """Ключ человека: user id, если он известен, иначе имя в нормальном виде.
+
+    Именно поэтому «Лешак» и «Леша» в одном чате — один и тот же человек: оба сообщения
+    ссылаются на одного участника (@kozlovAlex), и учёт идёт по этому ключу, а не по строке.
+    """
+    if user_id:
+        return f"id:{int(user_id)}"
+    key = name_key(name)
+    return f"name:{key}" if key else ""
+
+
+def person_labels(debts: Sequence[Debt], members: Sequence[ChatMember] = ()) -> dict[str, str]:
+    """Ключ человека -> подпись: «Леша Козлов (@kozlovAlex)» или просто «Леша»."""
+    labels: dict[str, str] = {}
     for debt in debts:
-        for raw in (debt.from_name, debt.to_name):
-            display = normalize_name(raw)
-            if not display:
+        sides = ((debt.from_user_id, debt.from_name), (debt.to_user_id, debt.to_name))
+        for user_id, name in sides:
+            key = identity_of(user_id, name)
+            if not key:
                 continue
-            key = name_key(display)
-            current = names.get(key)
-            if current is None or (_case_rank(display) < _case_rank(current)):
-                names[key] = display
-    return names
+            member = member_by_id(user_id, members)
+            if member is not None:
+                labels[key] = member.label          # участник узнан — показываем ник
+                continue
+            display = normalize_name(name)
+            current = labels.get(key)
+            if display and (current is None or _case_rank(display) < _case_rank(current)):
+                labels[key] = display
+    return labels
 
 
-def net_balances(debts: Sequence[Debt]) -> list[Balance]:
+def _label(labels: Mapping[str, str], key: str) -> str:
+    """Подпись человека по ключу (если её почему-то нет — сам ключ без префикса)."""
+    return labels.get(key) or key.split(":", 1)[-1].capitalize()
+
+
+def net_balances(debts: Sequence[Debt], members: Sequence[ChatMember] = ()) -> list[Balance]:
     """Сальдо по парам с взаимозачётом: (A→B 10) + (B→A 4) = A→B 6."""
-    display = canonical_names(debts)
+    labels = person_labels(debts, members)
     pairs: dict[tuple[str, str, str], float] = defaultdict(float)
     for debt in debts:
-        debtor, creditor = name_key(debt.from_name), name_key(debt.to_name)
+        debtor = identity_of(debt.from_user_id, debt.from_name)
+        creditor = identity_of(debt.to_user_id, debt.to_name)
         if not debtor or not creditor or debtor == creditor:
             continue
         currency = (debt.currency or "BYN").upper()
@@ -92,23 +116,25 @@ def net_balances(debts: Sequence[Debt]) -> list[Balance]:
 
         net = round(amount - pairs.get(backward, 0.0), 2)
         if net > 0:
-            balances.append(Balance(display[debtor_key], display[creditor_key], currency, net))
+            balances.append(Balance(_label(labels, debtor_key), _label(labels, creditor_key),
+                                    currency, net))
         elif net < 0:
-            balances.append(Balance(display[creditor_key], display[debtor_key], currency, abs(net)))
+            balances.append(Balance(_label(labels, creditor_key), _label(labels, debtor_key),
+                                    currency, abs(net)))
     balances.sort(key=lambda item: (-item.amount, item.currency, item.debtor))
     return balances
 
 
 def totals_by_person(
-    debts: Sequence[Debt],
+    debts: Sequence[Debt], members: Sequence[ChatMember] = (),
 ) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
     """Итоги по людям: (сколько каждый должен, сколько должны каждому) по валютам."""
-    display = canonical_names(debts)
+    labels = person_labels(debts, members)
     owes: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     owed: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for debt in debts:
-        debtor = display.get(name_key(debt.from_name)) or normalize_name(debt.from_name)
-        creditor = display.get(name_key(debt.to_name)) or normalize_name(debt.to_name)
+        debtor = _label(labels, identity_of(debt.from_user_id, debt.from_name))
+        creditor = _label(labels, identity_of(debt.to_user_id, debt.to_name))
         currency = (debt.currency or "BYN").upper()
         sign = -1.0 if debt.is_repayment else 1.0      # возврат уменьшает «должен» и «должны»
         owes[debtor][currency] += sign * float(debt.amount)
@@ -124,34 +150,38 @@ def _money_by_currency(values: dict[str, float]) -> str:
     return ", ".join(f"{amount:.2f} {code}" for code, amount in sorted(values.items()))
 
 
-def format_debt_saved(debt: Debt, used_default_currency: bool) -> str:
-    """Ответ на успешно записанный долг."""
-    lines = [
+def format_debt_saved(debt: Debt, members: Sequence[ChatMember] = ()) -> str:
+    """Ответ на успешно записанный долг: сразу видно, каких участников узнали."""
+    return "\n".join([
         "✅ Записал долг:",
-        f"• Кто должен: {debt.from_name}",
-        f"• Кому: {debt.to_name}",
+        f"• Кто должен: {label_for(debt.from_user_id, debt.from_name, members)}",
+        f"• Кому: {label_for(debt.to_user_id, debt.to_name, members)}",
         f"• Сумма: {debt.amount:.2f} {debt.currency}",
-    ]
-    if used_default_currency:
-        lines.append(f"(валюта не указана — взял по умолчанию: {debt.currency})")
-    return "\n".join(lines)
+    ])
 
 
-def format_repayment_saved(debt: Debt, used_default_currency: bool) -> str:
+def format_repayment_saved(debt: Debt, members: Sequence[ChatMember] = ()) -> str:
     """Ответ на записанный возврат долга."""
-    lines = [
+    return "\n".join([
         "↩️ Записал возврат долга:",
-        f"• Кто вернул: {debt.from_name}",
-        f"• Кому вернул: {debt.to_name}",
+        f"• Кто вернул: {label_for(debt.from_user_id, debt.from_name, members)}",
+        f"• Кому вернул: {label_for(debt.to_user_id, debt.to_name, members)}",
         f"• Сумма: {debt.amount:.2f} {debt.currency}",
-    ]
-    if used_default_currency:
-        lines.append(f"(валюта не указана — взял по умолчанию: {debt.currency})")
-    lines.append("Итог с учётом возврата: /debts")
-    return "\n".join(lines)
+        "Итог с учётом возврата: /debts",
+    ])
 
 
-def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN") -> str:
+def _row_line(debt: Debt, labels: Mapping[str, str]) -> str:
+    """Строка записи для отчёта: «Леша Козлов → Дмитрий Болт: 3.00 BYN»."""
+    left = _label(labels, identity_of(debt.from_user_id, debt.from_name))
+    right = _label(labels, identity_of(debt.to_user_id, debt.to_name))
+    if debt.is_repayment:
+        return f"↩️ {left} вернул {right}: {debt.amount:.2f} {debt.currency}"
+    return f"{left} → {right}: {debt.amount:.2f} {debt.currency}"
+
+
+def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN",
+                        members: Sequence[ChatMember] = ()) -> str:
     """Отчёт по долгам: сальдо по парам, итоги по людям и сами записи."""
     if not debts:
         return (
@@ -159,8 +189,9 @@ def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN") ->
             f"(валюта по умолчанию: {default_currency})."
         )
 
-    balances = net_balances(debts)
-    owes, owed = totals_by_person(debts)
+    labels = person_labels(debts, members)
+    balances = net_balances(debts, members)
+    owes, owed = totals_by_person(debts, members)
     debts_only = [debt for debt in debts if not debt.is_repayment]
     repayments = [debt for debt in debts if debt.is_repayment]
     total_by_currency: dict[str, float] = defaultdict(float)
@@ -196,7 +227,7 @@ def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN") ->
     if repayments:
         lines.append("")
         lines.append("Возвраты (учтены в зачёте):")
-        lines.extend(f"• {debt.pretty()}" for debt in repayments[:MAX_ROWS_IN_HISTORY])
+        lines.extend(f"• {_row_line(debt, labels)}" for debt in repayments[:MAX_ROWS_IN_HISTORY])
 
     if debts_only:
         lines.append("")
@@ -207,7 +238,7 @@ def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN") ->
     if len(debts) <= MAX_ROWS_IN_HISTORY:
         lines.append("")
         lines.append("Все записи:")
-        lines.extend(f"• {debt.pretty()}" for debt in debts)
+        lines.extend(f"• {_row_line(debt, labels)}" for debt in debts)
     return "\n".join(lines)
 
 

@@ -15,9 +15,11 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import requests
+
+from members import format_roster
 
 INTENTS = ("debt", "repayment", "debts", "set_currency", "help", "none")
 
@@ -35,11 +37,13 @@ CURRENCY_SYNONYMS: dict[str, tuple[str, ...]] = {
 }
 
 DEBT_VERBS = r"(?:должен|должна|должны|задолжал[аи]?|одолжил[а]?|занял[а]?|owes?|must\s+pay)"
+# Имя: обычное слово от двух букв или местоимение «я» («я должен Диме 3» — долг на автора).
+NAME_TOKEN = r"(?:[A-Za-zА-Яа-яЁё][\w\-]{1,29}|[Яя])"
 NAME_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё][\w\-]{1,29}")
 NUMBER_RE = re.compile(r"\d+(?:[.,]\d{1,2})?")
 DEBT_RE = re.compile(
-    rf"(?P<debtor>[A-Za-zА-Яа-яЁё][\w\-]{{1,29}})\s+{DEBT_VERBS}\s+(?:у\s+|от\s+)?"
-    rf"(?P<creditor>[A-Za-zА-Яа-яЁё][\w\-]{{1,29}})\s*(?:—|-|:)?\s*"
+    rf"(?P<debtor>{NAME_TOKEN})\s+{DEBT_VERBS}\s+(?:у\s+|от\s+)?"
+    rf"(?P<creditor>{NAME_TOKEN})\s*(?:—|-|:)?\s*"
     rf"(?P<amount>\d+(?:[.,]\d{{1,2}})?)?(?P<tail>[^\n]*)",
     re.IGNORECASE,
 )
@@ -50,9 +54,9 @@ REPAYMENT_VERBS = (
     r"рассчитал(?:ся|ась|ись)?|returned|repaid|paid\s+back)"
 )
 REPAYMENT_RE = re.compile(
-    rf"(?P<payer>[A-Za-zА-Яа-яЁё][\w\-]{{1,29}})\s+{REPAYMENT_VERBS}\s+"
+    rf"(?P<payer>{NAME_TOKEN})\s+{REPAYMENT_VERBS}\s+"
     rf"(?:мне\s+|долг\s+)?(?:у\s+|от\s+|для\s+|с\s+)?"
-    rf"(?P<payee>[A-Za-zА-Яа-яЁё][\w\-]{{1,29}})\s*(?:—|-|:)?\s*"
+    rf"(?P<payee>{NAME_TOKEN})\s*(?:—|-|:)?\s*"
     rf"(?P<amount>\d+(?:[.,]\d{{1,2}})?)?(?P<tail>[^\n]*)",
     re.IGNORECASE,
 )
@@ -73,6 +77,8 @@ class ParsedMessage:
     intent: str = "none"
     from_name: str | None = None
     to_name: str | None = None
+    from_user_id: int | None = None      # Telegram user id должника/плательщика (если узнан)
+    to_user_id: int | None = None        # Telegram user id кредитора/получателя
     currency: str | None = None
     amount: float | None = None
     note: str | None = None
@@ -103,7 +109,7 @@ class ParsedMessage:
 
 SYSTEM_PROMPT = """Ты — разборщик сообщений о долгах для телеграм-бота (русский и английский).
 Верни ТОЛЬКО JSON без пояснений:
-{"intent":"debt|repayment|debts|set_currency|help|none","from":"имя","to":"имя","currency":"BYN","amount":3.0,"note":"короткое пояснение"}
+{"intent":"debt|repayment|debts|set_currency|help|none","from":"имя","to":"имя","from_user_id":123,"to_user_id":456,"currency":"BYN","amount":3.0,"note":"короткое пояснение"}
 
 Правила:
 1. intent=debt — кто-то кому-то должен: «Леша должен Диме 3 рубля», «Маша заняла у Пети 10$».
@@ -118,7 +124,24 @@ SYSTEM_PROMPT = """Ты — разборщик сообщений о долга�
 6. intent=help — спрашивают, что умеет бот.
 7. intent=none — всё остальное (в note коротко почему).
 8. Имена приводи к именительному падежу (кто?): «Диме»/«Диму» → «Дима», «Леше» → «Леша»,
-   «Пете» → «Петя». Пиши только само имя, без лишних слов."""
+   «Пете» → «Петя». Пиши только само имя, без лишних слов.
+9. Тип операции определяй сам по смыслу сообщения: «должен», «занял», «одолжил» — это debt;
+   «вернул», «отдал», «погасил», «рассчитался», «закрыл долг» — это repayment. Не путай их:
+   возврат уменьшает долг, а не создаёт новый.
+10. Если ниже дан список участников чата, сопоставь людей из сообщения с ним: «Лешак» может
+    оказаться «Леша Козлов» (@kozlovAlex). Когда совпадение уверенное — заполни from_user_id
+    и to_user_id идентификаторами из списка. Сомневаешься — оставь id пустыми.
+11. «я», «мне», «меня», «мой» — это автор сообщения (он указан в списке): бери его имя и id."""
+
+
+def _to_user_id(value: Any) -> int | None:
+    """Приводит id участника из ответа модели к int (None — если пусто или не число)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value or "").strip()
+    return int(text) if text.lstrip("-").isdigit() else None
 
 
 class DeepSeekParser:
@@ -139,16 +162,23 @@ class DeepSeekParser:
         self._timeout = timeout
         self._session = session or requests
 
-    def parse(self, text: str, default_currency: str = "BYN") -> ParsedMessage:
-        """Разбирает текст: сначала DeepSeek, при сбое — офлайн-эвристики."""
+    def parse(self, text: str, default_currency: str = "BYN", *,
+              members: Sequence[Any] = (), author: Any = None) -> ParsedMessage:
+        """Разбирает текст: сначала DeepSeek, при сбое — офлайн-эвристики.
+
+        `members` и `author` — состав чата и автор сообщения: по ним модель понимает,
+        что «Лешак» из сообщения — это Леша Козлов (@kozlovAlex, id=…), и возвращает
+        from_user_id / to_user_id, чтобы учёт шёл по пользователям, а не по строкам имён.
+        """
         prompt = (
             f"Валюта по умолчанию: {default_currency}.\n"
             f"Сообщение пользователя: {text}"
         )
+        roster = format_roster(list(members or []), author)
         error_note: str | None = None
         parsed: ParsedMessage | None = None
         try:
-            parsed = self._to_message(self._complete(prompt))
+            parsed = self._to_message(self._complete(prompt, roster=roster))
         except DeepSeekError as exc:
             error_note = str(exc)
 
@@ -166,14 +196,15 @@ class DeepSeekParser:
             source="fallback",
         )
 
-    def _complete(self, user_prompt: str) -> str:
-        """Запрос к DeepSeek в JSON-режиме."""
+    def _complete(self, user_prompt: str, roster: str = "") -> str:
+        """Запрос к DeepSeek в JSON-режиме (roster — состав чата для сопоставления имён)."""
         if not self._api_key:
             raise DeepSeekError("Не задан DEEPSEEK_API_KEY.")
+        system = SYSTEM_PROMPT if not roster else f"{SYSTEM_PROMPT}\n\n{roster}"
         payload = {
             "model": self._model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0,
@@ -228,6 +259,8 @@ class DeepSeekParser:
             intent=intent,
             from_name=_to_name(data.get("from")),
             to_name=_to_name(data.get("to")),
+            from_user_id=_to_user_id(data.get("from_user_id")),
+            to_user_id=_to_user_id(data.get("to_user_id")),
             currency=_to_currency(data.get("currency")),
             amount=_to_amount(data.get("amount")),
             note=_to_name(data.get("note")),

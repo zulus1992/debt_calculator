@@ -25,6 +25,7 @@ DEFAULT_CURRENCY = "BYN"
 DEFAULT_DEBTS_TABLE = "debts"
 DEFAULT_SETTINGS_TABLE = "bot_settings"
 DEFAULT_STATE_TABLE = "bot_state"
+DEFAULT_MEMBERS_TABLE = "chat_members"
 
 
 class ConfigError(RuntimeError):
@@ -58,6 +59,7 @@ class Settings:
     debts_table: str = DEFAULT_DEBTS_TABLE
     settings_table: str = DEFAULT_SETTINGS_TABLE
     state_table: str = DEFAULT_STATE_TABLE
+    members_table: str = DEFAULT_MEMBERS_TABLE
     default_currency: str = DEFAULT_CURRENCY
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)
     request_timeout: float = 30.0
@@ -210,6 +212,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         debts_table=get("DEBTS_TABLE", DEFAULT_DEBTS_TABLE),
         settings_table=get("SETTINGS_TABLE", DEFAULT_SETTINGS_TABLE),
         state_table=get("BOT_STATE_TABLE", DEFAULT_STATE_TABLE),
+        members_table=get("MEMBERS_TABLE", DEFAULT_MEMBERS_TABLE),
         default_currency=get("DEFAULT_CURRENCY", DEFAULT_CURRENCY).upper(),
         allowed_user_ids=_parse_user_ids(get("ALLOWED_USER_IDS")),
         request_timeout=timeout,

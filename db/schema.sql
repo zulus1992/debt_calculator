@@ -40,6 +40,38 @@ end $$;
 comment on column public.debts.kind is
     'debt — долг, repayment — возврат: from_name вернул to_name сумму amount';
 
+-- Привязка записей к пользователям Telegram: если бот узнал человека в списке участников
+-- чата, долг хранится на его user id, а не только на имя (тогда «Лешак» и «Леша» — одно лицо).
+alter table public.debts add column if not exists from_user_id bigint;
+alter table public.debts add column if not exists to_user_id   bigint;
+comment on column public.debts.from_user_id is 'Telegram user id должника/плательщика (если узнан)';
+comment on column public.debts.to_user_id   is 'Telegram user id кредитора/получателя (если узнан)';
+
+create index if not exists debts_users_idx
+    on public.debts (chat_id, from_user_id, to_user_id);
+
+-- Участники чата: бот запоминает авторов сообщений, чтобы понимать, кто такой «Лешак»,
+-- и сопоставлять имена из сообщений с реальными пользователями (@ники и id).
+create table if not exists public.chat_members (
+    chat_id      bigint      not null,
+    user_id      bigint      not null,
+    username     text,
+    display_name text        not null default '',
+    aliases      text[]      not null default '{}',
+    last_seen    timestamptz not null default now(),
+    primary key (chat_id, user_id)
+);
+
+comment on table public.chat_members is
+    'Участники чата: id, @ник, имя и алиасы — по ним долги привязываются к пользователям';
+comment on column public.chat_members.aliases is
+    'Как ещё зовут человека в чате: «Леша», «Лёха» — подсказка для сопоставления имён';
+
+create index if not exists chat_members_chat_idx
+    on public.chat_members (chat_id);
+
+alter table public.chat_members enable row level security;
+
 create table if not exists public.bot_settings (
     chat_id          bigint      not null primary key,
     default_currency text        not null default 'BYN',
@@ -84,4 +116,6 @@ select 'debts' as table_name, count(*) as rows from public.debts
 union all
 select 'bot_settings', count(*) from public.bot_settings
 union all
-select 'bot_state', count(*) from public.bot_state;
+select 'bot_state', count(*) from public.bot_state
+union all
+select 'chat_members', count(*) from public.chat_members;

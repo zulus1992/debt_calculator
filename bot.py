@@ -24,7 +24,7 @@ import re
 import signal
 import sys
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from config import (
     ConfigError,
@@ -48,7 +48,12 @@ from deepseek import (
     detect_currency,
     heuristic_parse,
 )
-from storage import InMemoryStorage, Storage, StorageError, SupabaseStorage
+from members import (
+    format_roster,
+    member_from_telegram,
+    resolve_side,
+)
+from storage import ChatMember, InMemoryStorage, Storage, StorageError, SupabaseStorage
 from telegram_api import TelegramBot, TelegramError
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -74,8 +79,13 @@ LAST_UPDATE_ID_KEY = "last_update_id"
 class HeuristicParser:
     """Разбор только офлайн-эвристиками: демо-режим и тесты без DeepSeek."""
 
-    def parse(self, text: str, default_currency: str = "BYN") -> ParsedMessage:
-        """Разбирает текст регулярными выражениями."""
+    def parse(self, text: str, default_currency: str = "BYN", *,
+              members: Sequence[Any] = (), author: Any = None) -> ParsedMessage:
+        """Разбирает текст регулярными выражениями.
+
+        Состав чата здесь не нужен: имена из текста сопоставляются с участниками
+        уже в handle_text (resolve_side), поэтому параметры принимаются и игнорируются.
+        """
         parsed = heuristic_parse(text, default_currency)
         if parsed is not None:
             return parsed
@@ -100,6 +110,38 @@ def set_default_currency(text_value: str, chat_id: int, storage: Storage,
     return format_currency_set(code)
 
 
+def _load_members(storage: Storage, chat_id: int) -> list[ChatMember]:
+    """Состав чата из хранилища; ошибка чтения не должна ломать ответ боту."""
+    try:
+        return list(storage.list_members(chat_id))
+    except StorageError as exc:
+        logger.warning("Не удалось прочитать участников чата: %s", exc)
+        return []
+
+
+def _member_name(member: ChatMember | None, fallback: str) -> str:
+    """Имя для хранения: имя участника, его ник или то, как написали в сообщении."""
+    if member is not None:
+        if member.display_name.strip():
+            return member.display_name.strip()
+        if member.username:
+            return member.username
+    return normalize_name(fallback)
+
+
+def _unrecognized_note(members: Sequence[ChatMember], missing: Sequence[str]) -> str:
+    """Подсказка, если кого-то не узнали: как связать имя с человеком в чате."""
+    names = [str(name).strip() for name in missing if str(name or "").strip()]
+    if not names:
+        return ""
+    if not members:
+        return (
+            "\nℹ️ Участников чата я пока не знаю — записал по имени. "
+            "Пусть каждый напишет пару слов в чат, и я запомню, кто есть кто."
+        )
+    return f"\nℹ️ Не узнал: {', '.join(names)} — записал по имени."
+
+
 def handle_text(
     text: str,
     chat_id: int,
@@ -107,12 +149,18 @@ def handle_text(
     storage: Storage,
     parser: Any,
     settings: Settings,
+    members: Sequence[ChatMember] | None = None,
+    author: ChatMember | None = None,
 ) -> str:
     """Обрабатывает одно сообщение и формирует ответ бота.
 
     Функция не знает про Telegram — это делает её простой для тестов.
+    `members` и `author` — состав чата и автор сообщения: по ним ИИ (и локальный
+    резолвер) понимают, кто такой «Лешак» из текста, и запись привязывается к user id.
     """
     raw = (text or "").strip()
+    if members is None:
+        members = _load_members(storage, chat_id)
     if not raw:
         return format_help(settings.default_currency)
 
@@ -123,7 +171,7 @@ def handle_text(
     if command in ("/start", "/help"):
         return format_help(default_currency)
     if command == "/debts":
-        return format_debts_report(storage.list_debts(chat_id), default_currency)
+        return format_debts_report(storage.list_debts(chat_id), default_currency, members)
     if command == "/currency":
         return set_default_currency(argument or raw, chat_id, storage, default_currency)
     if command == "/reset":
@@ -135,40 +183,37 @@ def handle_text(
             return "📭 Записей нет — удалять нечего."
         return f"🗑 Удалил последнюю запись: {removed.pretty()}"
 
-    parsed = parser.parse(raw, default_currency)
+    parsed = parser.parse(raw, default_currency, members=members, author=author)
     explicit_currency = detect_currency(raw)
 
-    if parsed.intent == "debt":
-        if not parsed.is_debt:
-            return NOT_A_DEBT_REPLY
+    if parsed.intent in ("debt", "repayment"):
+        # Тип операции определяет ИИ по смыслу: «должен» — долг, «вернул» — возврат.
+        is_repayment = parsed.intent == "repayment"
+        if not (parsed.is_repayment if is_repayment else parsed.is_debt):
+            return NOT_A_REPAYMENT_REPLY if is_repayment else NOT_A_DEBT_REPLY
+        member_from = resolve_side(parsed.from_name, parsed.from_user_id, members, author)
+        member_to = resolve_side(parsed.to_name, parsed.to_user_id, members, author)
         currency = (parsed.currency or explicit_currency or default_currency).upper()
-        debt = storage.add_debt(
+        record = storage.add_debt(
             chat_id=chat_id,
-            from_name=normalize_name(str(parsed.from_name)),
-            to_name=normalize_name(str(parsed.to_name)),
+            from_name=_member_name(member_from, str(parsed.from_name or "")),
+            to_name=_member_name(member_to, str(parsed.to_name or "")),
             currency=currency,
             amount=float(parsed.amount or 0),
             raw_text=raw,
+            kind="repayment" if is_repayment else "debt",
+            from_user_id=member_from.user_id if member_from else None,
+            to_user_id=member_to.user_id if member_to else None,
         )
-        return format_debt_saved(debt, used_default_currency=explicit_currency is None)
-
-    if parsed.intent == "repayment":
-        if not parsed.is_repayment:
-            return NOT_A_REPAYMENT_REPLY
-        currency = (parsed.currency or explicit_currency or default_currency).upper()
-        repayment = storage.add_debt(
-            chat_id=chat_id,
-            from_name=normalize_name(str(parsed.from_name)),
-            to_name=normalize_name(str(parsed.to_name)),
-            currency=currency,
-            amount=float(parsed.amount or 0),
-            raw_text=raw,
-            kind="repayment",
-        )
-        return format_repayment_saved(repayment, used_default_currency=explicit_currency is None)
+        formatter = format_repayment_saved if is_repayment else format_debt_saved
+        missing = [
+            str(parsed.from_name or "") if member_from is None else "",
+            str(parsed.to_name or "") if member_to is None else "",
+        ]
+        return formatter(record, members) + _unrecognized_note(members, missing)
 
     if parsed.intent == "debts":
-        return format_debts_report(storage.list_debts(chat_id), default_currency)
+        return format_debts_report(storage.list_debts(chat_id), default_currency, members)
     if parsed.intent == "set_currency":
         if not parsed.currency:
             return "Не понял валюту. Пример: /currency USD"
@@ -264,6 +309,7 @@ def build_runtime(settings: Settings) -> tuple[Storage, DeepSeekParser, Telegram
         debts_table=settings.debts_table,
         settings_table=settings.settings_table,
         state_table=settings.state_table,
+        members_table=settings.members_table,
         timeout=settings.request_timeout,
     )
     parser = DeepSeekParser(
@@ -451,10 +497,15 @@ class DebtBot:
             return
 
         self._telegram.send_typing(chat_id)
+        # Из автора сообщения собирается состав чата: по нему ИИ понимает, что «Лешак» — это
+        # Леша Козлов, и запись привязывается к его user id.
+        author = member_from_telegram(int(chat_id), message.get("from") or {})
+        members = self._remember_author(author)
         try:
             reply = handle_text(
                 text, int(chat_id),
                 storage=self._storage, parser=self._parser, settings=self._settings,
+                members=members, author=author,
             )
         except StorageError as exc:
             logger.error("Хранилище: %s", exc)
@@ -463,6 +514,19 @@ class DebtBot:
             logger.exception("Ошибка обработки сообщения: %s", exc)
             reply = "⚠️ Внутренняя ошибка, попробуйте ещё раз."
         self._send(chat_id, reply, message)
+
+    def _remember_author(self, author: ChatMember | None) -> list[ChatMember]:
+        """Сохраняет автора в составе чата и возвращает актуальный список участников."""
+        if author is None:
+            return []
+        try:
+            self._storage.remember_member(author)
+        except StorageError as exc:
+            logger.warning("Не удалось запомнить участника %s: %s", author.user_id, exc)
+        members = _load_members(self._storage, author.chat_id)
+        if all(member.user_id != author.user_id for member in members):
+            members = [*members, author]      # состав мог не прочитаться — автора всё равно знаем
+        return members
 
     def _send(self, chat_id: Any, text: str, message: Mapping[str, Any]) -> None:
         """Отправляет ответ, логируя проблемы доставки."""
@@ -609,12 +673,15 @@ def check_services(settings: Settings) -> bool:
         storage = SupabaseStorage(
             settings.supabase_url, settings.supabase_key,
             debts_table=settings.debts_table, settings_table=settings.settings_table,
+            state_table=settings.state_table, members_table=settings.members_table,
             timeout=settings.request_timeout,
         )
         debts = storage.list_debts(0)
         print(f"✓ Supabase: таблица {settings.debts_table} доступна (пробный запрос: {len(debts)} строк)")
         storage.get_default_currency(0, settings.default_currency)
         print(f"✓ Supabase: таблица {settings.settings_table} доступна")
+        members = storage.list_members(0)
+        print(f"✓ Supabase: таблица {settings.members_table} доступна (участников: {len(members)})")
     except StorageError as exc:
         ok = False
         print("✗ Supabase:", exc)
@@ -626,19 +693,30 @@ def check_services(settings: Settings) -> bool:
 
 
 DEMO_MESSAGES = (
-    "Леша должен Диме 3 рубля",
+    "Лешак должен Диме 3 рубля",     # «Лешак» — это Леша Козлов, «Диме» — Дмитрий Болт
     "Маша заняла у Пети 10$",
     "покажи долги",
     "валюта по умолчанию доллар",
     "Петя должен Маше 5 долларов",
+    "я должен Диме 2 рубля",         # «я» — это автор сообщения (Леша Козлов)
     "покажи долги",
-    "Леша должен Диме 2 рубля",
     "Леша вернул Диме 1 рубль",      # возврат: уменьшает сальдо
-    "покажи долги",
-    "/undo",                         # отменяем последнюю запись (возврат)
     "/debts",
+    "/undo",                         # отменяем последнюю запись (возврат)
     "/currency BYN",
     "привет",
+)
+
+# Участники демо-чата: так бот понимает, что «Лешак» и «Лёха» — это @kozlovAlex.
+DEMO_MEMBERS = (
+    ChatMember(chat_id=1, user_id=101, username="kozlovAlex", display_name="Леша Козлов",
+               aliases=["Леша", "Лёха", "Лешак"]),
+    ChatMember(chat_id=1, user_id=102, username="bdzmity", display_name="Дмитрий Болт",
+               aliases=["Дима", "Димон"]),
+    ChatMember(chat_id=1, user_id=103, username="petrova_m", display_name="Маша Петрова",
+               aliases=["Маша"]),
+    ChatMember(chat_id=1, user_id=104, username="petya_k", display_name="Петя Кузнецов",
+               aliases=["Петя"]),
 )
 
 
@@ -648,10 +726,15 @@ def run_demo() -> int:
     storage = InMemoryStorage(default_currency=settings.default_currency)
     parser = HeuristicParser()
     chat_id = 1
+    for member in DEMO_MEMBERS:
+        storage.remember_member(member)
+    author = DEMO_MEMBERS[0]          # сообщения пишет Леша Козлов: «я» = он
     print("Демонстрация работы бота (без Telegram, DeepSeek и Supabase)")
     print("=" * 64)
+    print("Участники чата: " + ", ".join(member.label for member in DEMO_MEMBERS))
     for message in DEMO_MESSAGES:
-        reply = handle_text(message, chat_id, storage=storage, parser=parser, settings=settings)
+        reply = handle_text(message, chat_id, storage=storage, parser=parser,
+                            settings=settings, author=author)
         print(f"\n👤 {message}\n🤖 {reply}")
     print("=" * 64)
     print(f"Итого записей в памяти: {len(storage.debts)}")
