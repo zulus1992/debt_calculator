@@ -3,9 +3,11 @@
 
 Режимы:
     python bot.py            # постоянный процесс (long polling), ответы мгновенно — для хостинга
-    python bot.py --once     # обработать накопившееся и выйти — для GitHub Actions/cron
     python bot.py --check    # проверить настройки и доступность сервисов
     python bot.py --demo     # демонстрация без Telegram (в памяти, офлайн-разбор)
+    python bot.py --rates    # обновить курсы валют вручную (--rates --force — заново за сегодня)
+
+Курсы валют подтягиваются сами раз в день — при первом обращении к /d или /rates за сутки.
 
 Вебхук (мгновенные ответы на serverless-хостингах — Vercel, PythonAnywhere, WSGI):
     python bot.py --set-webhook https://<домен>/api/telegram   # Telegram шлёт апдейты нам
@@ -14,17 +16,21 @@
 
 Важно: одновременно должен работать только ОДИН режим — Telegram отдаёт апдейты
 одному «слушателю», второй получит HTTP 409 Conflict или потеряет сообщения.
+Если задан CHAT_PASSWORD, бот просит пароль при добавлении в чат и работает только
+в тех чатах, где пароль введён верно.
 """
 
 from __future__ import annotations
 
 import argparse
+import hmac
 import logging
 import re
 import signal
 import sys
 import time
 import uuid
+from datetime import date, timedelta
 from typing import Any, Mapping, Sequence
 
 from config import (
@@ -61,6 +67,15 @@ from members import (
     resolve_side,
     with_aliases,
 )
+from rates import (
+    RatesError,
+    convert_debts,
+    format_rates_report,
+    format_used_rates,
+    history_start,
+    rate_table,
+    update_rates,
+)
 from storage import ChatMember, InMemoryStorage, Storage, StorageError, SupabaseStorage
 from telegram_api import TelegramBot, TelegramError
 
@@ -86,6 +101,26 @@ UNKNOWN_REPLY = (
 )
 DENIED_REPLY = "⛔ Извините, этот бот настроен только для определённых пользователей."
 LAST_UPDATE_ID_KEY = "last_update_id"
+# Что делать с чатом, куда бота добавили: без пароля (CHAT_PASSWORD) он не работает.
+ADDED_REPLY = (
+    "👋 Привет! Я калькулятор долгов: «Леша должен Диме 3 рубля», возвраты, общие счета "
+    "(«Дима заплатил 10 за всех»), учёт по участникам чата.\n"
+    "Справка: /help"
+)
+PASSWORD_REPLY = (
+    "🔐 Чтобы я начал работать в этом чате, пришлите пароль:\n"
+    "• /password ваш-пароль\n"
+    "• или просто сообщением с паролем — второй раз спрашивать не буду."
+)
+PASSWORD_OK_REPLY = (
+    "✅ Пароль принят — работаю в этом чате.\n"
+    "Пишите как обычно: «Леша должен Диме 3 рубля», /reg, /debts, /d, /help."
+)
+PASSWORD_FAIL_REPLY = (
+    "❌ Пароль не подошёл.\n"
+    "Пришлите его ещё раз: /password ваш-пароль"
+)
+PASSWORD_COMMANDS = ("/password", "/pass", "/auth", "/start")
 # Как связать имя из сообщения с человеком в чате: без /reg записи не ведутся.
 REGISTER_HINT = (
     "Как это исправить:\n"
@@ -97,6 +132,8 @@ REGISTER_HINT = (
 REG_HANDLE_RE = re.compile(r"^@(?P<handle>\w{3,32})")
 REG_ALIAS_SPLIT_RE = re.compile(r"[,;]+")
 MAX_SKIPPED_SHOWN = 5
+# Сколько последних дней курсов показывать в /rates (и искать для пересчёта).
+RATES_HISTORY_DAYS = 30
 
 
 class HeuristicParser:
@@ -150,6 +187,101 @@ def _member_name(member: ChatMember | None, fallback: str) -> str:
         if member.username:
             return member.username
     return normalize_name(fallback)
+
+
+def password_candidate(raw: str) -> str:
+    """Что человек прислал как пароль: аргумент /password или всё сообщение целиком."""
+    text = str(raw or "").strip()
+    command, _, argument = text.partition(" ")
+    if command.lower() in PASSWORD_COMMANDS:
+        return argument.strip()
+    return text
+
+
+def looks_like_password(raw: str) -> bool:
+    """Похоже ли сообщение на попытку ввести пароль: одно слово или «/password <…>»."""
+    text = str(raw or "").strip()
+    if not text:
+        return False
+    command, _, argument = text.partition(" ")
+    if command.startswith("/"):
+        return command.lower() in PASSWORD_COMMANDS and bool(argument.strip())
+    return len(text.split()) == 1 and len(text) >= 3
+
+
+def is_password_attempt(raw: str, password: str) -> bool:
+    """Совпадает ли присланное с паролем чата (сравнение постоянного времени).
+
+    Пароль в чате — не про криптографию, но сравнение без «раннего выхода» не даёт
+    подбирать его по времени ответа.
+    """
+    secret = str(password or "").strip()
+    candidate = password_candidate(raw)
+    if not secret or not candidate:
+        return False
+    return hmac.compare_digest(candidate.encode("utf-8"), secret.encode("utf-8"))
+
+
+def _chat_authorized(storage: Storage, chat_id: int) -> bool:
+    """Подтвердил ли чат пароль (сбой чтения трактуем как «нет»)."""
+    try:
+        return bool(storage.chat_authorized(chat_id))
+    except StorageError as exc:
+        logger.warning("Не удалось прочитать доступ чата %s: %s", chat_id, exc)
+        return False
+
+
+def added_to_chat_reply(settings: Settings) -> str:
+    """Что ответить, когда бота добавили в чат: привет + просьба о пароле, если он задан."""
+    if settings.password_required:
+        return f"{ADDED_REPLY}\n\n{PASSWORD_REPLY}"
+    return ADDED_REPLY
+
+
+def rates_report(storage: Storage, settings: Settings, chat_currency: str) -> str:
+    """Команда /rates: показать курсы валют (обновив их, если за сегодня их ещё нет)."""
+    base = str(settings.rates_base or "BYN").upper()
+    try:
+        update = update_rates(settings, storage)
+        since = (date.today() - timedelta(days=RATES_HISTORY_DAYS)).isoformat()
+        points = storage.rates_since(base, since)
+    except StorageError as exc:
+        return f"⚠️ Проблема с базой данных: {exc}"
+    report = format_rates_report(points, base, target=chat_currency)
+    extras: list[str] = []
+    if update.problems:
+        extras.append("⚠️ " + "; ".join(update.problems[:3]))
+    elif not update.saved and update.reason and "уже сохранены" not in update.reason:
+        extras.append(f"ℹ️ {update.reason}.")
+    return "\n".join([report, *extras]) if extras else report
+
+
+def converted_report(chat_id: int, storage: Storage, settings: Settings,
+                     members: Sequence[ChatMember], chat_currency: str) -> str:
+    """Команда /d: все записи чата, приведённые к валюте чата по курсу на дату записи."""
+    try:
+        debts = storage.list_debts(chat_id)
+        if not debts:
+            return "📭 Долгов нет — пересчитывать нечего."
+        base = str(settings.rates_base or "BYN").upper()
+        update = update_rates(settings, storage)          # раз в день, без cron
+        points = storage.rates_since(base, history_start(debts))
+    except StorageError as exc:
+        return f"⚠️ Проблема с базой данных: {exc}"
+    converted = convert_debts(debts, chat_currency, rate_table(points), base)
+    header: list[str] = []
+    if converted.changed:
+        header.append(f"💱 Привёл к {chat_currency.upper()} по курсу на дату записи:")
+        header.extend(format_used_rates(converted.rates_used, chat_currency.upper()))
+    else:
+        header.append("💱 Курсов за эти даты в базе нет — показываю записи как есть.")
+        header.append("Обновить курсы: /rates")
+    if converted.skipped:
+        header.append("• Без курса оставил: " + ", ".join(sorted(set(converted.skipped))))
+    if update.problems:
+        header.append("⚠️ " + "; ".join(update.problems[:2]))
+    report = format_debts_report(converted.debts, chat_currency, members)
+    return "\n".join([*header, "", report])
 
 
 def _not_registered_reply(sides: Sequence[tuple[ChatMember | None, str | None]]) -> str:
@@ -378,6 +510,18 @@ def handle_text(
         return format_help(settings.default_currency)
 
     default_currency = storage.get_default_currency(chat_id, settings.default_currency)
+
+    # Пароль чата: пока он не введён верно, бот в этом чате ничего не делает —
+    # ни долгов, ни отчётов, ни регистрации участников.
+    if settings.password_required and not _chat_authorized(storage, chat_id):
+        if is_password_attempt(raw, settings.chat_password):
+            storage.set_chat_authorized(chat_id, True)
+            logger.info("Чат %s подтвердил пароль.", chat_id)
+            return PASSWORD_OK_REPLY
+        if looks_like_password(raw):
+            return PASSWORD_FAIL_REPLY
+        return PASSWORD_REPLY
+
     command, _, argument = raw.partition(" ")
     command = command.lower()
 
@@ -387,6 +531,10 @@ def handle_text(
         return register_command(argument, storage, members, author)
     if command in ("/who", "/members"):
         return format_members_report(members)
+    if command in ("/rates", "/rate"):
+        return rates_report(storage, settings, default_currency)
+    if command in ("/d", "/convert"):
+        return converted_report(chat_id, storage, settings, members, default_currency)
     if command == "/debts":
         return format_debts_report(storage.list_debts(chat_id), default_currency, members)
     if command == "/currency":
@@ -528,20 +676,26 @@ def configure_logging(level: str = "INFO") -> None:
     )
 
 
-def build_runtime(settings: Settings) -> tuple[Storage, DeepSeekParser, TelegramBot]:
-    """Собирает рабочие сервисы: хранилище Supabase, парсер DeepSeek, клиент Telegram.
-
-    Используется и постоянным процессом (bot.py), и вебхуком (webhook.py).
-    """
-    storage = SupabaseStorage(
+def _storage_for(settings: Settings) -> SupabaseStorage:
+    """Хранилище Supabase с таблицами из настроек (общее для бота, вебхука и --check)."""
+    return SupabaseStorage(
         settings.supabase_url,
         settings.supabase_key,
         debts_table=settings.debts_table,
         settings_table=settings.settings_table,
         state_table=settings.state_table,
         members_table=settings.members_table,
+        rates_table=settings.rates_table,
         timeout=settings.request_timeout,
     )
+
+
+def build_runtime(settings: Settings) -> tuple[Storage, DeepSeekParser, TelegramBot]:
+    """Собирает рабочие сервисы: хранилище Supabase, парсер DeepSeek, клиент Telegram.
+
+    Используется и постоянным процессом (bot.py), и вебхуком (webhook.py).
+    """
+    storage = _storage_for(settings)
     parser = DeepSeekParser(
         settings.deepseek_key,
         base_url=settings.deepseek_base_url,
@@ -582,7 +736,7 @@ class DebtBot:
 
         Используется на хостинге: процесс живёт всё время, при остановке контейнера
         (SIGTERM/SIGINT) корректно завершается и сохраняет смещение в bot_state,
-        чтобы после перезапуска или возврата к режиму `--once` ничего не путалось.
+        чтобы после перезапуска повторно доставленные апдейты не записались дважды.
         """
         me = self._telegram.get_me()
         self._bot_username = self._bot_username or str(me.get("username") or "").lstrip("@")
@@ -639,8 +793,7 @@ class DebtBot:
         сообщение прилетит повторно и долг запишется дважды.
 
         В постоянном режиме это ещё и «удобство для переезда»: если сохранение не удалось,
-        цикл опроса не должен из-за этого падать (в режиме --once ошибка фатальна,
-        потому что там смещение защищает от повторной обработки сообщений).
+        цикл опроса не должен из-за этого падать.
         """
         if offset is None:
             return
@@ -651,28 +804,6 @@ class DebtBot:
             self._storage.set_state(LAST_UPDATE_ID_KEY, str(offset))
         except StorageError as exc:
             logger.warning("Не удалось сохранить смещение апдейтов: %s", exc)
-
-    def run_once(self, limit: int = 100) -> int:
-        """Обрабатывает накопившиеся апдейты и выходит (режим GitHub Actions / cron).
-
-        Смещение (last_update_id) хранится в базе, поэтому запуски по расписанию
-        не теряют и не дублируют сообщения.
-        """
-        offset = self._load_offset()
-        updates = self._telegram.get_updates(offset, poll_timeout=0, limit=limit)
-        if not updates:
-            logger.info("Новых сообщений нет (offset=%s).", offset)
-            return 0
-
-        processed = 0
-        for update in updates:
-            update_id = int(update.get("update_id") or 0)
-            self._process(update)
-            processed += 1
-            # смещение фиксируем после каждого сообщения: при сбое потеряется максимум одно
-            self._storage.set_state(LAST_UPDATE_ID_KEY, str(update_id + 1))
-        logger.info("Обработано сообщений: %d (offset -> %s)", processed, offset)
-        return processed
 
     def process_update(self, update: Mapping[str, Any], *, remember: bool = True) -> bool:
         """Обрабатывает один апдейт с защитой от повторов — режим вебхука.
@@ -707,6 +838,10 @@ class DebtBot:
 
     def _process(self, update: Mapping[str, Any]) -> None:
         """Обрабатывает один апдейт Telegram."""
+        membership = update.get("my_chat_member")
+        if isinstance(membership, Mapping):
+            self._handle_membership(membership)
+            return
         message = update.get("message") or {}
         text = message.get("text")
         chat_id = (message.get("chat") or {}).get("id")
@@ -744,6 +879,29 @@ class DebtBot:
             logger.exception("Ошибка обработки сообщения: %s", exc)
             reply = "⚠️ Внутренняя ошибка, попробуйте ещё раз."
         self._send(chat_id, reply, message)
+
+    def _handle_membership(self, membership: Mapping[str, Any]) -> None:
+        """Реакция на добавление и удаление бота: просит пароль, сбрасывает доступ.
+
+        Telegram присылает `my_chat_member`, когда бота добавляют в чат или удаляют из него.
+        Если задан CHAT_PASSWORD, до верного пароля бот в этом чате не работает; при выходе
+        из чата доступ сбрасывается — вернут бота обратно, пароль спросят снова.
+        """
+        chat = membership.get("chat") or {}
+        chat_id = chat.get("id")
+        if chat_id is None:
+            return
+        new_status = str((membership.get("new_chat_member") or {}).get("status") or "").lower()
+        old_status = str((membership.get("old_chat_member") or {}).get("status") or "").lower()
+        if new_status in ("member", "administrator") and old_status in ("left", "kicked", ""):
+            logger.info("Бот добавлен в чат %s — приветствие отправлено.", chat_id)
+            self._send(chat_id, added_to_chat_reply(self._settings), {})
+        elif new_status in ("left", "kicked"):
+            logger.info("Бот удалён из чата %s — доступ сброшен.", chat_id)
+            try:
+                self._storage.set_chat_authorized(int(chat_id), False)
+            except StorageError as exc:
+                logger.warning("Не удалось сбросить доступ чата %s: %s", chat_id, exc)
 
     def _remember_author(self, author: ChatMember | None) -> list[ChatMember]:
         """Сохраняет автора в составе чата и возвращает актуальный список участников."""
@@ -805,13 +963,37 @@ def set_webhook_mode(settings: Settings, url: str, *, drop_pending: bool = False
     print(f"  ожидает апдейтов: {info.get('pending_update_count', 0)}")
     print("  Теперь напишите боту — ответ придёт за 1–3 секунды (задержка = запрос к DeepSeek).")
     print("  Вернуться на long polling: python bot.py --delete-webhook")
-    print("  ⚠ Постоянный процесс (`python bot.py`, cron в Actions) должен быть остановлен:")
+    print("  ⚠ Постоянный процесс (`python bot.py`) должен быть остановлен:")
     print("    по одному адресу Telegram шлёт апдейты только одним способом.")
     return 0
 
 
+def update_rates_mode(settings: Settings, *, force: bool = False) -> int:
+    """Команда --rates: обновляет курсы валют в базе (обычно это делается само раз в день)."""
+    problems = settings.problems()
+    if problems:
+        print("Ошибка: проверьте настройки:\n- " + "\n- ".join(problems), file=sys.stderr)
+        return 1
+    try:
+        storage = _storage_for(settings)
+        result = update_rates(settings, storage, force=force)
+    except (StorageError, RatesError) as exc:
+        print("Ошибка:", exc, file=sys.stderr)
+        return 1
+
+    if result.saved:
+        print(f"✓ Курсы записаны: {result.saved} значений на {result.rate_date}")
+        print("  пары: " + ", ".join(result.pairs))
+    else:
+        print("Курсы не обновлялись:", result.reason or "нет данных")
+    for problem in result.problems:
+        print("⚠", problem)
+    print("  посмотреть в Telegram: /rates, привести долги к валюте чата: /d")
+    return 0 if (result.saved or not result.problems) else 1
+
+
 def delete_webhook_mode(settings: Settings, *, drop_pending: bool = False) -> int:
-    """Команда --delete-webhook: снова long polling / --once."""
+    """Команда --delete-webhook: снова long polling."""
     try:
         telegram = _telegram_for(settings)
         telegram.delete_webhook(drop_pending_updates=drop_pending)
@@ -823,7 +1005,7 @@ def delete_webhook_mode(settings: Settings, *, drop_pending: bool = False) -> in
     if info.get("url"):
         print("⚠ Telegram всё ещё сообщает адрес вебхука:", info.get("url"), file=sys.stderr)
         return 1
-    print("✓ Вебхук снят — бот снова работает через getUpdates (python bot.py или --once).")
+    print("✓ Вебхук снят — бот снова работает через getUpdates (python bot.py).")
     return 0
 
 
@@ -881,8 +1063,7 @@ def check_services(settings: Settings) -> bool:
             else:
                 print("  ✓ секрет вебхука задан — заголовки запросов проверяются")
         else:
-            print("• Telegram: вебхук не установлен — режимы: python bot.py (long polling)",
-                  "или --once (раз в 30 минут)")
+            print("• Telegram: вебхук не установлен — режим: python bot.py (long polling)")
             print("  включить вебхук: python bot.py --set-webhook https://<домен>/api/telegram")
     except TelegramError as exc:
         ok = False
@@ -900,21 +1081,33 @@ def check_services(settings: Settings) -> bool:
         print(f"✓ DeepSeek: ключ принят, модель {settings.deepseek_model}")
 
     try:
-        storage = SupabaseStorage(
-            settings.supabase_url, settings.supabase_key,
-            debts_table=settings.debts_table, settings_table=settings.settings_table,
-            state_table=settings.state_table, members_table=settings.members_table,
-            timeout=settings.request_timeout,
-        )
+        storage = _storage_for(settings)
         debts = storage.list_debts(0)
         print(f"✓ Supabase: таблица {settings.debts_table} доступна (пробный запрос: {len(debts)} строк)")
         storage.get_default_currency(0, settings.default_currency)
         print(f"✓ Supabase: таблица {settings.settings_table} доступна")
         members = storage.list_members(0)
         print(f"✓ Supabase: таблица {settings.members_table} доступна (участников: {len(members)})")
+        rate_points = storage.rates_since(settings.rates_base, date.today().isoformat())
+        print(f"✓ Supabase: таблица {settings.rates_table} доступна "
+              f"(курсов на сегодня: {len(rate_points)})")
     except StorageError as exc:
         ok = False
         print("✗ Supabase:", exc)
+
+    rates_problem = settings.rates_problem()
+    if rates_problem:
+        print("⚠", rates_problem)
+    else:
+        print(f"✓ Курсы валют: ключ allratestoday задан, база {settings.rates_base}, "
+              f"валюты {', '.join(settings.rates_currencies)}")
+        print("  обновление — раз в день при первом обращении; вручную: python bot.py --rates")
+
+    if settings.password_required:
+        print("• CHAT_PASSWORD задан — бот просит пароль при добавлении в чат "
+              "и работает только там, где пароль введён")
+    else:
+        print("• CHAT_PASSWORD не задан — бот работает в любом чате без пароля")
 
     print()
     print("Итог:", "всё готово — запускайте python bot.py" if ok
@@ -938,6 +1131,8 @@ DEMO_MESSAGES = (
     "Гоша должен Диме 4 рубля",              # Гоша не зарегистрирован — записи не будет
     "/reg @gosha_p Гоша, Гоша Петров",       # регистрируем Гошу по @нику
     "Гоша должен Диме 4 рубля",              # теперь записывается
+    "/rates",                                # курсы валют из базы (в демо — без API)
+    "/d",                                    # все записи в валюте чата по курсу на дату
     "/debts",
     "/undo",                                 # убираем последний счёт или запись
     "/currency BYN",
@@ -962,11 +1157,14 @@ DEMO_MEMBERS = (
 def run_demo() -> int:
     """Прогон сценария без внешних сервисов: хранилище в памяти + офлайн-разбор."""
     settings = Settings(default_currency="BYN")
-    storage = InMemoryStorage(default_currency=settings.default_currency)
+    today = date.today().isoformat()
+    storage = InMemoryStorage(default_currency=settings.default_currency,
+                              default_created_at=f"{today}T10:00:00+00:00")
     parser = HeuristicParser()
     chat_id = 1
     for member in DEMO_MEMBERS:
         storage.remember_member(member)
+    demo_rates(storage, today)
     author = DEMO_MEMBERS[0]          # сообщения пишет Леша Козлов: «я» = он
     print("Демонстрация работы бота (без Telegram, DeepSeek и Supabase)")
     print("=" * 64)
@@ -975,9 +1173,30 @@ def run_demo() -> int:
         reply = handle_text(message, chat_id, storage=storage, parser=parser,
                             settings=settings, author=author)
         print(f"\n👤 {message}\n🤖 {reply}")
+    print("\n" + "=" * 64)
+    print("Чат с паролем (CHAT_PASSWORD): пока пароль не введён, бот не работает")
+    protected = Settings(default_currency="BYN", chat_password="сезам")
+    guarded = InMemoryStorage(default_currency="BYN")
+    for message in ("Леша должен Диме 3 рубля", "/password наугад", "сезам"):
+        reply = handle_text(message, 42, storage=guarded, parser=parser, settings=protected)
+        print(f"\n👤 {message}\n🤖 {reply}")
     print("=" * 64)
     print(f"Итого записей в памяти: {len(storage.debts)}")
     return 0
+
+
+def demo_rates(storage: InMemoryStorage, today: str) -> None:
+    """Курсы для демонстрации: /d и /rates показывают пересчёт без обращения к API."""
+    yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+    storage.save_rates([
+        {"rate_date": yesterday, "base": "BYN", "currency": "USD", "rate": 3.20, "source": "demo"},
+        {"rate_date": yesterday, "base": "BYN", "currency": "EUR", "rate": 3.45, "source": "demo"},
+        {"rate_date": today, "base": "BYN", "currency": "USD", "rate": 3.25, "source": "demo"},
+        {"rate_date": today, "base": "BYN", "currency": "EUR", "rate": 3.52, "source": "demo"},
+        {"rate_date": today, "base": "BYN", "currency": "RUB", "rate": 0.0331, "source": "demo"},
+        {"rate_date": today, "base": "BYN", "currency": "CNY", "rate": 0.4523, "source": "demo"},
+        {"rate_date": today, "base": "BYN", "currency": "THB", "rate": 0.0994, "source": "demo"},
+    ])
 
 
 def configure_stdout() -> None:
@@ -1000,12 +1219,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--check", action="store_true", help="проверить настройки и сервисы и выйти")
     parser.add_argument("--demo", action="store_true", help="демонстрация без Telegram (в памяти)")
-    parser.add_argument("--poll-timeout", type=int, default=25, help="время ожидания апдейтов, сек")
     parser.add_argument(
-        "--once",
+        "--rates",
         action="store_true",
-        help="обработать накопившиеся сообщения и выйти (режим GitHub Actions / cron)",
+        help="обновить курсы валют в базе (обычно это делается само раз в день)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="вместе с --rates: обновить курсы, даже если за сегодня они уже есть",
+    )
+    parser.add_argument("--poll-timeout", type=int, default=25, help="время ожидания апдейтов, сек")
     parser.add_argument(
         "--set-webhook",
         metavar="URL",
@@ -1030,7 +1254,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Точка входа: рабочий режим, --check или --demo."""
+    """Точка входа: рабочий режим, --check, --demo или --rates."""
     configure_stdout()
     args = build_parser().parse_args(argv)
     settings = load_settings()
@@ -1040,6 +1264,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_demo()
     if args.check:
         return 0 if check_services(settings) else 1
+    if args.rates:
+        return update_rates_mode(settings, force=args.force)
     if args.set_webhook:
         return set_webhook_mode(settings, args.set_webhook, drop_pending=args.drop_pending)
     if args.delete_webhook:
@@ -1056,10 +1282,6 @@ def main(argv: list[str] | None = None) -> int:
 
     bot = DebtBot(settings, storage, parser, telegram)
     try:
-        if args.once:
-            processed = bot.run_once()
-            logger.info("Режим --once завершён, обработано сообщений: %d", processed)
-            return 0
         bot.run(poll_timeout=max(5, args.poll_timeout))
     except (TelegramError, StorageError) as exc:
         logger.error("Сбой: %s", exc)

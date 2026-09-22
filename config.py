@@ -26,6 +26,13 @@ DEFAULT_DEBTS_TABLE = "debts"
 DEFAULT_SETTINGS_TABLE = "bot_settings"
 DEFAULT_STATE_TABLE = "bot_state"
 DEFAULT_MEMBERS_TABLE = "chat_members"
+DEFAULT_RATES_TABLE = "currency_rates"
+# Курсы валют: allratestoday (https://allratestoday.com/docs). Нужен бесплатный ключ API.
+DEFAULT_RATES_URL = "https://allratestoday.com/api/v1"
+DEFAULT_RATES_BASE = "BYN"
+DEFAULT_RATES_PERIOD = "30d"
+# Какие валюты тянем из API: бел. рубль, рос. рубль, доллар, евро, юань, тайский бат.
+DEFAULT_RATES_CURRENCIES = ("BYN", "RUB", "USD", "EUR", "CNY", "THB")
 
 
 class ConfigError(RuntimeError):
@@ -60,6 +67,13 @@ class Settings:
     settings_table: str = DEFAULT_SETTINGS_TABLE
     state_table: str = DEFAULT_STATE_TABLE
     members_table: str = DEFAULT_MEMBERS_TABLE
+    rates_table: str = DEFAULT_RATES_TABLE
+    rates_api_url: str = DEFAULT_RATES_URL
+    rates_api_key: str = ""
+    rates_base: str = DEFAULT_RATES_BASE
+    rates_period: str = DEFAULT_RATES_PERIOD
+    rates_currencies: tuple[str, ...] = DEFAULT_RATES_CURRENCIES
+    chat_password: str = ""
     default_currency: str = DEFAULT_CURRENCY
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)
     request_timeout: float = 30.0
@@ -76,7 +90,23 @@ class Settings:
     @property
     def currencies(self) -> tuple[str, ...]:
         """Известные коды валют (для подсказок и нормализации)."""
-        return ("BYN", "USD", "EUR", "RUB", "PLN", "UAH", "KZT", "GBP")
+        return ("BYN", "USD", "EUR", "RUB", "CNY", "THB", "PLN", "UAH", "KZT", "GBP")
+
+    @property
+    def password_required(self) -> bool:
+        """Нужен ли пароль, чтобы бот начал работать в чате."""
+        return bool(str(self.chat_password or "").strip())
+
+    def rates_problem(self) -> str | None:
+        """Проблема с настройками курсов валют (None — всё в порядке).
+
+        Курсы не обязательны для учёта долгов, поэтому в problems() они не попадают:
+        без ключа бот просто работает по уже сохранённым курсам.
+        """
+        if not str(self.rates_api_key or "").strip():
+            return ("RATES_API_KEY не задан — курсы валют брать негде: /d и /rates работают "
+                    "только по тем курсам, что уже лежат в базе.")
+        return None
 
     def problems(self) -> list[str]:
         """Список проблем конфигурации (пустой — всё настроено)."""
@@ -111,6 +141,22 @@ def _parse_bool(raw: str, default: bool) -> bool:
     if value in ("0", "false", "no", "off", "нет", "ложь"):
         return False
     return default
+
+
+def _parse_codes(raw: str) -> tuple[str, ...]:
+    """Разбирает список кодов валют: 'byn, usd eur' -> ('BYN', 'USD', 'EUR').
+
+    Пусто — набор по умолчанию (бел. и рос. рубли, доллар, евро, юань, бат).
+    Базовая валюта из RATES_BASE всегда попадает в список: без неё конвертация невозможна.
+    """
+    codes: list[str] = []
+    for chunk in str(raw or "").replace(";", ",").replace(" ", ",").split(","):
+        code = chunk.strip().upper()
+        if len(code) == 3 and code.isalpha() and code not in codes:
+            codes.append(code)
+    if not codes:
+        return DEFAULT_RATES_CURRENCIES
+    return tuple(codes)
 
 
 def _parse_user_ids(raw: str) -> frozenset[int]:
@@ -213,6 +259,13 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         settings_table=get("SETTINGS_TABLE", DEFAULT_SETTINGS_TABLE),
         state_table=get("BOT_STATE_TABLE", DEFAULT_STATE_TABLE),
         members_table=get("MEMBERS_TABLE", DEFAULT_MEMBERS_TABLE),
+        rates_table=get("RATES_TABLE", DEFAULT_RATES_TABLE),
+        rates_api_url=get("RATES_API_URL", DEFAULT_RATES_URL).rstrip("/"),
+        rates_api_key=get("RATES_API_KEY"),
+        rates_base=get("RATES_BASE", DEFAULT_RATES_BASE).upper(),
+        rates_period=get("RATES_PERIOD", DEFAULT_RATES_PERIOD),
+        rates_currencies=_parse_codes(get("RATES_CURRENCIES")),
+        chat_password=get("CHAT_PASSWORD"),
         default_currency=get("DEFAULT_CURRENCY", DEFAULT_CURRENCY).upper(),
         allowed_user_ids=_parse_user_ids(get("ALLOWED_USER_IDS")),
         request_timeout=timeout,

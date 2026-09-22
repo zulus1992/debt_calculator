@@ -93,7 +93,37 @@ create table if not exists public.bot_settings (
 );
 
 comment on table public.bot_settings is
-    'Настройки чата: валюта по умолчанию, если в сообщении валюта не указана';
+    'Настройки чата: валюта по умолчанию и признак того, что чат подтвердил пароль';
+
+-- Пароль чата (CHAT_PASSWORD): бот работает только там, где он введён верно.
+-- Сбрасывается, когда бота удаляют из чата, — при повторном добавлении спросим снова.
+alter table public.bot_settings add column if not exists is_authorized boolean not null default false;
+comment on column public.bot_settings.is_authorized is
+    'true — чат подтвердил пароль, бот в нём работает';
+
+-- Курсы валют (allratestoday): сколько базовой валюты стоит 1 единица валюты на дату.
+-- Обновляются раз в день — при первом за сутки обращении к /d или /rates (без cron).
+create table if not exists public.currency_rates (
+    rate_date  date          not null,
+    base       text          not null default 'BYN',
+    currency   text          not null,
+    rate       numeric(20, 8) not null check (rate > 0),
+    source     text,
+    updated_at timestamptz   not null default now(),
+    primary key (rate_date, base, currency)
+);
+
+comment on table public.currency_rates is
+    'Курсы валют по дням: rate = сколько base стоит 1 единица currency (1 USD = 3.25 BYN)';
+comment on column public.currency_rates.base is
+    'Базовая валюта, к которой приведён курс (RATES_BASE, по умолчанию BYN)';
+comment on column public.currency_rates.source is
+    'Источник курса: allratestoday (например wise / nbrb)';
+
+create index if not exists currency_rates_lookup_idx
+    on public.currency_rates (base, rate_date desc);
+
+alter table public.currency_rates enable row level security;
 
 create or replace function public.touch_bot_settings()
 returns trigger
@@ -113,7 +143,8 @@ create trigger bot_settings_touch
 alter table public.debts enable row level security;
 alter table public.bot_settings enable row level security;
 
--- Состояние бота: смещение обработанных апдейтов Telegram (нужно для режима GitHub Actions)
+-- Состояние бота: смещение обработанных апдейтов Telegram — чтобы повторная доставка
+-- (перезапуск, повтор вебхука) не записала один и тот же долг дважды
 create table if not exists public.bot_state (
     key        text        not null primary key,
     value      text        not null,
@@ -132,4 +163,6 @@ select 'bot_settings', count(*) from public.bot_settings
 union all
 select 'bot_state', count(*) from public.bot_state
 union all
-select 'chat_members', count(*) from public.chat_members;
+select 'chat_members', count(*) from public.chat_members
+union all
+select 'currency_rates', count(*) from public.currency_rates;

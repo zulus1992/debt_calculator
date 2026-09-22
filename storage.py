@@ -80,6 +80,33 @@ def _row_to_debt(row: dict[str, Any]) -> Debt:
 
 
 @dataclass
+class RatePoint:
+    """Курс валюты на дату: сколько базовой валюты стоит 1 единица currency."""
+
+    rate_date: str                     # ISO-дата: 2026-09-21
+    base: str                          # базовая валюта, к которой приведён курс (обычно BYN)
+    currency: str                      # валюта, курс которой храним
+    rate: float                        # 1 USD = 3.25 BYN → rate = 3.25 при base = BYN
+    source: str | None = None          # откуда курс: allratestoday (wise / nbrb …)
+
+
+def _row_to_rate(row: dict[str, Any]) -> RatePoint:
+    """Преобразует строку currency_rates в RatePoint."""
+    return RatePoint(
+        rate_date=str(row.get("rate_date") or "")[:10],
+        base=str(row.get("base") or DEFAULT_CURRENCY).upper(),
+        currency=str(row.get("currency") or "").upper(),
+        rate=float(row.get("rate") or 0),
+        source=str(row.get("source") or "") or None,
+    )
+
+
+def _chunks(rows: Sequence[Any], size: int) -> list[Sequence[Any]]:
+    """Делит список на порции: PostgREST спокойнее с вставкой по частям."""
+    return [rows[index:index + size] for index in range(0, len(rows), size)]
+
+
+@dataclass
 class ChatMember:
     """Участник чата: по нему бот понимает, кто такой «Лешак» или «Дима»."""
 
@@ -141,6 +168,16 @@ class Storage(Protocol):
 
     def list_members(self, chat_id: int) -> list[ChatMember]: ...
 
+    def chat_authorized(self, chat_id: int) -> bool: ...
+
+    def set_chat_authorized(self, chat_id: int, value: bool = True) -> None: ...
+
+    def save_rates(self, points: Sequence[Mapping[str, Any]]) -> int: ...
+
+    def rates_since(self, base: str, date_from: str) -> list[RatePoint]: ...
+
+    def has_rates(self, rate_date: str, base: str) -> bool: ...
+
     def get_default_currency(self, chat_id: int, fallback: str = DEFAULT_CURRENCY) -> str: ...
 
     def set_default_currency(self, chat_id: int, currency: str) -> None: ...
@@ -162,6 +199,7 @@ class SupabaseStorage:
         settings_table: str = "bot_settings",
         state_table: str = "bot_state",
         members_table: str = "chat_members",
+        rates_table: str = "currency_rates",
         timeout: float = 30.0,
         session: Any = None,
     ) -> None:
@@ -175,6 +213,7 @@ class SupabaseStorage:
         self._settings_table = settings_table
         self._state_table = state_table
         self._members_table = members_table
+        self._rates_table = rates_table
         self._timeout = timeout
         self._session = session or requests
 
@@ -455,6 +494,77 @@ class SupabaseStorage:
             prefer="resolution=merge-duplicates,return=representation",
         )
 
+    def chat_authorized(self, chat_id: int) -> bool:
+        """Работает ли бот в этом чате (чат подтвердил пароль)."""
+        rows = self._request(
+            "GET",
+            self._settings_table,
+            params={"chat_id": f"eq.{chat_id}", "select": "is_authorized", "limit": 1},
+        )
+        return bool(rows and rows[0].get("is_authorized"))
+
+    def set_chat_authorized(self, chat_id: int, value: bool = True) -> None:
+        """Запоминает, что чат ввёл верный пароль (или сбрасывает доступ)."""
+        self._request(
+            "POST",
+            self._settings_table,
+            params={"on_conflict": "chat_id"},
+            payload={"chat_id": chat_id, "is_authorized": bool(value)},
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+    def save_rates(self, points: Sequence[Mapping[str, Any]]) -> int:
+        """Сохраняет курсы валют (upsert по дате, базовой и целевой валюте)."""
+        rows = [
+            {
+                "rate_date": str(point.get("rate_date") or "")[:10],
+                "base": str(point.get("base") or DEFAULT_CURRENCY).upper(),
+                "currency": str(point.get("currency") or "").upper(),
+                "rate": round(float(point.get("rate") or 0), 8),
+                "source": point.get("source"),
+            }
+            for point in points
+            if str(point.get("currency") or "").strip()
+        ]
+        for chunk in _chunks(rows, 500):
+            self._request(
+                "POST",
+                self._rates_table,
+                params={"on_conflict": "rate_date,base,currency"},
+                payload=list(chunk),
+                prefer="resolution=merge-duplicates,return=minimal",
+            )
+        return len(rows)
+
+    def rates_since(self, base: str, date_from: str) -> list[RatePoint]:
+        """Курсы базовой валюты с указанной даты включительно (по возрастанию даты)."""
+        rows = self._request(
+            "GET",
+            self._rates_table,
+            params={
+                "base": f"eq.{str(base or DEFAULT_CURRENCY).upper()}",
+                "rate_date": f"gte.{date_from}",
+                "select": "*",
+                "order": "rate_date.asc",
+                "limit": 5000,
+            },
+        )
+        return [_row_to_rate(row) for row in rows or []]
+
+    def has_rates(self, rate_date: str, base: str) -> bool:
+        """Есть ли в базе курсы на эту дату (чтобы не дёргать API дважды в день)."""
+        rows = self._request(
+            "GET",
+            self._rates_table,
+            params={
+                "base": f"eq.{str(base or DEFAULT_CURRENCY).upper()}",
+                "rate_date": f"eq.{rate_date}",
+                "select": "currency",
+                "limit": 1,
+            },
+        )
+        return bool(rows)
+
     def get_state(self, key: str, default: str | None = None) -> str | None:
         """Читает служебное значение (например last_update_id) из bot_state."""
         rows = self._request(
@@ -486,13 +596,18 @@ class InMemoryStorage:
     currencies: dict[int, str] = field(default_factory=dict)
     state: dict[str, str] = field(default_factory=dict)
     members: dict[tuple[int, int], ChatMember] = field(default_factory=dict)
+    rates: list[RatePoint] = field(default_factory=list)
+    authorized: set[int] = field(default_factory=set)
+    # Дата записей для тестов и демо: по ней /d ищет курс на «дату сообщения».
+    default_created_at: str = "1970-01-01T00:00:00+00:00"
     _next_id: int = 1
 
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
                  amount: float, raw_text: str | None = None,
                  kind: str = "debt", from_user_id: int | None = None,
                  to_user_id: int | None = None,
-                 group_id: str | None = None) -> Debt:
+                 group_id: str | None = None,
+                 created_at: str | None = None) -> Debt:
         """Добавляет запись (долг, возврат или долю общего счёта) в память."""
         debt = Debt(
             id=self._next_id,
@@ -505,7 +620,7 @@ class InMemoryStorage:
             from_user_id=from_user_id,
             to_user_id=to_user_id,
             raw_text=raw_text,
-            created_at="1970-01-01T00:00:00+00:00",
+            created_at=created_at or self.default_created_at,
             group_id=group_id,
         )
         self._next_id += 1
@@ -526,6 +641,7 @@ class InMemoryStorage:
                 from_user_id=_to_int(record.get("from_user_id")),
                 to_user_id=_to_int(record.get("to_user_id")),
                 group_id=record.get("group_id"),
+                created_at=record.get("created_at"),
             )
             for record in records
         ]
@@ -602,6 +718,57 @@ class InMemoryStorage:
     def set_default_currency(self, chat_id: int, currency: str) -> None:
         """Запоминает валюту по умолчанию для чата."""
         self.currencies[chat_id] = currency.upper()
+
+    def chat_authorized(self, chat_id: int) -> bool:
+        """Работает ли бот в этом чате (чат подтвердил пароль)."""
+        return int(chat_id) in self.authorized
+
+    def set_chat_authorized(self, chat_id: int, value: bool = True) -> None:
+        """Запоминает, что чат ввёл верный пароль (или сбрасывает доступ)."""
+        if value:
+            self.authorized.add(int(chat_id))
+        else:
+            self.authorized.discard(int(chat_id))
+
+    def save_rates(self, points: Sequence[Mapping[str, Any]]) -> int:
+        """Сохраняет курсы валют в памяти: ключ — дата + база + валюта."""
+        saved = 0
+        for point in points:
+            currency = str(point.get("currency") or "").strip().upper()
+            if not currency:
+                continue
+            base = str(point.get("base") or DEFAULT_CURRENCY).upper()
+            rate_date = str(point.get("rate_date") or "")[:10]
+            fresh = RatePoint(
+                rate_date=rate_date,
+                base=base,
+                currency=currency,
+                rate=float(point.get("rate") or 0),
+                source=str(point.get("source") or "") or None,
+            )
+            for index, existing in enumerate(self.rates):
+                if (existing.rate_date, existing.base, existing.currency) == \
+                        (rate_date, base, currency):
+                    self.rates[index] = fresh
+                    break
+            else:
+                self.rates.append(fresh)
+            saved += 1
+        return saved
+
+    def rates_since(self, base: str, date_from: str) -> list[RatePoint]:
+        """Курсы базовой валюты с указанной даты включительно."""
+        upper = str(base or DEFAULT_CURRENCY).upper()
+        found = [
+            point for point in self.rates
+            if point.base == upper and point.rate_date >= date_from
+        ]
+        return sorted(found, key=lambda point: (point.rate_date, point.currency))
+
+    def has_rates(self, rate_date: str, base: str) -> bool:
+        """Есть ли в памяти курсы на эту дату."""
+        upper = str(base or DEFAULT_CURRENCY).upper()
+        return any(point.base == upper and point.rate_date == rate_date for point in self.rates)
 
     def get_state(self, key: str, default: str | None = None) -> str | None:
         """Читает служебное значение из памяти."""
