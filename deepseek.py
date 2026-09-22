@@ -4,6 +4,8 @@
 Результат разбора — ParsedMessage с намерением (intent):
     debt          — сообщение о долге: from / to / currency / amount
     repayment     — возврат долга: «Леша вернул Диме 3 рубля» (from вернул to)
+    expense       — общий счёт: «Дима заплатил 10 за всех» (делим на участников,
+                    participants — за кого платили, exclude — кого исключить)
     debts         — просьба показать долги
     set_currency  — установить валюту по умолчанию
     help          — вопрос про возможности бота
@@ -14,14 +16,14 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import requests
 
 from members import format_roster
 
-INTENTS = ("debt", "repayment", "debts", "set_currency", "help", "none")
+INTENTS = ("debt", "repayment", "expense", "debts", "set_currency", "help", "none")
 
 # Синонимы валют. По умолчанию «рубль» — белорусский рубль (BYN),
 # для российского указывайте «российский рубль», «руб РФ» или ₽.
@@ -65,6 +67,25 @@ DEBTS_KEYWORDS = ("долг", "долги", "сколько", "кто кому",
 CURRENCY_KEYWORDS = ("валют", "currency", "по умолчанию")
 HELP_KEYWORDS = ("помощь", "help", "что ты умеешь", "как пользоваться", "команды")
 
+# Общий счёт: «Дима заплатил 10 за всех», «я заплатил 10 за всех кроме Оли», «Маша оплатила ужин».
+EXPENSE_VERBS = (
+    r"(?:заплатил[аи]?|оплатил[аи]?|оплач[уи]?|потратил[аи]?|скинул(?:ся|ась|ись)|"
+    r"скинулись|скидыва(?:лся|лась|лись)|собрал[аи]?\s+деньги|проставил(?:ся|ась)|"
+    r"paid\s+for|paid|cashed\s+out)"
+)
+EXPENSE_RE = re.compile(rf"(?P<payer>{NAME_TOKEN})\s+{EXPENSE_VERBS}\b(?P<tail>[^\n]*)", re.IGNORECASE)
+# «за всех», «на всех», «поровну» — платили за весь чат.
+ALL_RE = re.compile(r"\b(?:за|на)\s+(?:всех|все|всю|нас|всём|всем)\b|\bпоровну\b", re.IGNORECASE)
+# «за себя» — платил только за себя, делить не с кем.
+SELF_ONLY_RE = re.compile(r"\b(?:за|на)\s+себя\b", re.IGNORECASE)
+# «за Машу и Петю» — платили за конкретных людей.
+FOR_SOMEONE_RE = re.compile(r"\b(?:за|на)\s+(?P<names>[^\n]*)", re.IGNORECASE)
+# «кроме Оли», «без Пети», «кроме себя» — кого не включать в общий счёт.
+EXCLUDE_RE = re.compile(
+    r"(?:кроме|без|исключая|не\s+считая|за\s+исключением)\s+(?P<names>[^\n]*)",
+    re.IGNORECASE,
+)
+
 
 class DeepSeekError(RuntimeError):
     """Ошибка обращения к DeepSeek."""
@@ -83,6 +104,8 @@ class ParsedMessage:
     amount: float | None = None
     note: str | None = None
     source: str = "ai"  # ai | heuristic | fallback
+    participants: list[str] | None = None          # за кого заплатили (None — за всех)
+    exclude: list[str] = field(default_factory=list)   # кого не включать в общий счёт
 
     @property
     def is_debt(self) -> bool:
@@ -106,10 +129,20 @@ class ParsedMessage:
             and float(self.amount) > 0
         )
 
+    @property
+    def is_expense(self) -> bool:
+        """Готов ли результат к записи как общий счёт («заплатил за всех»)."""
+        return (
+            self.intent == "expense"
+            and bool(self.from_name or self.from_user_id)
+            and isinstance(self.amount, (int, float))
+            and float(self.amount) > 0
+        )
+
 
 SYSTEM_PROMPT = """Ты — разборщик сообщений о долгах для телеграм-бота (русский и английский).
 Верни ТОЛЬКО JSON без пояснений:
-{"intent":"debt|repayment|debts|set_currency|help|none","from":"имя","to":"имя","from_user_id":123,"to_user_id":456,"currency":"BYN","amount":3.0,"note":"короткое пояснение"}
+{"intent":"debt|repayment|expense|debts|set_currency|help|none","from":"имя","to":"имя","from_user_id":123,"to_user_id":456,"currency":"BYN","amount":3.0,"participants":["Маша"],"exclude":["Оля"],"note":"короткое пояснение"}
 
 Правила:
 1. intent=debt — кто-то кому-то должен: «Леша должен Диме 3 рубля», «Маша заняла у Пети 10$».
@@ -131,7 +164,19 @@ SYSTEM_PROMPT = """Ты — разборщик сообщений о долга�
 10. Если ниже дан список участников чата, сопоставь людей из сообщения с ним: «Лешак» может
     оказаться «Леша Козлов» (@kozlovAlex). Когда совпадение уверенное — заполни from_user_id
     и to_user_id идентификаторами из списка. Сомневаешься — оставь id пустыми.
-11. «я», «мне», «меня», «мой» — это автор сообщения (он указан в списке): бери его имя и id."""
+11. «я», «мне», «меня», «мой» — это автор сообщения (он указан в списке): бери его имя и id.
+12. intent=expense — один человек платит за всех, и сумму делят поровну: «Дима заплатил 10 за всех»,
+    «я заплатил 10», «Маша оплатила ужин 30 рублей», «Петя скинулся на такси 20 евро».
+    from — кто заплатил («я» — автор сообщения), amount — вся уплаченная сумма, currency — как обычно.
+    Кого включать в делёж:
+    * «за всех», «на всех», «поровну» или про людей вообще не сказано — поле participants не заполняй;
+    * «кроме Оли», «без Пети», «кроме себя» — имена в exclude (для «себя» пиши «я»);
+    * названы конкретные люди («оплатил 10 за Машу и Петю») — перечисли их в participants;
+    * «заплатил за себя» — participants: ["я"].
+13. Не путай expense и repayment: «заплатил 10 за всех», «скинулись на подарок» — это expense
+    (трата делится между участниками); «заплатил/вернул долг Диме 3» — это repayment.
+14. Пометка «не зарегистрирован» в списке участников — не повод отказываться от разбора:
+    верни имя и id как обычно, бот сам попросит человека зарегистрироваться."""
 
 
 def _to_user_id(value: Any) -> int | None:
@@ -264,6 +309,8 @@ class DeepSeekParser:
             currency=_to_currency(data.get("currency")),
             amount=_to_amount(data.get("amount")),
             note=_to_name(data.get("note")),
+            participants=_to_name_list(data.get("participants")),
+            exclude=_to_name_list(data.get("exclude")) or [],
             source="ai",
         )
 
@@ -284,6 +331,23 @@ def _to_name(value: Any) -> str | None:
     if not text or text.lower() in {"none", "null", "unknown", "-"}:
         return None
     return text[:40]
+
+
+def _to_name_list(value: Any) -> list[str] | None:
+    """Список имён из ответа модели: 'Маша, Петя' или ['Маша'] -> ['Маша', 'Петя'].
+
+    Пустой результат — None: это значит «не указано», а не «никого».
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        parts = re.split(r"[,;]|\s+и\s+", value)
+    elif isinstance(value, (list, tuple, set)):
+        parts = [str(item) for item in value]
+    else:
+        return None
+    cleaned = [name for name in (_to_name(part) for part in parts) if name]
+    return cleaned or None
 
 
 def _to_currency(value: Any) -> str | None:
@@ -372,11 +436,55 @@ def _parse_repayment(raw: str, default_currency: str = "BYN") -> ParsedMessage |
     )
 
 
+def _parse_expense(raw: str, default_currency: str = "BYN") -> ParsedMessage | None:
+    """Пытается распознать общий счёт: «Дима заплатил 10 за всех кроме Оли».
+
+    Возвращает None, если фразы про оплату нет или не нашлась сумма. Кого делить —
+    разбирается так: «за всех» (или вообще ничего не сказано) — на весь чат,
+    «кроме Оли» — исключение, «за Машу и Петю» — платили за конкретных людей.
+    """
+    match = EXPENSE_RE.search(raw)
+    if not match:
+        return None
+    payer = match.group("payer")
+    if detect_currency(payer) is not None:
+        return None                     # «рублями заплатил»: слово похоже на имя, но это валюта
+    tail = match.group("tail") or ""
+    numbers = NUMBER_RE.findall(tail[:80]) or NUMBER_RE.findall(raw)
+    amount = _to_amount(numbers[0]) if numbers else None
+    if not amount:
+        return None
+
+    exclude_match = EXCLUDE_RE.search(raw)
+    exclude = _segment_names(exclude_match.group("names")) if exclude_match else []
+
+    participants: list[str] | None = None
+    if SELF_ONLY_RE.search(raw):
+        participants = ["я"]
+    elif not ALL_RE.search(raw):
+        someone = FOR_SOMEONE_RE.search(raw)
+        # Именем считаем только слово с большой буквы: «за ужин» — это не человек,
+        # а «за Машу» — человек (в офлайне без ИИ иначе не отличить).
+        names = _segment_names(someone.group("names")) if someone else []
+        proper = [name for name in names if name[:1].isupper()]
+        participants = proper or None
+
+    return ParsedMessage(
+        intent="expense",
+        from_name=_to_name(payer),
+        currency=detect_currency(tail) or detect_currency(raw) or default_currency,
+        amount=amount,
+        participants=participants,
+        exclude=exclude,
+        source="heuristic",
+    )
+
+
 def heuristic_parse(text: str, default_currency: str = "BYN") -> ParsedMessage | None:
     """Разбор сообщения без внешних сервисов (регулярные выражения).
 
     Понимает «Леша должен Диме 3 рубля», «3 рубля: Леша должен Диме», «Леша вернул Диме 3»,
-    «покажи долги», «валюта по умолчанию доллар».
+    «Дима заплатил 10 за всех кроме Оли», «покажи долги», «валюта по умолчанию доллар».
     """
     raw = (text or "").strip()
     if not raw:
@@ -389,6 +497,12 @@ def heuristic_parse(text: str, default_currency: str = "BYN") -> ParsedMessage |
             return ParsedMessage(intent="set_currency", currency=code, source="heuristic")
     if any(keyword in lowered for keyword in HELP_KEYWORDS):
         return ParsedMessage(intent="help", source="heuristic")
+
+    # Общий счёт («Дима заплатил 10 за всех») проверяем раньше возврата и отчёта:
+    # в таких фразах тоже встречается слово «долг», но это не просьба показать долги.
+    expense = _parse_expense(raw, default_currency)
+    if expense is not None:
+        return expense
 
     # Возврат проверяем до «долг/долги»: «вернул долг Диме 3» — это не отчёт.
     repayment = _parse_repayment(raw, default_currency)

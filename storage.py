@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
 import requests
 
@@ -31,16 +31,25 @@ class Debt:
     raw_text: str | None = None
     created_at: str | None = None
     id: int | None = None
+    group_id: str | None = None         # общий счёт: у долей одного платежа один и тот же group_id
 
     @property
     def is_repayment(self) -> bool:
         """Это возврат долга, а не новый долг."""
         return str(self.kind or "debt").lower() == "repayment"
 
+    @property
+    def is_expense(self) -> bool:
+        """Это доля общего счёта: «Дима заплатил 10 за всех»."""
+        return str(self.kind or "debt").lower() == "expense"
+
     def pretty(self) -> str:
         """Человекочитаемое описание записи."""
         if self.is_repayment:
             return f"↩️ {self.from_name} вернул {self.to_name}: {self.amount:.2f} {self.currency}"
+        if self.is_expense:
+            return (f"🧾 доля общего счёта: {self.from_name} → {self.to_name}: "
+                    f"{self.amount:.2f} {self.currency}")
         return f"{self.from_name} → {self.to_name}: {self.amount:.2f} {self.currency}"
 
 
@@ -66,6 +75,7 @@ def _row_to_debt(row: dict[str, Any]) -> Debt:
         to_user_id=_to_int(row.get("to_user_id")),
         raw_text=row.get("raw_text"),
         created_at=str(row.get("created_at") or "") or None,
+        group_id=str(row.get("group_id") or "") or None,
     )
 
 
@@ -79,6 +89,7 @@ class ChatMember:
     display_name: str = ""             # «Леша Козлов»
     aliases: list[str] = field(default_factory=list)   # «Леша», «Лёха» — подсказки для сопоставления
     last_seen: str | None = None
+    is_registered: bool = False         # отметка /reg: записи ведутся только на зарегистрированных
 
     @property
     def label(self) -> str:
@@ -101,6 +112,7 @@ def _row_to_member(row: dict[str, Any]) -> ChatMember:
         display_name=str(row.get("display_name") or ""),
         aliases=[str(alias) for alias in aliases],
         last_seen=str(row.get("last_seen") or "") or None,
+        is_registered=bool(row.get("is_registered")),
     )
 
 
@@ -110,7 +122,10 @@ class Storage(Protocol):
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
                  amount: float, raw_text: str | None = None,
                  kind: str = "debt", from_user_id: int | None = None,
-                 to_user_id: int | None = None) -> Debt: ...
+                 to_user_id: int | None = None,
+                 group_id: str | None = None) -> Debt: ...
+
+    def add_debts(self, chat_id: int, records: Sequence[Mapping[str, Any]]) -> list[Debt]: ...
 
     def list_debts(self, chat_id: int) -> list[Debt]: ...
 
@@ -118,7 +133,11 @@ class Storage(Protocol):
 
     def delete_last_debt(self, chat_id: int) -> Debt | None: ...
 
+    def delete_group(self, chat_id: int, group_id: str) -> int: ...
+
     def remember_member(self, member: ChatMember) -> None: ...
+
+    def register_member(self, member: ChatMember) -> None: ...
 
     def list_members(self, chat_id: int) -> list[ChatMember]: ...
 
@@ -220,23 +239,18 @@ class SupabaseStorage:
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
                  amount: float, raw_text: str | None = None,
                  kind: str = "debt", from_user_id: int | None = None,
-                 to_user_id: int | None = None) -> Debt:
-        """Сохраняет запись (долг или возврат) и возвращает её."""
+                 to_user_id: int | None = None,
+                 group_id: str | None = None) -> Debt:
+        """Сохраняет запись (долг, возврат или долю общего счёта) и возвращает её."""
         kind = str(kind or "debt").lower()
         rows = self._request(
             "POST",
             self._debts_table,
-            payload={
-                "chat_id": chat_id,
-                "from_name": from_name,
-                "to_name": to_name,
-                "from_user_id": from_user_id,
-                "to_user_id": to_user_id,
-                "currency": currency.upper(),
-                "amount": round(float(amount), 2),
-                "kind": kind,
-                "raw_text": raw_text,
-            },
+            payload=self._debt_body(
+                chat_id, from_name, to_name, currency, amount, kind=kind,
+                from_user_id=from_user_id, to_user_id=to_user_id,
+                raw_text=raw_text, group_id=group_id,
+            ),
             prefer="return=representation",
         )
         if rows:
@@ -245,7 +259,61 @@ class SupabaseStorage:
             chat_id=chat_id, from_name=from_name, to_name=to_name,
             currency=currency.upper(), amount=round(float(amount), 2), kind=kind,
             from_user_id=from_user_id, to_user_id=to_user_id, raw_text=raw_text,
+            group_id=group_id,
         )
+
+    def add_debts(self, chat_id: int, records: Sequence[Mapping[str, Any]]) -> list[Debt]:
+        """Сохраняет несколько записей одним запросом — доли общего счёта.
+
+        Общий счёт («Дима заплатил 10 за всех») — это одна операция, поэтому все доли
+        пишутся одним запросом: они появляются в базе одновременно и с одинаковым
+        group_id, а /undo убирает счёт целиком, а не одну строку.
+        """
+        if not records:
+            return []
+        payload = [
+            self._debt_body(
+                chat_id,
+                str(record.get("from_name") or ""),
+                str(record.get("to_name") or ""),
+                str(record.get("currency") or DEFAULT_CURRENCY),
+                float(record.get("amount") or 0),
+                kind=str(record.get("kind") or "debt"),
+                from_user_id=_to_int(record.get("from_user_id")),
+                to_user_id=_to_int(record.get("to_user_id")),
+                raw_text=record.get("raw_text"),
+                group_id=record.get("group_id"),
+            )
+            for record in records
+        ]
+        rows = self._request(
+            "POST",
+            self._debts_table,
+            payload=payload,
+            prefer="return=representation",
+        )
+        return [_row_to_debt(row) for row in rows or []]
+
+    @staticmethod
+    def _debt_body(chat_id: int, from_name: str, to_name: str, currency: str, amount: float,
+                   *, kind: str = "debt", from_user_id: int | None = None,
+                   to_user_id: int | None = None, raw_text: str | None = None,
+                   group_id: str | None = None) -> dict[str, Any]:
+        """Тело записи для PostgREST: одинаковое для одиночной и групповой вставки."""
+        body: dict[str, Any] = {
+            "chat_id": chat_id,
+            "from_name": from_name,
+            "to_name": to_name,
+            "from_user_id": from_user_id,
+            "to_user_id": to_user_id,
+            "currency": str(currency or DEFAULT_CURRENCY).upper(),
+            "amount": round(float(amount), 2),
+            "kind": str(kind or "debt").lower(),
+            "raw_text": raw_text,
+        }
+        if group_id:
+            body["group_id"] = group_id
+        return body
 
     def list_debts(self, chat_id: int) -> list[Debt]:
         """Все долги чата в порядке добавления."""
@@ -295,22 +363,62 @@ class SupabaseStorage:
         )
         return debt
 
+    def delete_group(self, chat_id: int, group_id: str) -> int:
+        """Удаляет оставшиеся доли одного общего счёта (группа записей по group_id)."""
+        if not group_id:
+            return 0
+        rows = self._request(
+            "DELETE",
+            self._debts_table,
+            params={"chat_id": f"eq.{chat_id}", "group_id": f"eq.{group_id}"},
+            prefer="return=representation",
+        )
+        return len(rows or [])
+
     def remember_member(self, member: ChatMember) -> None:
-        """Запоминает участника чата (upsert по паре chat_id + user_id)."""
+        """Запоминает участника чата (upsert по паре chat_id + user_id).
+
+        Это автообучение по автору сообщения: отметку /reg и уже собранные алиасы
+        такие записи не трогают — иначе каждый ответ бота стирал бы регистрацию.
+        """
         self._request(
             "POST",
             self._members_table,
             params={"on_conflict": "chat_id,user_id"},
-            payload={
-                "chat_id": member.chat_id,
-                "user_id": member.user_id,
-                "username": member.username or None,
-                "display_name": member.display_name,
-                "aliases": list(member.aliases),
-                "last_seen": member.last_seen or datetime.now(timezone.utc).isoformat(),
-            },
+            payload=self._member_body(member),
             prefer="resolution=merge-duplicates,return=minimal",
         )
+
+    def register_member(self, member: ChatMember) -> None:
+        """Сохраняет участника как зарегистрированного: команда /reg с его именами."""
+        payload = self._member_body(member)
+        payload["aliases"] = list(member.aliases)
+        payload["is_registered"] = True
+        self._request(
+            "POST",
+            self._members_table,
+            params={"on_conflict": "chat_id,user_id"},
+            payload=payload,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+    @staticmethod
+    def _member_body(member: ChatMember) -> dict[str, Any]:
+        """Тело участника для PostgREST.
+
+        Алиасы добавляются, только если они есть: пустой список при upsert затёр бы
+        имена, которые человек уже указал через /reg.
+        """
+        body: dict[str, Any] = {
+            "chat_id": member.chat_id,
+            "user_id": member.user_id,
+            "username": member.username or None,
+            "display_name": member.display_name,
+            "last_seen": member.last_seen or datetime.now(timezone.utc).isoformat(),
+        }
+        if member.aliases:
+            body["aliases"] = list(member.aliases)
+        return body
 
     def list_members(self, chat_id: int) -> list[ChatMember]:
         """Участники чата, которых бот успел запомнить (для сопоставления имён)."""
@@ -319,7 +427,7 @@ class SupabaseStorage:
             self._members_table,
             params={
                 "chat_id": f"eq.{chat_id}",
-                "select": "chat_id,user_id,username,display_name,aliases,last_seen",
+                "select": "chat_id,user_id,username,display_name,aliases,last_seen,is_registered",
                 "order": "display_name.asc",
                 "limit": 200,
             },
@@ -383,8 +491,9 @@ class InMemoryStorage:
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
                  amount: float, raw_text: str | None = None,
                  kind: str = "debt", from_user_id: int | None = None,
-                 to_user_id: int | None = None) -> Debt:
-        """Добавляет запись (долг или возврат) в память."""
+                 to_user_id: int | None = None,
+                 group_id: str | None = None) -> Debt:
+        """Добавляет запись (долг, возврат или долю общего счёта) в память."""
         debt = Debt(
             id=self._next_id,
             chat_id=chat_id,
@@ -397,10 +506,29 @@ class InMemoryStorage:
             to_user_id=to_user_id,
             raw_text=raw_text,
             created_at="1970-01-01T00:00:00+00:00",
+            group_id=group_id,
         )
         self._next_id += 1
         self.debts.append(debt)
         return debt
+
+    def add_debts(self, chat_id: int, records: Sequence[Mapping[str, Any]]) -> list[Debt]:
+        """Добавляет несколько записей — доли общего счёта."""
+        return [
+            self.add_debt(
+                chat_id=chat_id,
+                from_name=str(record.get("from_name") or ""),
+                to_name=str(record.get("to_name") or ""),
+                currency=str(record.get("currency") or self.default_currency),
+                amount=float(record.get("amount") or 0),
+                raw_text=record.get("raw_text"),
+                kind=str(record.get("kind") or "debt"),
+                from_user_id=_to_int(record.get("from_user_id")),
+                to_user_id=_to_int(record.get("to_user_id")),
+                group_id=record.get("group_id"),
+            )
+            for record in records
+        ]
 
     def list_debts(self, chat_id: int) -> list[Debt]:
         """Долги конкретного чата."""
@@ -419,8 +547,37 @@ class InMemoryStorage:
                 return self.debts.pop(index)
         return None
 
+    def delete_group(self, chat_id: int, group_id: str) -> int:
+        """Удаляет оставшиеся доли одного общего счёта (группа записей по group_id)."""
+        if not group_id:
+            return 0
+        before = len(self.debts)
+        self.debts = [
+            debt for debt in self.debts
+            if not (debt.chat_id == chat_id and debt.group_id == group_id)
+        ]
+        return before - len(self.debts)
+
     def remember_member(self, member: ChatMember) -> None:
-        """Запоминает участника чата в памяти."""
+        """Запоминает участника чата в памяти, не сбрасывая регистрацию и алиасы."""
+        current = self.members.get((member.chat_id, member.user_id))
+        aliases = list(member.aliases)
+        for alias in current.aliases if current else []:
+            if alias not in aliases:
+                aliases.append(alias)
+        self.members[(member.chat_id, member.user_id)] = ChatMember(
+            chat_id=member.chat_id,
+            user_id=member.user_id,
+            username=member.username or (current.username if current else ""),
+            display_name=member.display_name or member.username
+            or (current.display_name if current else "") or f"id{member.user_id}",
+            aliases=aliases,
+            last_seen=member.last_seen or "1970-01-01T00:00:00+00:00",
+            is_registered=member.is_registered or bool(current and current.is_registered),
+        )
+
+    def register_member(self, member: ChatMember) -> None:
+        """Сохраняет участника как зарегистрированного (/reg) вместе с его именами."""
         self.members[(member.chat_id, member.user_id)] = ChatMember(
             chat_id=member.chat_id,
             user_id=member.user_id,
@@ -428,6 +585,7 @@ class InMemoryStorage:
             display_name=member.display_name or member.username or f"id{member.user_id}",
             aliases=list(member.aliases),
             last_seen=member.last_seen or "1970-01-01T00:00:00+00:00",
+            is_registered=True,
         )
 
     def list_members(self, chat_id: int) -> list[ChatMember]:

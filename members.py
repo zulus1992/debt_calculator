@@ -28,10 +28,13 @@ def normalize(value: str) -> str:
 
 
 def name_key(value: str) -> str:
-    """Ключ сравнения имён: «Диме»/«Дима» → «дим», «Дмитрий»/«Дмитрию» → «дмитр»."""
+    """Ключ сравнения имён: «Диме»/«Дима» → «дим», «Оле»/«Оля» → «ол».
+
+    Снимаем до двух окончаний подряд, но не укорачиваем слово короче трёх букв.
+    """
     key = normalize(value).replace(" ", "")
     for _ in range(2):                       # снимаем максимум два окончания подряд
-        if len(key) >= 4 and key[-1] in CASE_ENDINGS:
+        if len(key) >= 3 and key[-1] in CASE_ENDINGS:
             key = key[:-1]
         else:
             break
@@ -131,6 +134,40 @@ def resolve_side(value: str | None, user_id: int | None, members: Sequence[ChatM
     return member_by_id(user_id, members) or resolve_member(value, members, author)
 
 
+def registered_members(members: Sequence[ChatMember]) -> list[ChatMember]:
+    """Участники с отметкой /reg: только на них бот ведёт записи."""
+    return [member for member in members if member.is_registered]
+
+
+def with_aliases(member: ChatMember, extra: Sequence[str],
+                 limit: int = 30, alias_length: int = 40) -> ChatMember:
+    """Копия участника с добавленными именами (алиасами) и отметкой «зарегистрирован».
+
+    Повторы не добавляются: «женя» и «Женя» — одно и то же имя, второе написание
+    отбрасывается, а первое сохраняется так, как его написал человек.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    for alias in [*member.aliases, *extra]:
+        text = str(alias or "").strip().strip(",").strip()[:alias_length]
+        key = normalize(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(text)
+        if len(merged) >= limit:
+            break
+    return ChatMember(
+        chat_id=member.chat_id,
+        user_id=member.user_id,
+        username=member.username,
+        display_name=member.display_name,
+        aliases=merged,
+        last_seen=member.last_seen,
+        is_registered=True,
+    )
+
+
 def label_for(user_id: int | None, name: str, members: Sequence[ChatMember]) -> str:
     """Человекочитаемое имя: «Леша Козлов (@kozlovAlex)», если участник узнан."""
     member = member_by_id(user_id, members)
@@ -145,9 +182,16 @@ def format_roster(members: Sequence[ChatMember], author: ChatMember | None = Non
     listed = list(members)[:limit]
     if not listed and author is None:
         return ""
-    lines = ["Участники чата (сопоставляй имена из сообщения с ними):"]
-    for member in listed:
-        parts = [f"id={member.user_id}"]
+    lines = [
+        "Участники чата (сопоставляй имена из сообщения с ними):",
+        "Пометка «зарегистрирован» — человек подтвердил свои имена командой /reg. "
+        "Если человек не зарегистрирован, всё равно верни его имя и id: бот сам попросит "
+        "зарегистрироваться, если запись на него невозможна.",
+    ]
+    ordered = sorted(listed, key=lambda item: (not item.is_registered, item.display_name.lower()))
+    for member in ordered:
+        parts = [f"[{'зарегистрирован' if member.is_registered else 'не зарегистрирован'}]",
+                 f"id={member.user_id}"]
         if member.display_name:
             parts.append(member.display_name)
         if member.username:

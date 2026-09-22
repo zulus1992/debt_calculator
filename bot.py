@@ -24,6 +24,7 @@ import re
 import signal
 import sys
 import time
+import uuid
 from typing import Any, Mapping, Sequence
 
 from config import (
@@ -34,12 +35,17 @@ from config import (
     webhook_secret_problem,
 )
 from debts import (
+    ExpenseSummary,
     format_currency_set,
     format_debt_saved,
     format_debts_report,
+    format_expense_saved,
     format_help,
+    format_members_report,
+    format_registered,
     format_repayment_saved,
     normalize_name,
+    split_amount,
 )
 from deepseek import (
     DeepSeekParser,
@@ -49,9 +55,11 @@ from deepseek import (
     heuristic_parse,
 )
 from members import (
-    format_roster,
     member_from_telegram,
+    registered_members,
+    resolve_member,
     resolve_side,
+    with_aliases,
 )
 from storage import ChatMember, InMemoryStorage, Storage, StorageError, SupabaseStorage
 from telegram_api import TelegramBot, TelegramError
@@ -65,15 +73,30 @@ NOT_A_DEBT_REPLY = (
 NOT_A_REPAYMENT_REPLY = (
     "🤔 Похоже на возврат долга, но не хватает данных. Пример: «Леша вернул Диме 3 рубля»."
 )
+NOT_AN_EXPENSE_REPLY = (
+    "🤔 Похоже на общий счёт, но не хватает данных. Пример: «Дима заплатил 10 за всех»."
+)
 UNKNOWN_REPLY = (
     "🤷 Не понял сообщение.\n"
     "• Записать долг: «Леша должен Диме 3 рубля»\n"
     "• Записать возврат: «Леша вернул Диме 3 рубля»\n"
+    "• Общий счёт: «Дима заплатил 10 за всех»\n"
     "• Показать долги: /debts\n"
     "• Справка: /help"
 )
 DENIED_REPLY = "⛔ Извините, этот бот настроен только для определённых пользователей."
 LAST_UPDATE_ID_KEY = "last_update_id"
+# Как связать имя из сообщения с человеком в чате: без /reg записи не ведутся.
+REGISTER_HINT = (
+    "Как это исправить:\n"
+    "• себя: /reg Женя, ЖеняШ, как вас ещё зовут\n"
+    "• другого: /reg @его_ник Гоша, Гоша Петров, кличка\n"
+    "После регистрации повторите сообщение — тогда и запишу.\n"
+    "Кто уже есть в чате: /who"
+)
+REG_HANDLE_RE = re.compile(r"^@(?P<handle>\w{3,32})")
+REG_ALIAS_SPLIT_RE = re.compile(r"[,;]+")
+MAX_SKIPPED_SHOWN = 5
 
 
 class HeuristicParser:
@@ -129,17 +152,207 @@ def _member_name(member: ChatMember | None, fallback: str) -> str:
     return normalize_name(fallback)
 
 
-def _unrecognized_note(members: Sequence[ChatMember], missing: Sequence[str]) -> str:
-    """Подсказка, если кого-то не узнали: как связать имя с человеком в чате."""
-    names = [str(name).strip() for name in missing if str(name or "").strip()]
-    if not names:
+def _not_registered_reply(sides: Sequence[tuple[ChatMember | None, str | None]]) -> str:
+    """Отказ записывать, если сторона записи — не зарегистрированный участник чата.
+
+    Учёт ведётся только по людям с командой /reg: имя из текста, которое ни с кем
+    не связано, — это повод попросить регистрацию, а не повод писать долг «на строку».
+    """
+    unknown: list[str] = []
+    unregistered: list[str] = []
+    for member, name in sides:
+        label = str(name or "").strip()
+        if member is None:
+            if label:
+                unknown.append(label)
+        elif not member.is_registered:
+            unregistered.append(member.label)
+    if not unknown and not unregistered:
         return ""
-    if not members:
-        return (
-            "\nℹ️ Участников чата я пока не знаю — записал по имени. "
-            "Пусть каждый напишет пару слов в чат, и я запомню, кто есть кто."
+    lines = ["❌ Не записал: записываю только на зарегистрированных участников."]
+    if unknown:
+        lines.append("• Не знаю такого человека в чате: " + ", ".join(unknown))
+    if unregistered:
+        lines.append("• Ещё не зарегистрирован: " + ", ".join(unregistered))
+    lines.append("")
+    lines.append(REGISTER_HINT)
+    return "\n".join(lines)
+
+
+def parse_registration(argument: str, author: ChatMember | None,
+                       members: Sequence[ChatMember]) -> tuple[ChatMember | None, list[str], str]:
+    """Разбирает аргументы /reg и отвечает: кого регистрируем, какие имена, что не так.
+
+    Формы:
+      «/reg @Genia Женя, ЖеняШ, шаман» — регистрируем участника с таким @ником;
+      «/reg Женя, ЖеняШ, шаман»        — регистрируем автора сообщения;
+      «/reg @Genia»                    — без новых имён: просто отметить участника.
+    """
+    raw = (argument or "").strip()
+    if not raw:
+        return author, [], ""
+    target: ChatMember | None = author
+    rest = raw
+    handle_match = REG_HANDLE_RE.match(raw)
+    if handle_match:
+        handle = handle_match.group("handle").lower()
+        target = next(
+            (member for member in members if member.username.lower() == handle),
+            None,
         )
-    return f"\nℹ️ Не узнал: {', '.join(names)} — записал по имени."
+        rest = raw[handle_match.end():]
+        if target is None:
+            known = ", ".join(f"@{member.username}" for member in members if member.username)
+            return None, [], (
+                f"❌ Не нашёл @{handle_match.group('handle')} в этом чате.\n"
+                "Я запоминаю людей по их сообщениям — пусть этот человек напишет что-нибудь "
+                "в чат, и я его узнаю.\n"
+                f"Известные @ники: {known or 'пока никого'}.\n"
+                "Себя можно зарегистрировать так: /reg Женя, ЖеняШ, кличка"
+            )
+    elif author is None:
+        return None, [], (
+            "❌ Не понял, кого регистрируем: не вижу автора сообщения.\n"
+            "Напишите так: /reg @его_ник Имя, кличка — или /reg Имя, кличка про себя."
+        )
+    rest = rest.lstrip(":—-–— \t")
+    aliases = [part.strip().lstrip("@") for part in REG_ALIAS_SPLIT_RE.split(rest)]
+    return target, [alias for alias in aliases if alias], ""
+
+
+def register_command(argument: str, storage: Storage, members: Sequence[ChatMember],
+                     author: ChatMember | None) -> str:
+    """Команда /reg: связывает участника чата с именами, по которым его узнают."""
+    target, aliases, problem = parse_registration(argument, author, members)
+    if problem:
+        return problem
+    if target is None:
+        return (
+            "Укажите, кого регистрируем:\n"
+            "• себя: /reg Женя, ЖеняШ, шаман\n"
+            "• другого: /reg @Genie Женя, ЖеняШ"
+        )
+    before = {alias.lower() for alias in target.aliases}
+    updated = with_aliases(target, aliases)
+    added = [alias for alias in updated.aliases if alias.lower() not in before]
+    storage.register_member(updated)
+    return format_registered(updated, added)
+
+
+def _skipped_names(members: Sequence[ChatMember], excluded: Sequence[ChatMember]) -> list[str]:
+    """Кто не участвует в общем счёте: не зарегистрирован (подсказка для ответа)."""
+    excluded_ids = {member.user_id for member in excluded}
+    names = [
+        member.label for member in members
+        if not member.is_registered and member.user_id not in excluded_ids
+    ]
+    if len(names) > MAX_SKIPPED_SHOWN:
+        hidden = len(names) - MAX_SKIPPED_SHOWN
+        names = [*names[:MAX_SKIPPED_SHOWN], f"и ещё {hidden}"]
+    return names
+
+
+def _resolve_group_names(names: Sequence[str], members: Sequence[ChatMember],
+                         fallback_author: ChatMember | None) -> tuple[list[ChatMember], list[str]]:
+    """Сопоставляет имена из сообщения с зарегистрированными участниками чата.
+
+    Возвращает (участники, непонятные имена). Незарегистрированные тоже попадают
+    во второй список: записи на них не ведутся, сначала нужно /reg.
+    """
+    found: list[ChatMember] = []
+    unknown: list[str] = []
+    seen: set[int] = set()
+    for name in names:
+        member = resolve_member(name, members, fallback_author)
+        if member is None or not member.is_registered:
+            unknown.append(str(name))
+        elif member.user_id not in seen:
+            seen.add(member.user_id)
+            found.append(member)
+    return found, unknown
+
+
+def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage,
+                 members: Sequence[ChatMember], author: ChatMember | None,
+                 currency: str = "BYN") -> str:
+    """Записывает общий счёт: делит сумму между участниками чата поровну.
+
+    «Дима заплатил 10 за всех» → каждому, кроме Димы, достаётся доля 10 / 4 = 2.50.
+    «…кроме Оли» — Оля в делёж не входит; «кроме себя» — сам плативший тоже.
+    Оригинал сообщения сохраняется в каждой доле (raw_text), а все доли получают
+    один group_id: благодаря ему /undo убирает общий счёт целиком, а не строку.
+    """
+    if not parsed.is_expense:
+        return NOT_AN_EXPENSE_REPLY
+    payer = resolve_side(parsed.from_name, parsed.from_user_id, members, author)
+    problem = _not_registered_reply([(payer, parsed.from_name)])
+    if problem or payer is None:
+        return problem
+
+    if parsed.participants:
+        participants, unknown = _resolve_group_names(parsed.participants, members, payer)
+        if unknown:
+            return (
+                "❌ Не понял, за кого счёт: " + ", ".join(unknown) + "\n"
+                "За кого платили, тоже должно быть зарегистрировано.\n" + REGISTER_HINT
+            )
+        if payer.user_id not in {member.user_id for member in participants}:
+            participants.append(payer)          # кто платил, тот тоже участник счёта
+    else:
+        participants = registered_members(members)
+
+    excluded: list[ChatMember] = []
+    if parsed.exclude:
+        excluded, unknown_excluded = _resolve_group_names(parsed.exclude, members, payer)
+        if unknown_excluded:
+            return (
+                "❌ Не понял, кого исключить: " + ", ".join(unknown_excluded) + "\n"
+                + REGISTER_HINT
+            )
+
+    excluded_ids = {member.user_id for member in excluded}
+    debtors = [
+        member for member in participants
+        if member.user_id != payer.user_id and member.user_id not in excluded_ids
+    ]
+    if not debtors:
+        return (
+            "🧾 Делить не с кого: кроме платившего, в счёте никого.\n"
+            "Если счёт общий, напишите «… за всех», а остальным нужно "
+            "зарегистрироваться: /reg Имя, кличка."
+        )
+
+    amount = round(float(parsed.amount or 0), 2)
+    payer_in_split = payer.user_id not in excluded_ids
+    people = len(debtors) + (1 if payer_in_split else 0)
+    shares = split_amount(amount, people)
+    pair_shares = list(zip(debtors, shares))
+    group_id = uuid.uuid4().hex[:16]
+    storage.add_debts(chat_id, [
+        {
+            "from_name": _member_name(member, member.label),
+            "to_name": _member_name(payer, payer.label),
+            "from_user_id": member.user_id,
+            "to_user_id": payer.user_id,
+            "currency": currency,
+            "amount": share,
+            "kind": "expense",
+            "raw_text": raw,
+            "group_id": group_id,
+        }
+        for member, share in pair_shares
+    ])
+    return format_expense_saved(ExpenseSummary(
+        payer=payer,
+        currency=currency,
+        amount=amount,
+        share=shares[0] if shares else 0.0,
+        people=people,
+        debtors=pair_shares,
+        excluded=excluded,
+        skipped=_skipped_names(members, excluded),
+        raw_text=raw,
+    ))
 
 
 def handle_text(
@@ -170,6 +383,10 @@ def handle_text(
 
     if command in ("/start", "/help"):
         return format_help(default_currency)
+    if command in ("/reg", "/register"):
+        return register_command(argument, storage, members, author)
+    if command in ("/who", "/members"):
+        return format_members_report(members)
     if command == "/debts":
         return format_debts_report(storage.list_debts(chat_id), default_currency, members)
     if command == "/currency":
@@ -181,6 +398,11 @@ def handle_text(
         removed = storage.delete_last_debt(chat_id)
         if removed is None:
             return "📭 Записей нет — удалять нечего."
+        if removed.group_id:
+            # Общий счёт — одна операция: убираем все его доли, а не одну строку.
+            rest = storage.delete_group(chat_id, removed.group_id)
+            text = f" «{removed.raw_text}»" if removed.raw_text else ""
+            return f"🗑 Удалил общий счёт{text} целиком: записей {rest + 1}."
         return f"🗑 Удалил последнюю запись: {removed.pretty()}"
 
     parsed = parser.parse(raw, default_currency, members=members, author=author)
@@ -193,6 +415,12 @@ def handle_text(
             return NOT_A_REPAYMENT_REPLY if is_repayment else NOT_A_DEBT_REPLY
         member_from = resolve_side(parsed.from_name, parsed.from_user_id, members, author)
         member_to = resolve_side(parsed.to_name, parsed.to_user_id, members, author)
+        problem = _not_registered_reply([
+            (member_from, parsed.from_name),
+            (member_to, parsed.to_name),
+        ])
+        if problem:
+            return problem
         currency = (parsed.currency or explicit_currency or default_currency).upper()
         record = storage.add_debt(
             chat_id=chat_id,
@@ -206,11 +434,13 @@ def handle_text(
             to_user_id=member_to.user_id if member_to else None,
         )
         formatter = format_repayment_saved if is_repayment else format_debt_saved
-        missing = [
-            str(parsed.from_name or "") if member_from is None else "",
-            str(parsed.to_name or "") if member_to is None else "",
-        ]
-        return formatter(record, members) + _unrecognized_note(members, missing)
+        return formatter(record, members)
+
+    if parsed.intent == "expense":
+        return save_expense(
+            parsed, raw, chat_id, storage, members, author,
+            currency=(parsed.currency or explicit_currency or default_currency).upper(),
+        )
 
     if parsed.intent == "debts":
         return format_debts_report(storage.list_debts(chat_id), default_currency, members)
@@ -693,30 +923,39 @@ def check_services(settings: Settings) -> bool:
 
 
 DEMO_MESSAGES = (
-    "Лешак должен Диме 3 рубля",     # «Лешак» — это Леша Козлов, «Диме» — Дмитрий Болт
+    "/who",                                  # кто в чате и кто зарегистрирован
+    "Лешак должен Диме 3 рубля",             # «Лешак» — это Леша Козлов, «Диме» — Дмитрий Болт
+    "/reg Лёха, Лешак",                      # автор (Леша) добавляет себе имена
     "Маша заняла у Пети 10$",
     "покажи долги",
     "валюта по умолчанию доллар",
     "Петя должен Маше 5 долларов",
-    "я должен Диме 2 рубля",         # «я» — это автор сообщения (Леша Козлов)
+    "я должен Диме 2 рубля",                 # «я» — это автор сообщения (Леша Козлов)
     "покажи долги",
-    "Леша вернул Диме 1 рубль",      # возврат: уменьшает сальдо
+    "Леша вернул Диме 1 рубль",              # возврат: уменьшает сальдо
+    "Дима заплатил 10 за всех",              # общий счёт: 10.00 делится на зарегистрированных
+    "Маша оплатила ужин 30 рублей за всех кроме Пети",   # общий счёт с исключением
+    "Гоша должен Диме 4 рубля",              # Гоша не зарегистрирован — записи не будет
+    "/reg @gosha_p Гоша, Гоша Петров",       # регистрируем Гошу по @нику
+    "Гоша должен Диме 4 рубля",              # теперь записывается
     "/debts",
-    "/undo",                         # отменяем последнюю запись (возврат)
+    "/undo",                                 # убираем последний счёт или запись
     "/currency BYN",
     "привет",
 )
 
 # Участники демо-чата: так бот понимает, что «Лешак» и «Лёха» — это @kozlovAlex.
+# Гоша специально без отметки /reg — на нём видно, как бот просит регистрацию.
 DEMO_MEMBERS = (
     ChatMember(chat_id=1, user_id=101, username="kozlovAlex", display_name="Леша Козлов",
-               aliases=["Леша", "Лёха", "Лешак"]),
+               aliases=["Леша"], is_registered=True),
     ChatMember(chat_id=1, user_id=102, username="bdzmity", display_name="Дмитрий Болт",
-               aliases=["Дима", "Димон"]),
+               aliases=["Дима", "Димон"], is_registered=True),
     ChatMember(chat_id=1, user_id=103, username="petrova_m", display_name="Маша Петрова",
-               aliases=["Маша"]),
+               aliases=["Маша"], is_registered=True),
     ChatMember(chat_id=1, user_id=104, username="petya_k", display_name="Петя Кузнецов",
-               aliases=["Петя"]),
+               aliases=["Петя"], is_registered=True),
+    ChatMember(chat_id=1, user_id=105, username="gosha_p", display_name="Гоша Петров"),
 )
 
 

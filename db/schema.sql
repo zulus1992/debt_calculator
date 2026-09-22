@@ -26,19 +26,17 @@ create index if not exists debts_chat_created_idx
 create index if not exists debts_pairs_idx
     on public.debts (chat_id, from_name, to_name, currency);
 
--- Тип записи: обычный долг или возврат («Леша вернул Диме 3 рубля»).
+-- Тип записи: долг, возврат («Леша вернул Диме 3 рубля») или доля общего счёта
+-- («Дима заплатил 10 за всех» — сумма делится между участниками).
 -- Возврат уменьшает сальдо: from_name вернул to_name сумму amount.
 alter table public.debts add column if not exists kind text not null default 'debt';
-do $$
-begin
-    alter table public.debts
-        add constraint debts_kind_check check (kind in ('debt', 'repayment'));
-exception
-    when duplicate_object then null;   -- ограничение уже есть (повторный запуск схемы)
-end $$;
+-- Ограничение пересоздаём: при первом применении схемы оно было только на debt/repayment.
+alter table public.debts drop constraint if exists debts_kind_check;
+alter table public.debts add constraint debts_kind_check
+    check (kind in ('debt', 'repayment', 'expense'));
 
 comment on column public.debts.kind is
-    'debt — долг, repayment — возврат: from_name вернул to_name сумму amount';
+    'debt — долг, repayment — возврат, expense — доля общего счёта (кто-то заплатил за всех)';
 
 -- Привязка записей к пользователям Telegram: если бот узнал человека в списке участников
 -- чата, долг хранится на его user id, а не только на имя (тогда «Лешак» и «Леша» — одно лицо).
@@ -49,6 +47,16 @@ comment on column public.debts.to_user_id   is 'Telegram user id кредито�
 
 create index if not exists debts_users_idx
     on public.debts (chat_id, from_user_id, to_user_id);
+
+-- Общий счёт («Дима заплатил 10 за всех») — одна операция из нескольких строк-долей:
+-- у всех долей одной оплаты одинаковый group_id. По нему видно оригинал сообщения,
+-- и /undo убирает весь счёт целиком, а не одну строку.
+alter table public.debts add column if not exists group_id text;
+comment on column public.debts.group_id is
+    'Идентификатор общего счёта: одинаковый у всех долей одной оплаты (для /undo)';
+
+create index if not exists debts_group_idx
+    on public.debts (chat_id, group_id);
 
 -- Участники чата: бот запоминает авторов сообщений, чтобы понимать, кто такой «Лешак»,
 -- и сопоставлять имена из сообщений с реальными пользователями (@ники и id).
@@ -66,6 +74,12 @@ comment on table public.chat_members is
     'Участники чата: id, @ник, имя и алиасы — по ним долги привязываются к пользователям';
 comment on column public.chat_members.aliases is
     'Как ещё зовут человека в чате: «Леша», «Лёха» — подсказка для сопоставления имён';
+
+-- Регистрация (/reg): человек сам связывает себя с именами, по которым его узнают.
+-- Записи (долги, возвраты, общие счета) ведутся только на зарегистрированных.
+alter table public.chat_members add column if not exists is_registered boolean not null default false;
+comment on column public.chat_members.is_registered is
+    'true — человек выполнил /reg: только на таких участников бот записывает долги';
 
 create index if not exists chat_members_chat_idx
     on public.chat_members (chat_id);

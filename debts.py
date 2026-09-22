@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
 from members import label_for, member_by_id
@@ -92,6 +92,19 @@ def _label(labels: Mapping[str, str], key: str) -> str:
     return labels.get(key) or key.split(":", 1)[-1].capitalize()
 
 
+def split_amount(amount: float, people: int) -> list[float]:
+    """Делит сумму на равные доли без потери копеек: 10 на 3 → [3.34, 3.33, 3.33].
+
+    Считаем в копейках, поэтому сумма долей всегда равна исходной сумме:
+    «лишние» копейки достаются первым участникам списка.
+    """
+    if people <= 0:
+        return []
+    cents = int(round(float(amount) * 100))
+    base, rest = divmod(cents, people)
+    return [round((base + (1 if index < rest else 0)) / 100, 2) for index in range(people)]
+
+
 def net_balances(debts: Sequence[Debt], members: Sequence[ChatMember] = ()) -> list[Balance]:
     """Сальдо по парам с взаимозачётом: (A→B 10) + (B→A 4) = A→B 6."""
     labels = person_labels(debts, members)
@@ -171,13 +184,120 @@ def format_repayment_saved(debt: Debt, members: Sequence[ChatMember] = ()) -> st
     ])
 
 
+@dataclass(frozen=True)
+class ExpenseSummary:
+    """Что записали по общему счёту — для человеческого ответа в чат."""
+
+    payer: ChatMember
+    currency: str
+    amount: float
+    share: float
+    people: int                                        # на сколько человек разделили
+    debtors: list[tuple[ChatMember, float]]            # (участник, его доля)
+    excluded: list[ChatMember] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)   # не участвуют (не зарегистрированы)
+    raw_text: str = ""
+
+
+def format_expense_saved(summary: ExpenseSummary) -> str:
+    """Ответ на записанный общий счёт: кто платил, на кого делили и сколько с каждого."""
+    lines = [
+        "🧾 Записал общий счёт:",
+        f"• Заплатил: {summary.payer.label}",
+        f"• Сумма: {summary.amount:.2f} {summary.currency} — делю на {summary.people} чел.",
+        f"• С каждого: {summary.share:.2f} {summary.currency}",
+    ]
+    if summary.debtors:
+        shown = ", ".join(
+            f"{member.label} — {amount:.2f} {summary.currency}"
+            for member, amount in summary.debtors[:MAX_ROWS_IN_HISTORY]
+        )
+        lines.append(f"• Кто скидывается: {shown}")
+    else:
+        lines.append("• Делить не с кем — все остальные исключены.")
+    if summary.excluded:
+        lines.append("• Исключены: " + ", ".join(member.label for member in summary.excluded))
+    if summary.skipped:
+        lines.append("• Не участвуют (не зарегистрированы): " + ", ".join(summary.skipped))
+    if summary.raw_text:
+        lines.append(f"• Оригинал сохранён: «{summary.raw_text}»")
+    lines.append("Итог с учётом счёта: /debts")
+    return "\n".join(lines)
+
+
+def format_registered(member: ChatMember, added: Sequence[str] = ()) -> str:
+    """Ответ на /reg: кого зарегистрировали и по каким именам его теперь узнают."""
+    lines = [f"✅ Зарегистрировал: {member.label}"]
+    if member.aliases:
+        lines.append("• Узнаю по именам: " + ", ".join(member.aliases))
+    else:
+        lines.append("• Узнаю по имени и @нику из Telegram.")
+        lines.append("• Добавить другие имена: /reg Лёха, Лешак, кличка")
+    if added:
+        lines.append("• Добавлено сейчас: " + ", ".join(added))
+    lines.append("• Записи с этими именами теперь попадут на него, а не на строку текста.")
+    lines.append("Кто уже зарегистрирован: /who")
+    return "\n".join(lines)
+
+
+def format_members_report(members: Sequence[ChatMember]) -> str:
+    """Ответ на /who: состав чата и отметка регистрации."""
+    if not members:
+        return (
+            "👥 Пока никого не знаю. Пусть каждый напишет пару слов в чат — и я запомню, "
+            "кто есть кто.\nЗатем зарегистрируйтесь: /reg Имя, кличка, как ещё вас зовут."
+        )
+    registered = [member for member in members if member.is_registered]
+    lines = [
+        f"👥 Кто есть кто в чате (зарегистрированы: {len(registered)} из {len(members)}).",
+        "Долги, возвраты и общие счета записываю только на зарегистрированных:",
+    ]
+    for member in sorted(members, key=lambda item: (not item.is_registered, item.label.lower())):
+        mark = "✅" if member.is_registered else "⬜"
+        names = f" — имена: {', '.join(member.aliases)}" if member.aliases else ""
+        lines.append(f"{mark} {member.label}{names}")
+    lines.append("")
+    lines.append("Зарегистрировать себя: /reg Женя, ЖеняШ, как вас ещё зовут")
+    lines.append("Зарегистрировать другого: /reg @его_ник Имя, кличка")
+    return "\n".join(lines)
+
+
 def _row_line(debt: Debt, labels: Mapping[str, str]) -> str:
     """Строка записи для отчёта: «Леша Козлов → Дмитрий Болт: 3.00 BYN»."""
     left = _label(labels, identity_of(debt.from_user_id, debt.from_name))
     right = _label(labels, identity_of(debt.to_user_id, debt.to_name))
     if debt.is_repayment:
         return f"↩️ {left} вернул {right}: {debt.amount:.2f} {debt.currency}"
+    if debt.is_expense:
+        return f"🧾 {left} → {right}: {debt.amount:.2f} {debt.currency} (доля общего счёта)"
     return f"{left} → {right}: {debt.amount:.2f} {debt.currency}"
+
+
+def _expense_lines(debts: Sequence[Debt], labels: Mapping[str, str]) -> list[str]:
+    """Блок «Общие счета»: один оплаченный счёт — строка с оригиналом сообщения.
+
+    Доли одного платежа объединяются по group_id (а если он не сохранился —
+    по тексту сообщения и плательщику).
+    """
+    groups: dict[tuple[str, str], list[Debt]] = {}
+    for debt in debts:
+        creditor = identity_of(debt.to_user_id, debt.to_name)
+        group_key = (debt.group_id or "", creditor)
+        groups.setdefault(group_key, []).append(debt)
+
+    lines: list[str] = []
+    for group in groups.values():
+        first = group[0]
+        payer = _label(labels, identity_of(first.to_user_id, first.to_name))
+        share = first.amount
+        currency = first.currency
+        text = (first.raw_text or "").strip()
+        title = f"«{text}»" if text else f"{payer} оплатил"
+        lines.append(
+            f"• 🧾 {title} — платил {payer}, доля {share:.2f} {currency}, "
+            f"должников {len(group)}"
+        )
+    return lines
 
 
 def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN",
@@ -194,6 +314,7 @@ def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN",
     owes, owed = totals_by_person(debts, members)
     debts_only = [debt for debt in debts if not debt.is_repayment]
     repayments = [debt for debt in debts if debt.is_repayment]
+    expenses = [debt for debt in debts if debt.is_expense]
     total_by_currency: dict[str, float] = defaultdict(float)
     returned_by_currency: dict[str, float] = defaultdict(float)
     for debt in debts_only:
@@ -223,6 +344,11 @@ def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN",
         lines.append("")
         lines.append("Итого по людям (с учётом возвратов):")
         lines.extend(people)
+
+    if expenses:
+        lines.append("")
+        lines.append("Общие счета (🧾 сумма счёта делится между участниками):")
+        lines.extend(_expense_lines(expenses, labels))
 
     if repayments:
         lines.append("")
@@ -255,6 +381,11 @@ def format_help(default_currency: str = "BYN") -> str:
     return "\n".join([
         "🤖 Калькулятор долгов. Что умею:",
         "",
+        "0. Зарегистрировать участников — без этого записи не ведутся:",
+        "   /reg Женя, ЖеняШ, жена, шаман — как вас ещё зовут в чате",
+        "   /reg @Genia Женя, ЖеняШ, жекич — зарегистрировать другого участника",
+        "   /who — кто уже есть в чате и кто зарегистрирован",
+        "",
         "1. Записать долг — просто напишите сообщением:",
         "   «Леша должен Диме 3 рубля» или «Маша заняла у Пети 10$».",
         "   Разбираю через DeepSeek: кто должен, кому, сколько и в какой валюте.",
@@ -262,14 +393,20 @@ def format_help(default_currency: str = "BYN") -> str:
         "2. Записать возврат долга (уменьшает сальдо):",
         "   «Леша вернул Диме 3 рубля» или «Маша отдала Пете 10$».",
         "",
-        "3. Показать и посчитать долги (с взаимозачётом):",
+        "3. Общий счёт — делю сумму между участниками поровну:",
+        "   «Дима заплатил 10 за всех», «я заплатил 10»,",
+        "   «Маша оплатила ужин 30 рублей за всех кроме Оли»,",
+        "   «Петя скинулся на такси 20 кроме себя».",
+        "   Оригинал сообщения сохраняю в записи, а /undo убирает весь счёт целиком.",
+        "",
+        "4. Показать и посчитать долги (с взаимозачётом):",
         "   /debts или «покажи долги»",
         "",
-        "4. Задать валюту по умолчанию:",
+        "5. Задать валюту по умолчанию:",
         f"   /currency BYN или «валюта по умолчанию доллар» (сейчас: {default_currency})",
         "",
-        "5. Удалить последнюю запись: /undo",
-        "6. Удалить все записи этого чата: /reset",
+        "6. Удалить последнюю запись: /undo",
+        "7. Удалить все записи этого чата: /reset",
         "",
         "Данные хранятся в Supabase, отдельно по каждому чату.",
     ])

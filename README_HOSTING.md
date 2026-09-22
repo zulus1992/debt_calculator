@@ -205,6 +205,7 @@ python bot.py                             # постоянный процесс,
 | На PythonAnywhere `--check` ругается на DeepSeek/Supabase (403/503, ошибка прокси) | домен не в allowlist бесплатного аккаунта: заявка на добавление, платный аккаунт или Vercel |
 | На PythonAnywhere в error log `ImportError: No module named webhook` | в WSGI-файле неверный путь к проекту (должен быть `/home/USERNAME/debt_calculator`) или не сделан **Reload** |
 | `Таблица не найдена (HTTP 404): chat_members` | не применена свежая схема: выполните `db/schema.sql` в Supabase → SQL Editor (таблица добавляется идемпотентно) |
+| `column is_registered does not exist` или `column group_id does not exist` | схема в Supabase старее кода: выполните `db/schema.sql` ещё раз — колонки и тип `kind = 'expense'` добавляются идемпотентно |
 | Хочется «пинговать» сервис, чтобы не остывал | `GET https://<адрес>/api/telegram` отвечает `ok` — годится для uptime-мониторов |
 
 Дальше в этом файле описан **способ 1** — постоянный процесс на панели хостинга.
@@ -269,10 +270,13 @@ python bot.py                             # постоянный процесс,
    git pull origin hosting
    ```
 2. **Restart** сервера в панели. Зависимости переустановятся сами — это делает `start.sh`.
+3. Если код обновился до версии с регистрацией участников (`/reg`) и общими счетами — **повторно
+   выполните `db/schema.sql`** в Supabase → SQL Editor: добавятся таблица/колонки
+   `chat_members.is_registered`, `debts.group_id` и тип записи `kind = 'expense'`.
 
 Локально перед загрузкой полезно прогнать проверки:
 ```powershell
-python -m unittest tests.test_pipeline   # 54 теста, без внешних сервисов
+python -m unittest tests.test_pipeline   # 192 теста, без внешних сервисов
 python bot.py --check                    # проверка ключей и сервисов
 ```
 
@@ -282,7 +286,7 @@ python bot.py --check                    # проверка ключей и се
 |---|---|
 | `HTTP 409 Conflict` | работает второй «слушатель»: отключите cron в ветке `main` (Actions → отключить workflow) или остановите локальный `python bot.py` |
 | `Sweep...` / бот не отвечает, в логе «Новых сообщений нет» | процесс живёт, но ключи неверны — смотрите вывод шага `--check` в консоли сервера |
-| `Таблица не найдена (HTTP 404)` | в Supabase не применён `db/schema.sql` (нужны `debts`, `bot_settings`, `bot_state`) |
+| `Таблица не найдена (HTTP 404)` | в Supabase не применён `db/schema.sql` (нужны `debts`, `chat_members`, `bot_settings`, `bot_state`) |
 | `ключ с ролью «anon»` | в `.env` попал anon-ключ; нужен `service_role` (Supabase → API Keys → Reveal) |
 | Ответ приходит с задержкой в десятки минут | вы всё ещё смотрите на Actions-режим (ветка `main`) или хостинг «усыпляет» процесс (у бесплатных тарифов бывает авто-сон) |
 | Контейнер перезапускается сам | смотрите лимиты RAM/CPU тарифа; боту достаточно 256–512 МБ, но панель может ограничивать жёстче |

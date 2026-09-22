@@ -1,0 +1,9 @@
+﻿ M README.md
+ M README_HOSTING.md
+ M bot.py
+ M db/schema.sql
+ M debts.py
+ M deepseek.py
+ M members.py
+ M storage.py
+ M tests/test_pipeline.py
