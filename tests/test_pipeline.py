@@ -295,13 +295,15 @@ class FakeTelegram:
     def __init__(self, updates: list[dict]) -> None:
         self.updates = list(updates)
         self.sent: list[tuple[int, str]] = []
+        self.offsets: list[int | None] = []
 
     def get_me(self) -> dict:
         """Имя бота для логов."""
         return {"id": 1, "username": "test_bot"}
 
     def get_updates(self, offset=None, *, poll_timeout: int = 30, limit: int = 20) -> list[dict]:
-        """Отдаёт подготовленные апдейты."""
+        """Отдаёт подготовленные апдейты и запоминает запрошенное смещение."""
+        self.offsets.append(offset)
         return self.updates
 
     def send_message(self, chat_id, text: str, *, reply_to=None, silent: bool = False) -> list[dict]:
@@ -571,6 +573,52 @@ class SupabaseKeyValidationTests(unittest.TestCase):
             use_env_file=False,
         )
         self.assertEqual(settings.problems(), [])
+
+
+class LongPollingTests(unittest.TestCase):
+    """Постоянный режим (хостинг): старт с сохранённого смещения и его запись при выходе."""
+
+    def build(self, updates: list[dict]):
+        """Бот с хранилищем в памяти и фейковым Telegram."""
+        settings = Settings(default_currency="BYN")
+        storage = InMemoryStorage(default_currency="BYN")
+        telegram = FakeTelegram(updates)
+        return DebtBot(settings, storage, HeuristicParser(), telegram), storage, telegram
+
+    def test_run_uses_saved_offset_and_persists_it(self) -> None:
+        bot, storage, telegram = self.build([make_update(20, "Леша должен Диме 3 рубля")])
+        storage.set_state("last_update_id", "15")
+        bot.run(poll_timeout=5, max_updates=1)
+        self.assertEqual(telegram.offsets[0], 15)               # старт с сохранённого смещения
+        self.assertEqual(storage.get_state("last_update_id"), "21")  # записал после обработки
+        self.assertEqual(len(storage.list_debts(7)), 1)
+        self.assertIn("Записал долг", telegram.sent[0][1])
+
+    def test_run_without_saved_offset_requests_everything(self) -> None:
+        bot, storage, telegram = self.build([make_update(1, "/help")])
+        bot.run(poll_timeout=0, max_updates=1)
+        self.assertIsNone(telegram.offsets[0])                  # обработать всё, что накопилось
+
+    def test_run_with_limit_stops_on_empty_batch(self) -> None:
+        bot, storage, telegram = self.build([])
+        self.assertEqual(bot.run(poll_timeout=0, max_updates=5), 0)   # без бесконечного цикла
+        self.assertEqual(len(telegram.offsets), 1)
+
+    def test_run_survives_broken_state_storage(self) -> None:
+        class BrokenState(InMemoryStorage):
+            """Хранилище, у которого не работает bot_state."""
+
+            def get_state(self, key: str, default: str | None = None) -> str | None:
+                raise StorageError("нет таблицы bot_state")
+
+            def set_state(self, key: str, value: str) -> None:
+                raise StorageError("нет таблицы bot_state")
+
+        settings = Settings(default_currency="BYN")
+        telegram = FakeTelegram([make_update(3, "Леша должен Диме 3 рубля")])
+        bot = DebtBot(settings, BrokenState(), HeuristicParser(), telegram)
+        self.assertEqual(bot.run(poll_timeout=5, max_updates=1), 1)   # не падает из-за состояния
+        self.assertIn("Записал долг", telegram.sent[0][1])
 
 
 if __name__ == "__main__":

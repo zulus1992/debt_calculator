@@ -126,6 +126,11 @@ python -m unittest tests.test_pipeline -v
 Для Termux: `pkg install python`, `pip install requests`, положить проект в `~/debt_calculator`,
 создать `.env` и запускать `termux-wake-lock && python bot.py &`.
 
+**Нужны мгновенные ответы (постоянный процесс)?** Используйте ветку **`hosting`**:
+в ней бот работает на long polling, cron в Actions отключён (чтобы не конфликтовал за апдейты),
+добавлены `start.sh` и `Procfile` для панелей хостинга. Подробная инструкция —
+[README_HOSTING.md](README_HOSTING.md).
+
 ## Вариант: полностью в GitHub Actions (без ПК и без хостинга)
 
 Бот умеет работать «пачками»: раз в 30 минут GitHub поднимает runner, забирает накопившиеся

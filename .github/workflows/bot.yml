@@ -1,21 +1,17 @@
-name: Бот-калькулятор долгов
+name: Диагностика настроек и сервисов (ручной запуск)
+
+# ВАЖНО: в ветке hosting основной режим — постоянный процесс на хостинге (long polling),
+# поэтому расписание (cron) здесь отключено намеренно: два одновременных getUpdates
+# дают HTTP 409 Conflict и «воруют» друг у друга сообщения.
+# Оставлен только ручной запуск — проверить секреты и доступность сервисов.
 
 on:
-  schedule:
-    # Время в UTC. Каждые 30 минут бот забирает накопившиеся сообщения Telegram.
-    # Точность запуска GitHub не гарантирует: задержка 5–30 минут — норма.
-    - cron: "*/30 * * * *"
-  workflow_dispatch: # кнопка «Run workflow» — обработать сообщения прямо сейчас, с телефона
-
-concurrency:
-  # Два одновременных запуска недопустимы: параллельный getUpdates даёт ошибку HTTP 409
-  group: debt-bot
-  cancel-in-progress: false
+  workflow_dispatch:
 
 jobs:
-  process:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
@@ -33,19 +29,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Кэш pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ hashFiles('requirements.txt') }}
-
       - name: Установить зависимости
         run: pip install -r requirements.txt
 
       - name: "Диагностика: настройки и сервисы"
-        if: always()
-        continue-on-error: true
         run: python bot.py --check
 
-      - name: Обработать накопившиеся сообщения
-        run: python bot.py --once
+      - name: Тесты
+        run: python -m unittest tests.test_pipeline
+

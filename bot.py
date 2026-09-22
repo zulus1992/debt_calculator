@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
 """Телеграм-бот «калькулятор долгов»: DeepSeek разбирает сообщение, Supabase хранит долги.
 
-Запуск:
-    python bot.py                 # рабочий режим (длинный опрос Telegram)
-    python bot.py --check         # проверить настройки и доступность сервисов
-    python bot.py --demo          # демонстрация без Telegram (в памяти, офлайн-разбор)
+Режимы:
+    python bot.py            # постоянный процесс (long polling), ответы мгновенно — для хостинга
+    python bot.py --once     # обработать накопившееся и выйти — для GitHub Actions/cron
+    python bot.py --check    # проверить настройки и доступность сервисов
+    python bot.py --demo     # демонстрация без Telegram (в памяти, офлайн-разбор)
+
+Важно: одновременно должен работать только ОДИН режим — Telegram отдаёт апдейты
+одному «слушателю», второй получит HTTP 409 Conflict.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 import time
 from typing import Any, Mapping
@@ -155,28 +160,74 @@ class DebtBot:
         self._storage = storage
         self._parser = parser
         self._telegram = telegram
+        self._stop = False
 
     def run(self, poll_timeout: int = 25, max_updates: int | None = None) -> int:
-        """Цикл опроса. max_updates ограничивает число обработанных сообщений (для тестов)."""
+        """Постоянный режим (long polling): ответы приходят мгновенно.
+
+        Используется на хостинге: процесс живёт всё время, при остановке контейнера
+        (SIGTERM/SIGINT) корректно завершается и сохраняет смещение в bot_state,
+        чтобы после перезапуска или возврата к режиму `--once` ничего не путалось.
+        """
         me = self._telegram.get_me()
+        offset = self._load_offset()
         logger.info(
-            "Бот @%s (id %s) запущен. Остановка — Ctrl+C.", me.get("username"), me.get("id")
+            "Бот @%s (id %s) запущен (long polling). Стартовое смещение: %s",
+            me.get("username"), me.get("id"), offset,
         )
-        offset: int | None = None
+        self._install_signal_handlers()
         processed = 0
-        while True:
-            try:
-                updates = self._telegram.get_updates(offset, poll_timeout=poll_timeout)
-            except TelegramError as exc:
-                logger.error("getUpdates: %s", exc)
-                time.sleep(5)
+        try:
+            while not self._stop:
+                try:
+                    updates = self._telegram.get_updates(offset, poll_timeout=poll_timeout)
+                except TelegramError as exc:
+                    logger.error("getUpdates: %s", exc)
+                    time.sleep(5)
+                    continue
+                for update in updates:
+                    offset = int(update.get("update_id") or 0) + 1
+                    self._process(update)
+                    processed += 1
+                    if max_updates is not None and processed >= max_updates:
+                        return processed
+                if not updates and max_updates is not None:
+                    # Тестовый/отладочный режим: не крутимся вхолостую на пустой пачке
+                    # (в обычном режиме getUpdates ждёт сообщения до poll_timeout секунд).
+                    break
+        finally:
+            self._save_offset(offset)
+        logger.info("Остановлено. Обработано сообщений за сессию: %d", processed)
+        return processed
+
+    def _install_signal_handlers(self) -> None:
+        """SIGTERM/SIGINT -> мягкая остановка (контейнеры хостинга гасят процесс именно так)."""
+        def handler(signum: int, _frame: Any) -> None:
+            logger.info("Получен сигнал %s — останавливаюсь.", signum)
+            self._stop = True
+
+        for name in ("SIGTERM", "SIGINT"):
+            signum = getattr(signal, name, None)
+            if signum is None:
                 continue
-            for update in updates:
-                offset = int(update.get("update_id") or 0) + 1
-                self._process(update)
-                processed += 1
-                if max_updates is not None and processed >= max_updates:
-                    return processed
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):  # не главный поток — просто пропускаем
+                pass
+
+    def _save_offset(self, offset: int | None) -> None:
+        """Сохраняет смещение апдейтов; ошибки только логируются.
+
+        В постоянном режиме это «удобство для переезда»: если сохранение не удалось,
+        цикл опроса не должен из-за этого падать (в режиме --once ошибка фатальна,
+        потому что там смещение защищает от повторной обработки сообщений).
+        """
+        if offset is None:
+            return
+        try:
+            self._storage.set_state(LAST_UPDATE_ID_KEY, str(offset))
+        except StorageError as exc:
+            logger.warning("Не удалось сохранить смещение апдейтов: %s", exc)
 
     def run_once(self, limit: int = 100) -> int:
         """Обрабатывает накопившиеся апдейты и выходит (режим GitHub Actions / cron).
