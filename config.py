@@ -6,11 +6,18 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
 ENV_FILE = Path(__file__).with_name(".env")
+
+# Telegram принимает секрет вебхука только из A-Z, a-z, 0-9, «_» и «-», 1–256 символов.
+WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+WEBHOOK_SECRET_HINT = (
+    'Сгенерируйте: python -c "import secrets; print(secrets.token_urlsafe(32))"'
+)
 
 DEFAULT_DEEPSEEK_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-chat"
@@ -55,6 +62,7 @@ class Settings:
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)
     request_timeout: float = 30.0
     log_level: str = "INFO"
+    webhook_secret: str = ""
 
     @property
     def rest_url(self) -> str:
@@ -139,6 +147,26 @@ def supabase_key_problem(key: str) -> str | None:
     )
 
 
+def webhook_secret_problem(secret: str) -> str | None:
+    """Проверяет секрет вебхука и возвращает текст проблемы (None — секрет подходит).
+
+    Без секрета эндпоинт вебхука отказывает в обработке: адрес виден в интернете,
+    и без проверки заголовка любой желающий мог бы «писать от имени Telegram».
+    """
+    value = _clean(secret)
+    if not value:
+        return (
+            "WEBHOOK_SECRET не задан — эндпоинт вебхука ничего не обработает. "
+            f"{WEBHOOK_SECRET_HINT}"
+        )
+    if not WEBHOOK_SECRET_RE.match(value):
+        return (
+            "WEBHOOK_SECRET содержит недопустимые символы: Telegram принимает только "
+            "A-Z, a-z, 0-9, «_», «-» (до 256 символов)."
+        )
+    return None
+
+
 def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = True) -> Settings:
     """Собирает настройки: аргумент -> окружение процесса -> .env -> значения по умолчанию."""
     source: Mapping[str, str] = os.environ if env is None else env
@@ -172,6 +200,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         allowed_user_ids=_parse_user_ids(get("ALLOWED_USER_IDS")),
         request_timeout=timeout,
         log_level=get("LOG_LEVEL", "INFO").upper(),
+        webhook_secret=get("WEBHOOK_SECRET"),
     )
 
 

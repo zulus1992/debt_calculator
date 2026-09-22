@@ -82,6 +82,41 @@ class TelegramBot:
         result = self.call("getUpdates", http_timeout=max(self._timeout, poll_timeout + 10), **payload)
         return list(result or [])
 
+    def set_webhook(
+        self,
+        url: str,
+        *,
+        secret_token: str | None = None,
+        drop_pending_updates: bool = False,
+        allowed_updates: tuple[str, ...] = ("message",),
+        max_connections: int | None = None,
+    ) -> bool:
+        """Переводит бота на вебхук: Telegram сам присылает апдейты на url.
+
+        url — только HTTPS (порты 443/80/88/8443) и доступен из интернета.
+        secret_token Telegram присылает обратно в заголовке
+        X-Telegram-Bot-Api-Secret-Token — по нему эндпоинт отличает Telegram
+        от посторонних запросов.
+        """
+        payload: dict[str, Any] = {
+            "url": url,
+            "drop_pending_updates": drop_pending_updates,
+            "allowed_updates": list(allowed_updates),
+        }
+        if secret_token:
+            payload["secret_token"] = secret_token
+        if max_connections is not None:
+            payload["max_connections"] = max_connections
+        return bool(self.call("setWebhook", **payload))
+
+    def delete_webhook(self, *, drop_pending_updates: bool = False) -> bool:
+        """Убирает вебхук — бот снова готов к long polling."""
+        return bool(self.call("deleteWebhook", drop_pending_updates=drop_pending_updates))
+
+    def get_webhook_info(self) -> dict[str, Any]:
+        """Состояние вебхука: url, pending_update_count, последняя ошибка доставки."""
+        return dict(self.call("getWebhookInfo") or {})
+
     def send_message(
         self,
         chat_id: int | str,

@@ -9,6 +9,7 @@
 | Файл | Отличие |
 |---|---|
 | `bot.py` | `run()` стартует с сохранённого `last_update_id`, ловит SIGTERM/SIGINT (мягкая остановка контейнера) и сохраняет смещение при выключении |
+| `webhook.py`, `api/telegram.py`, `vercel.json` | режим вебхука: Telegram сам присылает апдейты на HTTPS-эндпоинт — постоянный процесс не нужен (см. «Способ 2» ниже) |
 | `.github/workflows/bot.yml` | **cron отключён** (оставлен только ручной запуск «Диагностика настроек и сервисов» + тесты) — иначе Actions и хостинг будут воевать за одни сообщения |
 | `start.sh` | новая точка входа для панели: ставит зависимости, проверяет настройки, запускает бота в постоянном режиме |
 | `Procfile` | для хостингов, которые читают Procfile (Railway и подобные) |
@@ -17,6 +18,91 @@
 > ⚠️ Держите запущенным **только один** экземпляр. Если параллельно останется cron из ветки
 > `main` или второй процесс на ПК, Telegram отдаст апдейты одному «слушателю», а второй получит
 > `HTTP 409 Conflict`. На этой ветке cron уже убран; проверьте, что вы не запускаете `python bot.py` ещё где-то.
+
+## Способ 2: вебхук — мгновенные ответы бесплатно, без постоянного процесса
+
+Так бот работает на **serverless-хостинге**: Telegram сам присылает каждый апдейт отдельным
+HTTPS-запросом на наш эндпоинт (`webhook.py`, WSGI). Не нужен ни VPS, ни панель с «вечно живым»
+контейнером — а значит, не мешает и автосон бесплатных тарифов: ответ приходит за 1–3 секунды
+(задержка = один запрос к DeepSeek).
+
+| Что нужно | Где брать |
+|---|---|
+| HTTPS-адрес | Vercel (Hobby — бесплатно) или PythonAnywhere (free: `https://USERNAME.pythonanywhere.com`) |
+| `WEBHOOK_SECRET` | сгенерировать: `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
+| остальные ключи | те же, что и раньше (Telegram, DeepSeek, Supabase service_role) |
+
+Файлы режима: `webhook.py` (WSGI-приложение), `api/telegram.py` (точка входа для Vercel),
+`vercel.json` (лимит времени функции). Локальный запуск — `python webhook.py --serve`.
+
+### Вариант 2.1. Vercel (5 минут)
+
+1. В Vercel → *Add New… → Project* → импортировать этот репозиторий, ветку **`hosting`**.
+   Framework Preset — **Other**, Root Directory — корень (в `vercel.json` уже настроено, что
+   функция `api/telegram.py` может работать до 60 секунд).
+2. *Settings → Environment Variables* — добавить:
+   `TELEGRAM_BOT_TOKEN`, `DEEPSEEK_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`,
+   `WEBHOOK_SECRET`, при желании `DEFAULT_CURRENCY`, `ALLOWED_USER_IDS`.
+3. Deploy. Адрес обработчика: `https://<проект>.vercel.app/api/telegram`
+   (любой ответ `ok` в браузере — уже хорошо: значит, функция жива).
+4. Локально (там, где лежит проект с заполненным `.env`) сказать Telegram, куда присылать апдейты:
+   ```powershell
+   python bot.py --set-webhook https://<проект>.vercel.app/api/telegram
+   python bot.py --webhook-info                     # должно быть: url, pending 0, без ошибок
+   ```
+5. Написать боту «Леша должен Диме 3 рубля» — ответ за 1–3 секунды.
+
+### Вариант 2.2. PythonAnywhere (бесплатный тариф)
+
+1. *Web → Add a new web app → Manual configuration* → Python 3.10+.
+2. Загрузить файлы проекта в `/home/USERNAME/debt_calculator` (Files/Git/Bash) и создать там `.env`
+   с теми же переменными, включая `WEBHOOK_SECRET`.
+3. В WSGI-файле (`/var/www/USERNAME_pythonanywhere_com_wsgi.py`) оставить:
+   ```python
+   import sys
+   path = "/home/USERNAME/debt_calculator"
+   if path not in sys.path:
+       sys.path.insert(0, path)
+   from webhook import app as application
+   ```
+4. Reload, затем `python bot.py --set-webhook https://USERNAME.pythonanywhere.com/api/telegram`
+   (запускать команду можно из Bash-консоли PythonAnywhere).
+
+> ℹ️ У бесплатного PythonAnywhere есть суточный лимит CPU-секунд — для домашнего бота его хватает
+> с большим запасом (работа процессора тратится только на разбор ответа, основное время — ожидание
+> сети). Если лимит начнёт мешать, вернитесь на Vercel или на long polling.
+
+### Локальная проверка перед деплоем
+
+```powershell
+python webhook.py --serve                 # http://127.0.0.1:8080, GET / — проверка живости
+# публичный адрес для теста: ngrok http 8080  или  cloudflared tunnel --url http://127.0.0.1:8080
+python bot.py --set-webhook https://<адрес туннеля>/api/telegram
+```
+
+### Как вернуться на long polling (или в GitHub Actions)
+
+```powershell
+python bot.py --delete-webhook            # снять вебхук — Telegram снова отдаёт апдейты getUpdates
+python bot.py                             # постоянный процесс, либо `--once` для cron
+```
+
+Смещение обработанных апдейтов (`bot_state.last_update_id`) общее для всех режимов, поэтому
+переключение вебхук ↔ long polling ↔ `--once` не теряет и не дублирует сообщения. Повторные
+доставки одного апдейта бот отбрасывает сам (`accepted: false` в ответе на вебхук).
+
+### Диагностика режима вебхука
+
+| Симптом | Причина и что делать |
+|---|---|
+| `403` в ответе вебхука, сообщения не приходят | секрет в `WEBHOOK_SECRET` (Vercel/PythonAnywhere) не совпадает с тем, что отправляли в `--set-webhook`. Задайте одинаковое значение и повторите `--set-webhook` |
+| `500 WEBHOOK_SECRET не задан` | переменная не добавлена в окружение хостинга — бот отказывается обрабатывать запросы без проверки подписи |
+| В `--webhook-info` поле `last error` = `Wrong response from the webhook` | на хостинге нет ключей DeepSeek/Supabase: смотрите логи функции (Vercel → Deployments → Logs) |
+| В `--webhook-info` поле `last error` = `SSL error` / `Bad Gateway` | адрес недоступен либо сертификат не готов; проверьте деплой и повторите `--set-webhook` |
+| Ответы приходят дважды | по одному адресу работают и вебхук, и `python bot.py`: остановите постоянный процесс и cron в Actions |
+| Хочется «пинговать» сервис, чтобы не остывал | `GET https://<адрес>/api/telegram` отвечает `ok` — годится для uptime-мониторов |
+
+Дальше в этом файле описан **способ 1** — постоянный процесс на панели хостинга.
 
 ## Что подготовить
 
@@ -34,6 +120,7 @@
    ```
    bot.py  config.py  debts.py  deepseek.py  storage.py  telegram_api.py
    requirements.txt  start.sh  Procfile
+   webhook.py  api/telegram.py  vercel.json   (нужны только для режима вебхука)
    tests/            (необязательно, но удобно для самопроверки)
    .env              (создать на месте, в git его нет — см. .gitignore)
    ```
@@ -52,6 +139,7 @@
    DEFAULT_CURRENCY=BYN
    ALLOWED_USER_IDS=                        # пусто = отвечает всем; иначе список id через запятую
    LOG_LEVEL=INFO
+   WEBHOOK_SECRET=                          # нужен только для режима вебхука (Способ 2)
    ```
 5. **Start** в панели и смотрите консоль:
    ```
@@ -128,11 +216,19 @@ workflow «Диагностика настроек и сервисов» — о�
 ## Как вернуться на Actions-режим
 
 Переключите ветку обратно (`git checkout main`) — там cron включён и бот работает «пачками».
-Помните: одновременно работать не должны.
+Сначала снимите вебхук, если он был включён (`python bot.py --delete-webhook`), и остановите
+постоянный процесс. Помните: одновременно работать не должны.
 
 ## Быстрый переезд между режимами
 
 Смещение обработанных сообщений хранится в `bot_state.last_update_id`, поэтому при переключении
-между `--once` (Actions) и long polling ничего не теряется и не дублируется: оба режима читают
-одно и то же значение.
+между вебхуком, `--once` (Actions) и long polling ничего не теряется и не дублируется: все режимы
+читают одно и то же значение.
+
+При переходе **на вебхук** не забудьте остановить постоянный процесс и cron (иначе Telegram будет
+доставлять апдейты в двух местах), а при возврате **с вебхука** — снять его:
+
+```powershell
+python bot.py --delete-webhook     # Telegram снова отдаёт апдейты через getUpdates
+```
 

@@ -7,16 +7,25 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import unittest
 from typing import Any
 
 from bot import DebtBot, HeuristicParser, handle_text, is_allowed
-from config import Settings, jwt_role, load_settings, supabase_key_problem
+from config import (
+    ConfigError,
+    Settings,
+    jwt_role,
+    load_settings,
+    supabase_key_problem,
+    webhook_secret_problem,
+)
 from debts import name_key, net_balances, normalize_name, totals_by_person
 from deepseek import ParsedMessage, detect_currency, heuristic_parse
 from storage import Debt, InMemoryStorage, StorageError, SupabaseStorage
 from telegram_api import TelegramBot, TelegramError, split_message
+from webhook import SECRET_HEADER, LazyWebhookApp, WebhookApp, build_app
 
 CHAT = 555
 
@@ -366,6 +375,194 @@ class RunOnceTests(unittest.TestCase):
         self.assertIn("настроен только", telegram.sent[0][1])
 
 
+# Секрет вебхука в тестах: то же значение хелпер отправляет в заголовке по умолчанию.
+TEST_SECRET = "test-secret_123"
+
+
+def call_wsgi(app, *, method: str = "POST", path: str = "/api/telegram",
+              update: dict | None = None, secret: str | None = TEST_SECRET,
+              raw_body: bytes | None = None) -> tuple[str, str, dict[str, str]]:
+    """Вызывает WSGI-приложение и возвращает статус, тело и заголовки ответа."""
+    if raw_body is not None:
+        payload = raw_body
+    else:
+        payload = json.dumps(update or {}, ensure_ascii=False).encode("utf-8")
+    environ: dict[str, Any] = {
+        "REQUEST_METHOD": method,
+        "PATH_INFO": path,
+        "CONTENT_LENGTH": str(len(payload)),
+        "CONTENT_TYPE": "application/json",
+        "wsgi.input": io.BytesIO(payload),
+        "wsgi.errors": io.StringIO(),
+        "wsgi.version": (1, 0),
+        "wsgi.multithread": False,
+        "wsgi.multiprocess": False,
+        "wsgi.run_once": False,
+        "wsgi.url_scheme": "https",
+        "SERVER_NAME": "testserver",
+        "SERVER_PORT": "443",
+        "REMOTE_ADDR": "149.154.167.220",   # диапазон серверов Telegram
+    }
+    if secret is not None:
+        environ[SECRET_HEADER] = secret
+    captured: dict[str, Any] = {}
+
+    def start_response(status: str, headers: list, exc_info: Any = None) -> None:
+        """Запоминает статус и заголовки ответа."""
+        captured["status"] = status
+        captured["headers"] = dict(headers)
+
+    chunks = app(environ, start_response)
+    return captured["status"], b"".join(chunks).decode("utf-8"), captured["headers"]
+
+
+class WebhookAppTests(unittest.TestCase):
+    """Режим вебхука: секрет, обработка апдейта и защита от повторов."""
+
+    SECRET = TEST_SECRET
+
+    def build(self, *, secret: str | None = None, **settings_kwargs):
+        """Приложение вебхука с хранилищем в памяти и подменённым Telegram."""
+        settings = Settings(
+            default_currency="BYN",
+            webhook_secret=self.SECRET if secret is None else secret,
+            **settings_kwargs,
+        )
+        storage = InMemoryStorage(default_currency="BYN")
+        telegram = FakeTelegram([])
+        app = build_app(settings, storage=storage, parser=HeuristicParser(), telegram=telegram)
+        return app, storage, telegram
+
+    def test_get_is_health_check(self) -> None:
+        app, _, _ = self.build()
+        status, body, _ = call_wsgi(app, method="GET", path="/")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body, "ok")
+
+    def test_debt_is_saved_and_answered(self) -> None:
+        app, storage, telegram = self.build()
+        status, body, _ = call_wsgi(app, update=make_update(10, "Леша должен Диме 3 рубля"),
+                                    secret=self.SECRET)
+        self.assertEqual(status, "200 OK")
+        self.assertIn('"accepted": true', body)
+        self.assertEqual(len(storage.list_debts(7)), 1)
+        self.assertIn("Записал долг", telegram.sent[0][1])
+        self.assertEqual(storage.get_state("last_update_id"), "11")
+
+    def test_wrong_secret_is_rejected(self) -> None:
+        app, storage, telegram = self.build()
+        status, _, _ = call_wsgi(app, update=make_update(10, "Леша должен Диме 3 рубля"),
+                                 secret="не тот секрет")
+        self.assertEqual(status, "403 Forbidden")
+        self.assertEqual(storage.list_debts(7), [])
+        self.assertEqual(telegram.sent, [])
+
+    def test_missing_header_is_rejected(self) -> None:
+        app, storage, _ = self.build()
+        status, _, _ = call_wsgi(app, update=make_update(10, "/debts"), secret=None)
+        self.assertEqual(status, "403 Forbidden")
+        self.assertEqual(storage.list_debts(7), [])
+
+    def test_without_configured_secret_fails_closed(self) -> None:
+        app, storage, _ = self.build(secret="")
+        status, body, _ = call_wsgi(app, update=make_update(10, "Леша должен Диме 3 рубля"))
+        self.assertEqual(status, "500 Internal Server Error")
+        self.assertIn("WEBHOOK_SECRET", body)
+        self.assertEqual(storage.list_debts(7), [])
+
+    def test_duplicate_update_is_skipped(self) -> None:
+        app, storage, telegram = self.build()
+        storage.set_state("last_update_id", "11")   # апдейт 10 уже обработан (в polling/до перезапуска)
+        status, body, _ = call_wsgi(app, update=make_update(10, "Леша должен Диме 3 рубля"))
+        self.assertEqual(status, "200 OK")
+        self.assertIn('"accepted": false', body)
+        self.assertEqual(storage.list_debts(7), [])
+        self.assertEqual(telegram.sent, [])
+
+    def test_invalid_json_is_reported(self) -> None:
+        app, _, _ = self.build()
+        status, body, _ = call_wsgi(app, raw_body="{это не json".encode("utf-8"))
+        self.assertEqual(status, "400 Bad Request")
+        self.assertIn("JSON", body)
+
+    def test_other_methods_are_not_allowed(self) -> None:
+        app, _, _ = self.build()
+        status, _, _ = call_wsgi(app, method="PUT")
+        self.assertEqual(status, "405 Method Not Allowed")
+
+    def test_update_without_message_is_accepted_silently(self) -> None:
+        app, storage, telegram = self.build()
+        status, body, _ = call_wsgi(app, update={"update_id": 5, "edited_message": {}})
+        self.assertEqual(status, "200 OK")
+        self.assertIn('"accepted": true', body)
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(storage.get_state("last_update_id"), "6")
+
+    def test_denied_user_through_webhook(self) -> None:
+        app, storage, telegram = self.build(allowed_user_ids=frozenset({100}))
+        call_wsgi(app, update=make_update(7, "Леша должен Диме 3 рубля", user=999))
+        self.assertEqual(storage.list_debts(7), [])
+        self.assertIn("настроен только", telegram.sent[0][1])
+
+
+class LazyWebhookAppTests(unittest.TestCase):
+    """serverless (Vercel): приложение собирается лениво, при первом апдейте."""
+
+    def test_health_answers_even_when_settings_broken(self) -> None:
+        def broken() -> WebhookApp:
+            """Ломается так же, как боевая сборка при пустых ключах."""
+            raise ConfigError("не хватает ключей")
+
+        lazy = LazyWebhookApp(broken)
+        status, body, _ = call_wsgi(lazy, method="GET")
+        self.assertEqual(status, "200 OK")           # «пингер» видит живой сервис
+        self.assertIn("ok", body)
+
+        status, body, _ = call_wsgi(lazy, update=make_update(1, "/help"), secret=TEST_SECRET)
+        self.assertEqual(status, "500 Internal Server Error")
+        self.assertIn("не хватает ключей", body)
+
+    def test_factory_runs_once_and_updates_are_processed(self) -> None:
+        settings = Settings(default_currency="BYN", webhook_secret=TEST_SECRET)
+        storage = InMemoryStorage(default_currency="BYN")
+        telegram = FakeTelegram([])
+        calls: list[int] = []
+
+        def factory() -> WebhookApp:
+            """Считает, сколько раз собиралось приложение (на serverless это cold start)."""
+            calls.append(1)
+            return build_app(settings, storage=storage, parser=HeuristicParser(), telegram=telegram)
+
+        lazy = LazyWebhookApp(factory)
+        first = call_wsgi(lazy, update=make_update(10, "Леша должен Диме 3 рубля"), secret=TEST_SECRET)
+        second = call_wsgi(lazy, update=make_update(11, "/debts"), secret=TEST_SECRET)
+        self.assertEqual((first[0], second[0]), ("200 OK", "200 OK"))
+        self.assertEqual(len(calls), 1)              # приложение собралось один раз
+        self.assertEqual(len(storage.list_debts(7)), 1)
+        self.assertIn("Записал долг", telegram.sent[0][1])
+        self.assertIn("Итог с взаимозачётом", telegram.sent[1][1])
+
+
+class WebhookSecretTests(unittest.TestCase):
+    """Секрет вебхука: формат проверяется заранее, для long polling он не нужен."""
+
+    def test_secret_is_not_required_for_polling(self) -> None:
+        settings = load_settings({}, use_env_file=False)
+        self.assertEqual(settings.webhook_secret, "")
+        self.assertEqual(len(settings.problems()), 4)   # те же 4 проблемы, что и раньше
+
+    def test_secret_is_read_from_env(self) -> None:
+        settings = load_settings({"WEBHOOK_SECRET": " 'abc_123-XYZ' "}, use_env_file=False)
+        self.assertEqual(settings.webhook_secret, "abc_123-XYZ")
+
+    def test_secret_format(self) -> None:
+        self.assertIsNone(webhook_secret_problem("abc_123-XYZ"))
+        self.assertIsNone(webhook_secret_problem("a" * 256))
+        self.assertIn("WEBHOOK_SECRET", webhook_secret_problem("") or "")
+        self.assertIn("недопустимые", webhook_secret_problem("плохой секрет") or "")
+        self.assertIn("недопустимые", webhook_secret_problem("a" * 257) or "")
+
+
 class FakeResponse:
     """Ответ HTTP-сессии: заданный JSON и статус."""
 
@@ -459,6 +656,52 @@ class TelegramClientTests(unittest.TestCase):
         self.session.responses = [FakeResponse({"ok": False, "description": "bad"}, status=400)]
         with self.assertRaises(TelegramError):
             self.bot.send_message(1, "привет")
+
+
+class TelegramWebhookApiTests(unittest.TestCase):
+    """Методы Bot API для вебхука: setWebhook, deleteWebhook, getWebhookInfo."""
+
+    def setUp(self) -> None:
+        self.session = FakeSession()
+        self.bot = TelegramBot("123:abc", session=self.session)
+
+    def test_set_webhook_payload(self) -> None:
+        self.session.responses = [FakeResponse({"ok": True, "result": True})]
+        self.assertTrue(self.bot.set_webhook("https://example.vercel.app/api/telegram",
+                                             secret_token="s3cret"))
+        call = self.session.calls[0]
+        self.assertTrue(call["url"].endswith("/setWebhook"))
+        self.assertEqual(call["payload"]["url"], "https://example.vercel.app/api/telegram")
+        self.assertEqual(call["payload"]["secret_token"], "s3cret")
+        self.assertEqual(call["payload"]["allowed_updates"], ["message"])
+        self.assertFalse(call["payload"]["drop_pending_updates"])
+
+    def test_set_webhook_drop_pending_and_connections(self) -> None:
+        self.session.responses = [FakeResponse({"ok": True, "result": True})]
+        self.bot.set_webhook("https://example.test/hook", drop_pending_updates=True,
+                             max_connections=10)
+        payload = self.session.calls[0]["payload"]
+        self.assertTrue(payload["drop_pending_updates"])
+        self.assertEqual(payload["max_connections"], 10)
+        self.assertNotIn("secret_token", payload)      # без секрета поле не отправляем
+
+    def test_delete_webhook(self) -> None:
+        self.session.responses = [FakeResponse({"ok": True, "result": True})]
+        self.assertTrue(self.bot.delete_webhook())
+        call = self.session.calls[0]
+        self.assertTrue(call["url"].endswith("/deleteWebhook"))
+        self.assertFalse(call["payload"]["drop_pending_updates"])
+
+    def test_get_webhook_info(self) -> None:
+        self.session.responses = [FakeResponse({
+            "ok": True, "result": {"url": "https://x/api/telegram", "pending_update_count": 2},
+        })]
+        info = self.bot.get_webhook_info()
+        self.assertEqual((info["url"], info["pending_update_count"]), ("https://x/api/telegram", 2))
+
+    def test_webhook_info_without_webhook(self) -> None:
+        self.session.responses = [FakeResponse({"ok": True, "result": {"url": ""}})]
+        self.assertEqual(self.bot.get_webhook_info()["url"], "")
 
 
 class SupabaseStorageTests(unittest.TestCase):

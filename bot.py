@@ -7,8 +7,13 @@
     python bot.py --check    # проверить настройки и доступность сервисов
     python bot.py --demo     # демонстрация без Telegram (в памяти, офлайн-разбор)
 
+Вебхук (мгновенные ответы на serverless-хостингах — Vercel, PythonAnywhere, WSGI):
+    python bot.py --set-webhook https://<домен>/api/telegram   # Telegram шлёт апдейты нам
+    python bot.py --webhook-info                               # что сейчас настроено
+    python bot.py --delete-webhook                             # вернуться на long polling
+
 Важно: одновременно должен работать только ОДИН режим — Telegram отдаёт апдейты
-одному «слушателю», второй получит HTTP 409 Conflict.
+одному «слушателю», второй получит HTTP 409 Conflict или потеряет сообщения.
 """
 
 from __future__ import annotations
@@ -20,7 +25,13 @@ import sys
 import time
 from typing import Any, Mapping
 
-from config import ConfigError, Settings, load_settings, require_settings
+from config import (
+    ConfigError,
+    Settings,
+    load_settings,
+    require_settings,
+    webhook_secret_problem,
+)
 from debts import (
     format_currency_set,
     format_debt_saved,
@@ -151,6 +162,29 @@ def is_allowed(user_id: int | None, settings: Settings) -> bool:
     return user_id is not None and int(user_id) in settings.allowed_user_ids
 
 
+def build_runtime(settings: Settings) -> tuple[Storage, DeepSeekParser, TelegramBot]:
+    """Собирает рабочие сервисы: хранилище Supabase, парсер DeepSeek, клиент Telegram.
+
+    Используется и постоянным процессом (bot.py), и вебхуком (webhook.py).
+    """
+    storage = SupabaseStorage(
+        settings.supabase_url,
+        settings.supabase_key,
+        debts_table=settings.debts_table,
+        settings_table=settings.settings_table,
+        state_table=settings.state_table,
+        timeout=settings.request_timeout,
+    )
+    parser = DeepSeekParser(
+        settings.deepseek_key,
+        base_url=settings.deepseek_base_url,
+        model=settings.deepseek_model,
+        timeout=settings.request_timeout,
+    )
+    telegram = TelegramBot(settings.telegram_token, timeout=settings.request_timeout)
+    return storage, parser, telegram
+
+
 class DebtBot:
     """Длинный опрос Telegram и обработка входящих сообщений."""
 
@@ -218,13 +252,20 @@ class DebtBot:
     def _save_offset(self, offset: int | None) -> None:
         """Сохраняет смещение апдейтов; ошибки только логируются.
 
-        В постоянном режиме это «удобство для переезда»: если сохранение не удалось,
+        Значение никогда не уменьшается: при вебхуке в несколько инстансов (serverless)
+        «опоздавший» запрос не должен откатить смещение — иначе уже обработанное
+        сообщение прилетит повторно и долг запишется дважды.
+
+        В постоянном режиме это ещё и «удобство для переезда»: если сохранение не удалось,
         цикл опроса не должен из-за этого падать (в режиме --once ошибка фатальна,
         потому что там смещение защищает от повторной обработки сообщений).
         """
         if offset is None:
             return
         try:
+            current = self._load_offset()
+            if current is not None and current >= offset:
+                return
             self._storage.set_state(LAST_UPDATE_ID_KEY, str(offset))
         except StorageError as exc:
             logger.warning("Не удалось сохранить смещение апдейтов: %s", exc)
@@ -250,6 +291,26 @@ class DebtBot:
             self._storage.set_state(LAST_UPDATE_ID_KEY, str(update_id + 1))
         logger.info("Обработано сообщений: %d (offset -> %s)", processed, offset)
         return processed
+
+    def process_update(self, update: Mapping[str, Any], *, remember: bool = True) -> bool:
+        """Обрабатывает один апдейт с защитой от повторов — режим вебхука.
+
+        Telegram повторяет доставку, если эндпоинт ответил ошибкой или не успел ответить,
+        поэтому апдейты с уже пройденным update_id отбрасываются. Смещение хранится там же,
+        где его использует long polling (`bot_state.last_update_id`), так что переключение
+        между режимами не теряет и не дублирует сообщения.
+
+        Возвращает True, если апдейт был обработан (False — это повтор).
+        """
+        update_id = int(update.get("update_id") or 0)
+        offset = self._load_offset()
+        if update_id and offset is not None and update_id < offset:
+            logger.info("Повтор апдейта %s (смещение %s) — пропускаю.", update_id, offset)
+            return False
+        self._process(update)
+        if remember and update_id:
+            self._save_offset(update_id + 1)
+        return True
 
     def _load_offset(self) -> int | None:
         """Читает сохранённое смещение апдейтов (None — обработать всё, что накопилось)."""
@@ -297,6 +358,85 @@ class DebtBot:
             logger.error("sendMessage: %s", exc)
 
 
+def _telegram_for(settings: Settings) -> TelegramBot:
+    """Клиент Telegram с проверкой настроек (для команд управления вебхуком)."""
+    problems = settings.problems()
+    if problems:
+        raise ConfigError("Проверьте настройки:\n- " + "\n- ".join(problems))
+    return TelegramBot(settings.telegram_token, timeout=settings.request_timeout)
+
+
+def set_webhook_mode(settings: Settings, url: str, *, drop_pending: bool = False) -> int:
+    """Команда --set-webhook: Telegram сам присылает апдейты на наш HTTPS-эндпоинт."""
+    url = (url or "").strip()
+    if not url.startswith("https://"):
+        print(
+            "Ошибка: адрес вебхука должен начинаться с https:// — Telegram не доставляет "
+            "апдейты по http. Для локальной проверки используйте туннель "
+            "(ngrok http 8080 / cloudflared tunnel --url http://127.0.0.1:8080).",
+            file=sys.stderr,
+        )
+        return 1
+    secret_problem = webhook_secret_problem(settings.webhook_secret)
+    if secret_problem:
+        print("Ошибка:", secret_problem, file=sys.stderr)
+        return 1
+    try:
+        telegram = _telegram_for(settings)
+        telegram.set_webhook(
+            url,
+            secret_token=settings.webhook_secret,
+            drop_pending_updates=drop_pending,
+        )
+        info = telegram.get_webhook_info()
+    except (ConfigError, TelegramError) as exc:
+        print("Ошибка:", exc, file=sys.stderr)
+        return 1
+
+    print("✓ Вебхук установлен:", info.get("url"))
+    print(f"  ожидает апдейтов: {info.get('pending_update_count', 0)}")
+    print("  Теперь напишите боту — ответ придёт за 1–3 секунды (задержка = запрос к DeepSeek).")
+    print("  Вернуться на long polling: python bot.py --delete-webhook")
+    print("  ⚠ Постоянный процесс (`python bot.py`, cron в Actions) должен быть остановлен:")
+    print("    по одному адресу Telegram шлёт апдейты только одним способом.")
+    return 0
+
+
+def delete_webhook_mode(settings: Settings, *, drop_pending: bool = False) -> int:
+    """Команда --delete-webhook: снова long polling / --once."""
+    try:
+        telegram = _telegram_for(settings)
+        telegram.delete_webhook(drop_pending_updates=drop_pending)
+        info = telegram.get_webhook_info()
+    except (ConfigError, TelegramError) as exc:
+        print("Ошибка:", exc, file=sys.stderr)
+        return 1
+
+    if info.get("url"):
+        print("⚠ Telegram всё ещё сообщает адрес вебхука:", info.get("url"), file=sys.stderr)
+        return 1
+    print("✓ Вебхук снят — бот снова работает через getUpdates (python bot.py или --once).")
+    return 0
+
+
+def show_webhook_info(settings: Settings) -> int:
+    """Команда --webhook-info: что сейчас настроено в Telegram."""
+    try:
+        info = _telegram_for(settings).get_webhook_info()
+    except (ConfigError, TelegramError) as exc:
+        print("Ошибка:", exc, file=sys.stderr)
+        return 1
+
+    url = str(info.get("url") or "")
+    print("Режим:", f"вебхук {url}" if url else "long polling (вебхук не установлен)")
+    print("Ожидает апдейтов:", info.get("pending_update_count", 0))
+    if info.get("last_error_date"):
+        print("Последняя ошибка доставки:", info.get("last_error_message"))
+    if info.get("ip_address"):
+        print("Адрес сервера Telegram:", info.get("ip_address"))
+    return 0
+
+
 def check_services(settings: Settings) -> bool:
     """Проверяет настройки и доступность Telegram, DeepSeek и Supabase."""
     print("Проверка настроек и сервисов")
@@ -311,8 +451,26 @@ def check_services(settings: Settings) -> bool:
 
     ok = True
     try:
-        me = TelegramBot(settings.telegram_token, timeout=settings.request_timeout).get_me()
+        telegram = TelegramBot(settings.telegram_token, timeout=settings.request_timeout)
+        me = telegram.get_me()
         print(f"✓ Telegram: @{me.get('username')} (id {me.get('id')})")
+        info = telegram.get_webhook_info()
+        url = str(info.get("url") or "")
+        if url:
+            print(f"✓ Telegram: включён вебхук — {url}")
+            print(f"  ожидает апдейтов: {info.get('pending_update_count', 0)}")
+            if info.get("last_error_message"):
+                print("  ⚠ последняя ошибка доставки:", info["last_error_message"])
+            secret_problem = webhook_secret_problem(settings.webhook_secret)
+            if secret_problem:
+                ok = False
+                print("  ✗", secret_problem)
+            else:
+                print("  ✓ секрет вебхука задан — заголовки запросов проверяются")
+        else:
+            print("• Telegram: вебхук не установлен — режимы: python bot.py (long polling)",
+                  "или --once (раз в 30 минут)")
+            print("  включить вебхук: python bot.py --set-webhook https://<домен>/api/telegram")
     except TelegramError as exc:
         ok = False
         print("✗ Telegram:", exc)
@@ -404,6 +562,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="обработать накопившиеся сообщения и выйти (режим GitHub Actions / cron)",
     )
+    parser.add_argument(
+        "--set-webhook",
+        metavar="URL",
+        help="включить режим вебхука: Telegram шлёт апдейты на этот HTTPS-адрес",
+    )
+    parser.add_argument(
+        "--delete-webhook",
+        action="store_true",
+        help="выключить вебхук и вернуться на long polling",
+    )
+    parser.add_argument(
+        "--webhook-info",
+        action="store_true",
+        help="показать, как Telegram доставляет апдейты (вебхук или getUpdates)",
+    )
+    parser.add_argument(
+        "--drop-pending",
+        action="store_true",
+        help="вместе с --set-webhook/--delete-webhook: выбросить накопившиеся апдейты",
+    )
     return parser
 
 
@@ -421,24 +599,16 @@ def main(argv: list[str] | None = None) -> int:
         return run_demo()
     if args.check:
         return 0 if check_services(settings) else 1
+    if args.set_webhook:
+        return set_webhook_mode(settings, args.set_webhook, drop_pending=args.drop_pending)
+    if args.delete_webhook:
+        return delete_webhook_mode(settings, drop_pending=args.drop_pending)
+    if args.webhook_info:
+        return show_webhook_info(settings)
 
     try:
         require_settings(settings)
-        storage = SupabaseStorage(
-            settings.supabase_url,
-            settings.supabase_key,
-            debts_table=settings.debts_table,
-            settings_table=settings.settings_table,
-            state_table=settings.state_table,
-            timeout=settings.request_timeout,
-        )
-        parser = DeepSeekParser(
-            settings.deepseek_key,
-            base_url=settings.deepseek_base_url,
-            model=settings.deepseek_model,
-            timeout=settings.request_timeout,
-        )
-        telegram = TelegramBot(settings.telegram_token, timeout=settings.request_timeout)
+        storage, parser, telegram = build_runtime(settings)
     except (ConfigError, StorageError, TelegramError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1

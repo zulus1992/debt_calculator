@@ -12,13 +12,15 @@ Telegram → bot.py ── DeepSeek (chat/completions, JSON) ──► {"from":"
 
 | Файл | Что делает |
 |---|---|
-| `bot.py` | запуск бота, маршрутизация команд, `--check`, `--demo` |
-| `telegram_api.py` | Telegram Bot API: long polling `getUpdates`, `sendMessage` |
+| `bot.py` | запуск бота, маршрутизация команд, `--check`, `--demo`, команды вебхука |
+| `webhook.py` | режим вебхука: WSGI-приложение (Vercel, PythonAnywhere, gunicorn) + `--serve` |
+| `api/telegram.py` | точка входа для Vercel: отдаёт `webhook.app` по адресу `/api/telegram` |
+| `telegram_api.py` | Telegram Bot API: `getUpdates`, `sendMessage`, `setWebhook`/`deleteWebhook` |
 | `deepseek.py` | разбор сообщений через DeepSeek + офлайн-эвристики (фолбэк) |
 | `storage.py` | Supabase через REST (PostgREST) + хранилище в памяти для тестов |
 | `debts.py` | нормализация имён, взаимозачёт, итоги, тексты ответов |
 | `config.py` | настройки из `.env` и переменных окружения |
-| `db/schema.sql` | таблицы `debts` и `bot_settings`, RLS, индексы |
+| `db/schema.sql` | таблицы `debts`, `bot_settings`, `bot_state`, RLS, индексы |
 | `tests/test_pipeline.py` | тесты без внешних сервисов (`unittest`) |
 
 Зависимость всего одна — `requests` (работает и на ПК, и на телефоне в Termux, и на VPS).
@@ -120,16 +122,23 @@ python -m unittest tests.test_pipeline -v
 | Вариант | Плюсы | Минусы |
 |---|---|---|
 | ПК (`python bot.py`) | проще всего начать | нужен включённый ПК |
-| VPS / Railway / Render | бот работает всегда | нужен хостинг (у части сервисов есть бесплатный тариф) |
+| Вебхук на Vercel / PythonAnywhere | бесплатно, ответы за 1–3 с, сервер не нужен | нужно один раз настроить адрес и `WEBHOOK_SECRET` |
+| VPS / HidenCloud / Render | бот работает всегда | нужен хостинг (у части сервисов есть бесплатный тариф) |
 | Android + Termux | без ПК и без облака | Android усыпляет фоновые процессы, нужен `termux-wake-lock` |
 
 Для Termux: `pkg install python`, `pip install requests`, положить проект в `~/debt_calculator`,
 создать `.env` и запускать `termux-wake-lock && python bot.py &`.
 
-**Нужны мгновенные ответы (постоянный процесс)?** Используйте ветку **`hosting`**:
-в ней бот работает на long polling, cron в Actions отключён (чтобы не конфликтовал за апдейты),
-добавлены `start.sh` и `Procfile` для панелей хостинга. Подробная инструкция —
-[README_HOSTING.md](README_HOSTING.md).
+**Нужны мгновенные ответы (ответ за 1–3 секунды)?** Два пути, оба описаны в
+[README_HOSTING.md](README_HOSTING.md):
+
+* **вебхук** — бесплатно на serverless-хостинге (Vercel, PythonAnywhere): Telegram сам присылает
+  апдейты на `webhook.py`, постоянный процесс не нужен:
+  ```powershell
+  python bot.py --set-webhook https://<проект>.vercel.app/api/telegram
+  ```
+* **ветка `hosting`** — постоянный процесс (long polling) на панели хостинга/VPS; в этой ветке
+  cron в Actions отключён (чтобы не конкурировать за апдейты), добавлены `start.sh` и `Procfile`.
 
 ## Вариант: полностью в GitHub Actions (без ПК и без хостинга)
 
@@ -165,12 +174,13 @@ python bot.py --once      # то, что запускает workflow
 |---|---|
 | не нужен ПК, хостинг и телефон | **ответ приходит с задержкой** до 30–40 минут (интервал + задержки GitHub) |
 | бесплатно для публичных репозиториев | у приватных тратятся минуты: ~45 с × 48 запусков ≈ 1 100 мин/мес из 2 000 |
-| тот же код и секреты, переписывать ничего не надо | **webhook невозможен**: Actions не принимает входящие HTTP-запросы |
+| тот же код и секреты, переписывать ничего не надо | **вебхук здесь не живёт**: Actions не принимает входящие HTTP-запросы (для вебхука — Vercel/PythonAnywhere) |
 | каждый запуск — отдельный лог с диагностикой | расписания отключаются после ~60 дней неактивности репозитория |
 
 Итог: для домашнего бота это рабочий вариант «совсем без инфраструктуры».
-Нужны ответы за секунды — держите `python bot.py` на VPS/Termux или переведите бота
-на webhook (Cloudflare Worker, Vercel, Deno Deploy, любой сервер с HTTPS).
+Нужны ответы за секунды — включите вебхук (`python bot.py --set-webhook …` на Vercel или
+PythonAnywhere) либо держите постоянный процесс (`python bot.py`) на VPS/Termux:
+см. [README_HOSTING.md](README_HOSTING.md).
 
 ## Ограничения и что можно добавить дальше
 
@@ -178,6 +188,7 @@ python bot.py --once      # то, что запускает workflow
   логично добавить тип записи `repayment` и вычитать сумму.
 * **Удаление одной записи** по номеру из `/debts` и команда `/undo` для последней записи.
 * **Минимальный набор переводов** (сейчас взаимозачёт по парам, без «треугольников»).
-* **Webhook** вместо long polling — если хостинг не умеет держать постоянный процесс.
+* **Кнопки «вернул долг»** под отчётом (`inline_keyboard`) — закрывать долг в один тап (нужно
+  добавить обработку `callback_query`).
 * **Напоминания** по расписанию («кто давно не отдавал») — cron + `sendMessage`.
 
