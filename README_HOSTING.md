@@ -216,8 +216,8 @@ python bot.py                             # постоянный процесс 
 * ключ DeepSeek;
 * токен бота от `@BotFather`;
 * `SUPABASE_SERVICE_KEY` — **service_role** (не anon!), иначе запись блокирует RLS;
-* необязательно: `CHAT_PASSWORD` (пароль для чатов) и `RATES_API_KEY` (курсы валют allratestoday
-  для `/d` и `/rates`).
+* необязательно: `CHAT_PASSWORD` (пароль для чатов) и `RATES_API_KEY` (ключ ExchangeRate-API
+  для `/d` и `/rates`; без ключа работает открытый эндпоинт `open.er-api.com`).
 
 ## Шаги на HidenCloud (панель в стиле Pterodactyl)
 

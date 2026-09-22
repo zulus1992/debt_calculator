@@ -101,7 +101,7 @@ alter table public.bot_settings add column if not exists is_authorized boolean n
 comment on column public.bot_settings.is_authorized is
     'true — чат подтвердил пароль, бот в нём работает';
 
--- Курсы валют (allratestoday): сколько базовой валюты стоит 1 единица валюты на дату.
+-- Курсы валют (ExchangeRate-API): сколько базовой валюты стоит 1 единица валюты на дату.
 -- Обновляются раз в день — при первом за сутки обращении к /d или /rates (без cron).
 create table if not exists public.currency_rates (
     rate_date  date          not null,
@@ -118,7 +118,7 @@ comment on table public.currency_rates is
 comment on column public.currency_rates.base is
     'Базовая валюта, к которой приведён курс (RATES_BASE, по умолчанию BYN)';
 comment on column public.currency_rates.source is
-    'Источник курса: allratestoday (например wise / nbrb)';
+    'Источник курса: exchangerate-api.com';
 
 create index if not exists currency_rates_lookup_idx
     on public.currency_rates (base, rate_date desc);

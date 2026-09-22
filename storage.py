@@ -87,7 +87,7 @@ class RatePoint:
     base: str                          # базовая валюта, к которой приведён курс (обычно BYN)
     currency: str                      # валюта, курс которой храним
     rate: float                        # 1 USD = 3.25 BYN → rate = 3.25 при base = BYN
-    source: str | None = None          # откуда курс: allratestoday (wise / nbrb …)
+    source: str | None = None          # откуда курс: exchangerate-api.com
 
 
 def _row_to_rate(row: dict[str, Any]) -> RatePoint:

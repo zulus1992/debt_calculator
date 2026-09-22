@@ -1,20 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Курсы валют: загрузка из allratestoday, хранение в базе и конвертация сумм.
+"""Курсы валют: загрузка из ExchangeRate-API, хранение в базе и конвертация сумм.
 
-API (https://allratestoday.com/docs), ключ передаётся заголовком `Authorization: Bearer`:
+API: https://www.exchangerate-api.com/docs (ключ бесплатно — app.exchangerate-api.com).
+Один запрос отдаёт все валюты сразу, ключ передаётся в адресе:
 
-    GET /api/v1/rate?source=USD&target=BYN
-        → {"rate": 3.25, "source": "wise"}
-    GET /api/v1/historical-rates?source=USD&target=BYN&period=30d
-        → {"source": "USD", "target": "BYN", "period": "30d",
-           "data": [{"date": "2026-09-01T00:00:00Z", "rate": 3.24, "timestamp": 1756...}]}
+    GET https://v6.exchangerate-api.com/v6/<RATES_API_KEY>/latest/BYN
+        → {"result": "success", "base_code": "BYN", "time_last_update_utc": "...",
+           "conversion_rates": {"BYN": 1, "USD": 0.3077, "EUR": 0.2841, ...}}
+    GET https://open.er-api.com/v6/latest/BYN          (без ключа, открытый эндпоинт)
+        → то же, но поле называется "rates" (нужна ссылка на exchangerate-api.com)
 
-Курсы лежат «в базовой валюте»: при base = BYN значение rate = 3.25 для USD означает
-«1 USD = 3.25 BYN». Так их удобно и показывать, и пересчитывать: сумма в базовой валюте
-равна amount × rate[валюта], а в любой другой — делится на её курс.
+Ошибки приходят кодом: {"result": "error", "error-type": "invalid-key|quota-reached|..."}.
+
+Курсы в ответе обратные (`conversion_rates[X]` = сколько X за 1 base), поэтому мы их
+переворачиваем и храним «в базовой валюте»: при base = BYN значение rate = 3.25 для USD
+означает «1 USD = 3.25 BYN». Так их удобно и показывать, и пересчитывать: сумма в базовой
+валюте равна amount × rate[валюта], а в любой другой — делится на её курс.
 
 Курсы обновляются не чаще раза в день и без cron: перед запросом к API проверяем, нет ли
 уже курсов на сегодняшнюю дату в базе (вручную — `python bot.py --rates --force`).
+Истории за прошлые дни в бесплатном тарифе нет: база копит по одному снимку в сутки,
+а для дат без снимка берётся ближайший сохранённый курс.
 """
 
 from __future__ import annotations
@@ -42,6 +48,18 @@ CURRENCY_TITLES: dict[str, str] = {
 }
 # Насколько назад смотреть курсы, если на дату записи их нет (выходные и праздники).
 LOOKBACK_DAYS = 7
+# Откуда берём курсы: exchangerate-api.com. Ключ бесплатный — app.exchangerate-api.com,
+# без ключа работает открытый эндпоинт (лимит запросов и обязательна ссылка на сервис).
+SOURCE_TITLE = "exchangerate-api.com"
+OPEN_URL = "https://open.er-api.com/v6"
+# Понятные расшифровки error-type из ответов ExchangeRate-API.
+ERROR_TITLES: dict[str, str] = {
+    "unsupported-code": "валюта не поддерживается сервисом",
+    "malformed-request": "неверный запрос к API (проверьте RATES_API_URL)",
+    "invalid-key": "неверный RATES_API_KEY (ключ из кабинета app.exchangerate-api.com)",
+    "inactive-account": "аккаунт не активирован: подтвердите e-mail в кабинете",
+    "quota-reached": "исчерпан лимит запросов тарифа — подождите или смените план",
+}
 
 
 class RatesError(RuntimeError):
@@ -54,9 +72,9 @@ class RatesUpdate:
 
     rate_date: str
     saved: int = 0
-    pairs: tuple[str, ...] = ()
+    currencies: tuple[str, ...] = ()    # какие валюты сохранили
     problems: tuple[str, ...] = ()
-    reason: str = ""          # почему не обновляли (курсы уже есть, нет ключа и т.п.)
+    reason: str = ""          # почему не обновляли (курсы уже есть, ошибка API и т.п.)
 
     @property
     def updated(self) -> bool:
@@ -79,12 +97,6 @@ def _to_float(value: Any) -> float | None:
     return number if number > 0 else None
 
 
-def _day_of(value: Any) -> str:
-    """ISO-дата из значения: '2026-09-21T00:00:00Z' → '2026-09-21'."""
-    text = str(value or "").strip()
-    return text[:10] if len(text) >= 10 else ""
-
-
 def rate_table(points: Sequence[RatePoint]) -> dict[str, dict[str, float]]:
     """Таблица курсов: {дата: {валюта: сколько базовой валюты за 1 единицу валюты}}."""
     table: dict[str, dict[str, float]] = {}
@@ -97,20 +109,25 @@ def rate_table(points: Sequence[RatePoint]) -> dict[str, dict[str, float]]:
 
 def rate_for(table: Mapping[str, Mapping[str, float]], day: str,
              currency: str) -> tuple[float | None, str | None]:
-    """Курс валюты на дату: если на этот день курса нет — берём ближайший предыдущий."""
+    """Курс валюты на дату: точно на эту дату, иначе — ближайший сохранённый.
+
+    Курсы копятся по одному снимку в сутки, поэтому на выходные и на дни до начала сбора
+    берём ближайшую дату с этим курсом: сначала предыдущую, если её нет — следующую.
+    """
     code = str(currency or "").upper()
     if not code or not table:
         return None, None
-    chosen: str | None = None
-    for candidate in sorted(table):
-        if candidate <= str(day or ""):
-            chosen = candidate
-        else:
-            break
-    if chosen is None:
-        return None, None
-    value = table[chosen].get(code)
-    return (float(value), chosen) if value else (None, None)
+    target = str(day or "")
+    exact = table.get(target)
+    if exact and exact.get(code):
+        return float(exact[code]), target
+    earlier = [item for item in sorted(table, reverse=True) if item <= target]
+    later = [item for item in sorted(table) if item > target]
+    for candidate in (*earlier, *later):
+        value = table[candidate].get(code)
+        if value:
+            return float(value), candidate
+    return None, None
 
 
 def convert_amount(amount: float, from_code: str, to_code: str,
@@ -203,16 +220,17 @@ def format_used_rates(rates_used: Mapping[str, Mapping[str, float]], target: str
 
 
 def format_rates_report(points: Sequence[RatePoint], base: str, *,
-                        target: str = "") -> str:
+                        target: str = "", source: str = SOURCE_TITLE) -> str:
     """Ответ на /rates: курсы к базовой валюте, которые лежат в базе."""
     base_code = str(base or "BYN").upper()
     if not points:
         return (
             "💱 Курсов валют пока нет.\n"
-            "Проверьте RATES_API_KEY и повторите: /rates (или python bot.py --rates)."
+            f"Проверьте RATES_API_KEY (ключ с {SOURCE_TITLE}) и повторите: /rates "
+            "(или python bot.py --rates)."
         )
     latest = max(point.rate_date for point in points)
-    lines = [f"💱 Курсы валют (база {base_code}, allratestoday, {_ru_date(latest)}):"]
+    lines = [f"💱 Курсы валют (база {base_code}, {source}, {_ru_date(latest)}):"]
     for point in sorted((item for item in points if item.rate_date == latest),
                         key=lambda item: item.currency):
         lines.append(f"• 1 {point.currency} = {_pretty_rate(point.rate)} {base_code} "
@@ -245,114 +263,68 @@ def _ru_date(value: str) -> str:
         return str(value or "")
 
 
-def parse_rate(payload: Any) -> tuple[float | None, str | None]:
-    """Курс из ответа /rate: {"rate": 3.25, "source": "wise"}."""
-    if not isinstance(payload, Mapping):
-        return None, None
-    rate = _to_float(payload.get("rate"))
-    if rate is None and isinstance(payload.get("data"), Mapping):
-        rate = _to_float(payload["data"].get("rate"))
-    source = payload.get("source") or payload.get("source_api") or payload.get("provider")
-    return rate, (str(source) if source else None)
-
-
-def _get_json(url: str, params: Mapping[str, Any], api_key: str, timeout: float,
-              session: Any = None) -> Any:
-    """GET к API курсов с понятными сообщениями об ошибках."""
+def _get_json(url: str, timeout: float, session: Any = None) -> Any:
+    """GET к API курсов с понятными сообщениями об ошибках (ключ передаётся в адресе)."""
     http = session or requests
     headers = {"Accept": "application/json", "User-Agent": "debt-calculator-bot/1.0"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
     requester = getattr(http, "get", None)
     if requester is None:                       # подменённая в тестах сессия без GET
         raise RatesError("HTTP-клиент не умеет GET — проверьте настройки.")
     try:
-        response = requester(url, params=dict(params), headers=headers, timeout=timeout)
+        response = requester(url, headers=headers, timeout=timeout)
     except requests.RequestException as exc:
-        raise RatesError(f"allratestoday недоступен: {exc}") from exc
+        raise RatesError(f"{SOURCE_TITLE} недоступен: {exc}") from exc
     status = int(getattr(response, "status_code", 0) or 0)
-    if status == 401:
-        raise RatesError("allratestoday отклонил ключ (HTTP 401): проверьте RATES_API_KEY.")
-    if status == 402:
-        raise RatesError("allratestoday: для этих данных нужен платный тариф (HTTP 402).")
     if status == 404:
-        raise RatesError("allratestoday: адрес не найден (HTTP 404): проверьте RATES_API_URL.")
+        raise RatesError(f"{SOURCE_TITLE}: адрес не найден (HTTP 404): проверьте RATES_API_URL.")
     if status == 429:
-        raise RatesError("allratestoday: слишком много запросов (HTTP 429), попробуйте позже.")
+        raise RatesError(f"{SOURCE_TITLE}: слишком много запросов (HTTP 429) — "
+                         "сработал лимит тарифа, попробуйте позже.")
     if status >= 400:
         text = str(getattr(response, "text", ""))[:150]
-        raise RatesError(f"allratestoday вернул HTTP {status}: {text}")
+        raise RatesError(f"{SOURCE_TITLE} вернул HTTP {status}: {text}")
     try:
         return response.json()
     except (ValueError, AttributeError) as exc:
-        raise RatesError("allratestoday вернул не JSON.") from exc
+        raise RatesError(f"{SOURCE_TITLE} вернул не JSON.") from exc
 
 
-def _url(base_url: str, path: str) -> str:
-    """Адрес метода API: base_url + /path."""
-    return f"{str(base_url or '').rstrip('/')}/{path}"
-
-
-def fetch_rate(source: str, target: str, *, base_url: str, api_key: str = "",
-               timeout: float = 30.0, session: Any = None) -> tuple[float, str | None]:
-    """Текущий курс пары: сколько target за 1 source."""
-    payload = _get_json(_url(base_url, "rate"),
-                        {"source": source.upper(), "target": target.upper()},
-                        api_key, timeout, session)
-    rate, provider = parse_rate(payload)
-    if rate is None:
-        raise RatesError(f"allratestoday не вернул курс {source.upper()}/{target.upper()}: "
-                         f"{str(payload)[:120]}")
-    return rate, provider
-
-
-def fetch_history(source: str, target: str, period: str = "30d", *, base_url: str,
-                  api_key: str = "", timeout: float = 30.0,
-                  session: Any = None) -> list[tuple[str, float, str | None]]:
-    """История курса пары по дням: [(дата, курс, источник)]."""
-    payload = _get_json(_url(base_url, "historical-rates"),
-                        {"source": source.upper(), "target": target.upper(), "period": period},
-                        api_key, timeout, session)
-    return parse_history(payload)
+def fetch_latest(base: str, *, api_url: str = "", api_key: str = "", open_url: str = OPEN_URL,
+                 timeout: float = 30.0, session: Any = None) -> dict[str, float]:
+    """Курсы всех валют к базовой одним запросом: /latest/{base}."""
+    url = latest_url(base, api_url=api_url, api_key=api_key, open_url=open_url)
+    return parse_rates(_get_json(url, timeout, session), base)
 
 
 def fetch_points(settings: Any, *, session: Any = None,
                  today: str | None = None) -> tuple[list[dict[str, Any]], list[str]]:
-    """Курсы всех нужных валют к базовой: точки для записи в базу и список проблем.
+    """Точки для записи в базу: по одной на каждую валюту из RATES_CURRENCIES.
 
-    Сначала пробуем историю за период (тогда /d сможет считать курсы на прошлые даты),
-    а если история недоступна — берём текущий курс (хотя бы сегодняшний день).
+    Сервис отдаёт сразу все валюты к базовой, поэтому запрос один; в базу кладём только
+    нужные — иначе каждый день сохранялось бы больше сотни строк.
     """
     base = str(settings.rates_base or "BYN").upper()
+    day = today or date.today().isoformat()
+    rates = fetch_latest(
+        base,
+        api_url=settings.rates_api_url,
+        api_key=settings.rates_api_key,
+        open_url=getattr(settings, "rates_open_url", OPEN_URL),
+        timeout=settings.request_timeout,
+        session=session,
+    )
     points: list[dict[str, Any]] = []
     problems: list[str] = []
-    day_today = today or date.today().isoformat()
     for code in settings.rates_currencies:
         currency = str(code or "").upper()
         if not currency or currency == base:
             continue
-        history: list[tuple[str, float, str | None]] = []
-        try:
-            history = fetch_history(currency, base, settings.rates_period,
-                                    base_url=settings.rates_api_url,
-                                    api_key=settings.rates_api_key,
-                                    timeout=settings.request_timeout, session=session)
-        except RatesError as exc:
-            problems.append(f"{currency}: {exc}")
-        if not history:
-            try:
-                value, provider = fetch_rate(currency, base, base_url=settings.rates_api_url,
-                                             api_key=settings.rates_api_key,
-                                             timeout=settings.request_timeout, session=session)
-            except RatesError as exc:
-                problems.append(f"{currency}: {exc}")
-                continue
-            history = [(day_today, value, provider)]
-        for day, value, provider in history:
-            points.append({
-                "rate_date": day, "base": base, "currency": currency,
-                "rate": value, "source": provider,
-            })
+        value = rates.get(currency)
+        if not value:
+            problems.append(f"{currency}: {SOURCE_TITLE} не вернул курс")
+            continue
+        points.append({"rate_date": day, "base": base, "currency": currency,
+                       "rate": value, "source": SOURCE_TITLE})
     return points, problems
 
 
@@ -361,41 +333,74 @@ def update_rates(settings: Any, storage: Storage, *, force: bool = False,
     """Обновляет курсы в базе: не чаще одного раза в день.
 
     Cron не нужен: перед обращением к API проверяем, что курсов на сегодня в базе нет.
+    Без RATES_API_KEY работает открытый эндпоинт (без ключа, с лимитом запросов).
     """
     day = today or date.today().isoformat()
     base = str(settings.rates_base or "BYN").upper()
     if not force and storage.has_rates(day, base):
         return RatesUpdate(rate_date=day, reason="курсы на сегодня уже сохранены")
-    if not str(settings.rates_api_key or "").strip():
-        return RatesUpdate(rate_date=day, reason="не задан RATES_API_KEY")
-    points, problems = fetch_points(settings, session=session, today=day)
+    if not str(settings.rates_api_key or "").strip() \
+            and not str(getattr(settings, "rates_open_url", "") or "").strip():
+        return RatesUpdate(rate_date=day,
+                           reason="курсы не настроены (нет RATES_API_KEY и RATES_OPEN_URL)")
+    try:
+        points, problems = fetch_points(settings, session=session, today=day)
+    except RatesError as exc:
+        return RatesUpdate(rate_date=day, problems=(str(exc),),
+                           reason="курсы получить не удалось")
     if not points:
         return RatesUpdate(rate_date=day, problems=tuple(problems),
                            reason="курсы получить не удалось")
     saved = storage.save_rates(points)
-    pairs = tuple(sorted({f"{point['currency']}/{point['base']}" for point in points}))
-    return RatesUpdate(rate_date=day, saved=saved, pairs=pairs, problems=tuple(problems))
+    currencies = tuple(point["currency"] for point in points)
+    return RatesUpdate(rate_date=day, saved=saved, currencies=currencies,
+                       problems=tuple(problems))
 
 
-def parse_history(payload: Any) -> list[tuple[str, float, str | None]]:
-    """Точки истории из ответа /historical-rates: [(дата, курс, источник)]."""
+def _error_text(payload: Mapping[str, Any]) -> str:
+    """Понятное сообщение по error-type из ответа сервиса."""
+    kind = str(payload.get("error-type") or payload.get("error_type") or "").strip().lower()
+    return ERROR_TITLES.get(kind, f"ошибка сервиса {SOURCE_TITLE}") + f" (error-type: {kind or '?'})"
+
+
+def parse_rates(payload: Any, base: str = "") -> dict[str, float]:
+    """Курсы из ответа /latest: {валюта: сколько базовой валюты стоит 1 единица}.
+
+    Сервис отдаёт обратные курсы (`conversion_rates[X]` = сколько X за 1 base), поэтому
+    переворачиваем: rate[X] = 1 / conversion_rates[X]. Базовая валюта — всегда 1.0.
+    Понимает и платный эндпоинт (`conversion_rates`), и открытый (`rates`).
+    """
     if not isinstance(payload, Mapping):
-        return []
-    points: list[tuple[str, float, str | None]] = []
-    source = payload.get("source_api") or payload.get("source") or payload.get("provider")
-    items = payload.get("data") or payload.get("rates") or payload.get("history") or []
-    if isinstance(items, Mapping):
-        items = [{"date": key, "rate": value} for key, value in items.items()]
-    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
-        return []
-    for item in items:
-        if isinstance(item, Mapping):
-            day = _day_of(item.get("date") or item.get("time") or item.get("timestamp"))
-            rate = _to_float(item.get("rate") or item.get("value"))
-        elif isinstance(item, Sequence) and len(item) >= 2:
-            day, rate = _day_of(item[0]), _to_float(item[1])
-        else:
+        raise RatesError(f"{SOURCE_TITLE} вернул не JSON-объект: {str(payload)[:120]}")
+    if str(payload.get("result") or "").strip().lower() == "error":
+        raise RatesError(_error_text(payload))
+    quoted = payload.get("conversion_rates") or payload.get("rates")
+    if not isinstance(quoted, Mapping) or not quoted:
+        raise RatesError(f"{SOURCE_TITLE} не вернул курсы: {str(payload)[:120]}")
+    base_code = str(payload.get("base_code") or base or "").upper()
+    rates: dict[str, float] = {}
+    for code, value in quoted.items():
+        currency = str(code or "").upper()
+        if len(currency) != 3 or not currency.isalpha():
             continue
-        if day and rate:
-            points.append((day, rate, str(source) if source else None))
-    return points
+        number = _to_float(value)
+        if not number:
+            continue
+        rates[currency] = 1.0 if currency == base_code else round(1.0 / number, 8)
+    if base_code:
+        rates[base_code] = 1.0
+    if not rates:
+        raise RatesError(f"{SOURCE_TITLE} не вернул ни одной валюты")
+    return rates
+
+
+def latest_url(base: str, *, api_url: str = "", api_key: str = "",
+               open_url: str = OPEN_URL) -> str:
+    """Адрес запроса курсов: с ключом личного кабинета или открытый (без ключа)."""
+    base_code = str(base or "USD").upper()
+    key = str(api_key or "").strip()
+    if key:
+        return f"{str(api_url or '').rstrip('/')}/{key}/latest/{base_code}"
+    return f"{str(open_url or OPEN_URL).rstrip('/')}/latest/{base_code}"
+
+

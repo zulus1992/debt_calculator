@@ -52,11 +52,10 @@ from rates import (
     RatesError,
     convert_amount,
     convert_debts,
-    fetch_history,
-    fetch_rate,
+    fetch_latest,
     format_rates_report,
-    parse_history,
-    parse_rate,
+    latest_url,
+    parse_rates,
     rate_for,
     rate_table,
     update_rates,
@@ -340,16 +339,16 @@ class AccessAndConfigTests(unittest.TestCase):
     def test_new_env_settings(self) -> None:
         settings = load_settings({
             "CHAT_PASSWORD": " 'сезам' ",
-            "RATES_API_KEY": "art_live_x",
+            "RATES_API_KEY": "test-key",
             "RATES_CURRENCIES": "byn, usd;thb",
             "RATES_BASE": "byn",
-            "RATES_PERIOD": "7d",
+            "RATES_OPEN_URL": "https://open.er-api.com/v6/",
         }, use_env_file=False)
         self.assertEqual(settings.chat_password, "сезам")
         self.assertTrue(settings.password_required)
         self.assertEqual(settings.rates_currencies, ("BYN", "USD", "THB"))
         self.assertEqual(settings.rates_base, "BYN")
-        self.assertEqual(settings.rates_period, "7d")
+        self.assertEqual(settings.rates_open_url, "https://open.er-api.com/v6")
         self.assertIsNone(settings.rates_problem())
 
     def test_defaults_for_password_and_rates(self) -> None:
@@ -357,8 +356,14 @@ class AccessAndConfigTests(unittest.TestCase):
         self.assertFalse(settings.password_required)      # без пароля бот работает везде
         self.assertEqual(settings.rates_base, "BYN")
         self.assertEqual(settings.rates_currencies, ("BYN", "RUB", "USD", "EUR", "CNY", "THB"))
-        self.assertEqual(settings.rates_api_url, "https://allratestoday.com/api/v1")
-        self.assertIsNotNone(settings.rates_problem())    # без ключа курсов не будет
+        self.assertEqual(settings.rates_api_url, "https://v6.exchangerate-api.com/v6")
+        self.assertEqual(settings.rates_open_url, "https://open.er-api.com/v6")
+        # без ключа тоже работаем — через открытый эндпоинт
+        self.assertIsNone(settings.rates_problem())
+        self.assertIn("open.er-api.com", settings.rates_source)
+        with_key = load_settings({"RATES_API_KEY": "test-key"}, use_env_file=False)
+        self.assertIn("ключ задан", with_key.rates_source)
+        self.assertIsNotNone(Settings(rates_open_url="").rates_problem())
 
 
 class TelegramHelpersTests(unittest.TestCase):
@@ -2018,32 +2023,43 @@ class AiExpenseTests(unittest.TestCase):
 
 
 class RatesParsingTests(unittest.TestCase):
-    """Разбор ответов allratestoday и арифметика курсов."""
+    """Разбор ответов ExchangeRate-API и арифметика курсов."""
 
-    def test_parse_single_rate(self) -> None:
-        self.assertEqual(parse_rate({"rate": 3.2531, "source": "wise"}), (3.2531, "wise"))
-        self.assertEqual(parse_rate({"data": {"rate": "0,92145"}}), (0.92145, None))
-        self.assertEqual(parse_rate({"error": "nope"}), (None, None))
-        self.assertEqual(parse_rate("мусор"), (None, None))
-
-    def test_parse_history(self) -> None:
+    def test_parse_latest_response(self) -> None:
         payload = {
-            "source": "USD", "target": "BYN", "period": "30d", "source_api": "wise",
-            "data": [
-                {"date": "2026-09-20T00:00:00Z", "rate": 3.24},
-                {"date": "2026-09-21", "rate": "3.25"},
-                {"date": "2026-09-22", "rate": None},
-            ],
+            "result": "success", "base_code": "BYN",
+            "conversion_rates": {"BYN": 1, "USD": 0.3077, "EUR": 0.2841, "RUB": 30.2},
         }
-        self.assertEqual(parse_history(payload),
-                         [("2026-09-20", 3.24, "wise"), ("2026-09-21", 3.25, "wise")])
+        rates = parse_rates(payload, "BYN")
+        self.assertEqual(sorted(rates), ["BYN", "EUR", "RUB", "USD"])
+        self.assertEqual(rates["BYN"], 1.0)
+        # сервис отдаёт «сколько USD за 1 BYN» — храним обратный курс (1 USD = 3.25 BYN)
+        self.assertAlmostEqual(rates["USD"], 1 / 0.3077, places=6)
 
-    def test_parse_history_other_shapes(self) -> None:
-        self.assertEqual(parse_history({"data": {"2026-09-21": 3.25}}),
-                         [("2026-09-21", 3.25, None)])
-        self.assertEqual(parse_history({"rates": [["2026-09-21", "3,3"]]}),
-                         [("2026-09-21", 3.3, None)])
-        self.assertEqual(parse_history(None), [])
+    def test_parse_open_endpoint_uses_rates_field(self) -> None:
+        payload = {"result": "success", "provider": "https://www.exchangerate-api.com",
+                   "base_code": "USD", "rates": {"USD": 1, "BYN": 3.2, "EUR": "0,91"}}
+        rates = parse_rates(payload, "USD")
+        self.assertAlmostEqual(rates["BYN"], 1 / 3.2, places=6)
+        self.assertAlmostEqual(rates["EUR"], 1 / 0.91, places=6)
+
+    def test_error_types_are_explained(self) -> None:
+        cases = {
+            "invalid-key": "RATES_API_KEY",
+            "quota-reached": "лимит",
+            "inactive-account": "аккаунт не активирован",
+            "unsupported-code": "не поддерживается",
+        }
+        for kind, expected in cases.items():
+            with self.assertRaises(RatesError) as ctx:
+                parse_rates({"result": "error", "error-type": kind}, "BYN")
+            self.assertIn(expected, str(ctx.exception))
+
+    def test_broken_payload_is_reported(self) -> None:
+        with self.assertRaises(RatesError):
+            parse_rates("мусор", "BYN")
+        with self.assertRaises(RatesError):
+            parse_rates({"result": "success"}, "BYN")
 
     def test_rate_table_and_lookup(self) -> None:
         table = rate_table([
@@ -2053,9 +2069,10 @@ class RatesParsingTests(unittest.TestCase):
         ])
         self.assertEqual(table["2026-09-20"]["BYN"], 1.0)
         self.assertEqual(rate_for(table, "2026-09-21", "USD"), (3.25, "2026-09-21"))
-        # на дату без курса берём ближайший предыдущий
+        # на дату без курса берём ближайший сохранённый: сначала предыдущий…
         self.assertEqual(rate_for(table, "2026-09-25", "USD"), (3.25, "2026-09-21"))
-        self.assertEqual(rate_for(table, "2026-09-19", "USD"), (None, None))
+        # …а если предыдущих нет — следующий (курсы копятся начиная с какого-то дня)
+        self.assertEqual(rate_for(table, "2026-09-19", "USD"), (3.20, "2026-09-20"))
         self.assertEqual(rate_for(table, "2026-09-21", "BYN"), (1.0, "2026-09-21"))
         self.assertEqual(rate_for(table, "2026-09-21", "THB"), (None, None))
 
@@ -2073,22 +2090,28 @@ class RatesParsingTests(unittest.TestCase):
         self.assertEqual(convert_amount(10, "THB", "BYN", table, "2026-09-21"), (None, None))
 
     def test_client_requests_and_errors(self) -> None:
-        session = FakeSession([FakeResponse({"error": "bad key"}, status=401)])
+        session = FakeSession([FakeResponse({"result": "error", "error-type": "quota-reached"})])
         with self.assertRaises(RatesError) as ctx:
-            fetch_rate("USD", "BYN", base_url="https://api.test/api/v1", api_key="x",
-                       session=session)
-        self.assertIn("401", str(ctx.exception))
+            fetch_latest("BYN", api_url="https://v6.exchangerate-api.com/v6",
+                         api_key="test-key", session=session)
+        self.assertIn("лимит", str(ctx.exception))
         call = session.calls[0]
-        self.assertTrue(call["url"].endswith("/api/v1/rate"))
-        self.assertEqual(call["params"], {"source": "USD", "target": "BYN"})
-        self.assertEqual(call["headers"]["Authorization"], "Bearer x")
+        self.assertTrue(call["url"].endswith("/v6/test-key/latest/BYN"))   # ключ в адресе
+        self.assertIsNone(call["params"])
 
-    def test_fetch_history_uses_period(self) -> None:
-        session = FakeSession([FakeResponse({"data": [{"date": "2026-09-21", "rate": 3.25}]})])
-        points = fetch_history("USD", "BYN", "30d", base_url="https://api.test/api/v1",
-                               session=session)
-        self.assertEqual(points, [("2026-09-21", 3.25, None)])
-        self.assertEqual(session.calls[0]["params"]["period"], "30d")
+    def test_http_429_is_reported(self) -> None:
+        session = FakeSession([FakeResponse({"error": "slow down"}, status=429)])
+        with self.assertRaises(RatesError) as ctx:
+            fetch_latest("BYN", api_url="https://v6.exchangerate-api.com/v6",
+                         api_key="test-key", session=session)
+        self.assertIn("429", str(ctx.exception))
+
+    def test_latest_url_shapes(self) -> None:
+        self.assertEqual(latest_url("byn", api_url="https://v6.exchangerate-api.com/v6/",
+                                    api_key="key"),
+                         "https://v6.exchangerate-api.com/v6/key/latest/BYN")
+        self.assertEqual(latest_url("byn", open_url="https://open.er-api.com/v6"),
+                         "https://open.er-api.com/v6/latest/BYN")
 
     def test_rates_report_text(self) -> None:
         report = format_rates_report([
@@ -2106,29 +2129,31 @@ class RatesUpdateTests(unittest.TestCase):
     """Обновление курсов: раз в день, без cron, с понятными причинами отказа."""
 
     def settings(self, **kwargs) -> Settings:
-        """Настройки с тестовым API курсов."""
+        """Настройки с тестовым ключом ExchangeRate-API."""
         return Settings(
-            rates_api_key="art_live_test", rates_api_url="https://api.test/api/v1",
-            rates_base="BYN", rates_currencies=("BYN", "USD"), request_timeout=5.0, **kwargs,
+            rates_api_key="test-key", rates_api_url="https://v6.exchangerate-api.com/v6",
+            rates_base="BYN", rates_currencies=("BYN", "USD", "EUR"),
+            request_timeout=5.0, **kwargs,
         )
 
-    def test_update_saves_history_points(self) -> None:
+    def test_one_request_saves_configured_currencies(self) -> None:
         storage = InMemoryStorage()
-        session = FakeSession([FakeResponse({"source_api": "wise", "data": [
-            {"date": "2026-09-20", "rate": 3.2},
-            {"date": "2026-09-21", "rate": 3.25},
-        ]})])
+        session = FakeSession([FakeResponse({
+            "result": "success", "base_code": "BYN",
+            "conversion_rates": {"BYN": 1, "USD": 0.25, "EUR": 0.2, "THB": 8.0},
+        })])
         result = update_rates(self.settings(), storage, today="2026-09-21", session=session)
-        self.assertTrue(result.updated)
-        self.assertEqual(result.saved, 2)
-        self.assertEqual(result.pairs, ("USD/BYN",))
-        self.assertEqual([point.rate for point in storage.rates], [3.2, 3.25])
-        self.assertEqual(storage.rates[0].source, "wise")
+        self.assertEqual(len(session.calls), 1)          # один запрос отдаёт все валюты
+        self.assertEqual(result.saved, 2)                # BYN — база, THB не в списке
+        self.assertEqual(result.currencies, ("USD", "EUR"))
+        self.assertEqual([point.currency for point in storage.rates], ["USD", "EUR"])
+        self.assertAlmostEqual(storage.rates[0].rate, 4.0)      # 1 USD = 4 BYN
+        self.assertEqual(storage.rates[0].source, "exchangerate-api.com")
 
     def test_second_call_same_day_does_not_fetch(self) -> None:
         storage = InMemoryStorage()
-        history = {"data": [{"date": "2026-09-21", "rate": 3.25}]}
-        session = FakeSession([FakeResponse(history), FakeResponse(history)])
+        payload = {"result": "success", "base_code": "BYN", "conversion_rates": {"USD": 0.25}}
+        session = FakeSession([FakeResponse(payload), FakeResponse(payload)])
         update_rates(self.settings(), storage, today="2026-09-21", session=session)
         again = update_rates(self.settings(), storage, today="2026-09-21", session=session)
         self.assertEqual(again.saved, 0)
@@ -2137,24 +2162,35 @@ class RatesUpdateTests(unittest.TestCase):
         update_rates(self.settings(), storage, today="2026-09-21", force=True, session=session)
         self.assertEqual(len(session.calls), 2)          # --force обновляет заново
 
-    def test_without_key_no_request(self) -> None:
-        session = FakeSession()
-        result = update_rates(Settings(rates_api_key=""), InMemoryStorage(), session=session)
-        self.assertEqual(result.saved, 0)
-        self.assertIn("RATES_API_KEY", result.reason)
-        self.assertEqual(session.calls, [])
-
-    def test_history_falls_back_to_current_rate(self) -> None:
+    def test_open_endpoint_without_key(self) -> None:
         storage = InMemoryStorage()
-        session = FakeSession([
-            FakeResponse({"error": "no history"}, status=404),
-            FakeResponse({"rate": 3.33, "source": "wise"}),
-        ])
-        result = update_rates(self.settings(), storage, today="2026-09-21", session=session)
+        session = FakeSession([FakeResponse({"result": "success", "base_code": "BYN",
+                                             "rates": {"USD": 0.25}})])
+        settings = Settings(rates_api_key="", rates_open_url="https://open.er-api.com/v6",
+                            rates_base="BYN", rates_currencies=("BYN", "USD"),
+                            request_timeout=5.0)
+        result = update_rates(settings, storage, today="2026-09-21", session=session)
         self.assertEqual(result.saved, 1)
-        self.assertEqual(storage.rates[0].rate_date, "2026-09-21")
-        self.assertEqual(storage.rates[0].source, "wise")
-        self.assertTrue(result.problems)                 # про проблему с историей сообщаем
+        self.assertTrue(session.calls[0]["url"].endswith("/open.er-api.com/v6/latest/BYN"))
+
+    def test_api_error_becomes_problem(self) -> None:
+        storage = InMemoryStorage()
+        session = FakeSession([FakeResponse({"result": "error", "error-type": "invalid-key"})])
+        result = update_rates(self.settings(), storage, today="2026-09-21", session=session)
+        self.assertEqual(result.saved, 0)
+        self.assertFalse(result.updated)
+        self.assertEqual(result.reason, "курсы получить не удалось")
+        self.assertTrue(any("RATES_API_KEY" in problem for problem in result.problems))
+        self.assertEqual(storage.rates, [])
+
+    def test_missing_currency_is_reported(self) -> None:
+        storage = InMemoryStorage()
+        session = FakeSession([FakeResponse({"result": "success", "base_code": "BYN",
+                                             "conversion_rates": {"EUR": 0.2}})])
+        result = update_rates(self.settings(), storage, today="2026-09-21", session=session)
+        self.assertEqual(result.saved, 1)                # EUR сохранили
+        self.assertEqual(result.currencies, ("EUR",))
+        self.assertTrue(any("USD" in problem for problem in result.problems))
 
 
 class PasswordTests(unittest.TestCase):

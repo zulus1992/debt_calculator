@@ -1051,7 +1051,7 @@ def update_rates_mode(settings: Settings, *, force: bool = False) -> int:
 
     if result.saved:
         print(f"✓ Курсы записаны: {result.saved} значений на {result.rate_date}")
-        print("  пары: " + ", ".join(result.pairs))
+        print("  валюты: " + ", ".join(result.currencies))
     else:
         print("Курсы не обновлялись:", result.reason or "нет данных")
     for problem in result.problems:
@@ -1167,7 +1167,7 @@ def check_services(settings: Settings) -> bool:
     if rates_problem:
         print("⚠", rates_problem)
     else:
-        print(f"✓ Курсы валют: ключ allratestoday задан, база {settings.rates_base}, "
+        print(f"✓ Курсы валют: {settings.rates_source}, база {settings.rates_base}, "
               f"валюты {', '.join(settings.rates_currencies)}")
         print("  обновление — раз в день при первом обращении; вручную: python bot.py --rates")
 

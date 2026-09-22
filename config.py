@@ -27,10 +27,11 @@ DEFAULT_SETTINGS_TABLE = "bot_settings"
 DEFAULT_STATE_TABLE = "bot_state"
 DEFAULT_MEMBERS_TABLE = "chat_members"
 DEFAULT_RATES_TABLE = "currency_rates"
-# Курсы валют: allratestoday (https://allratestoday.com/docs). Нужен бесплатный ключ API.
-DEFAULT_RATES_URL = "https://allratestoday.com/api/v1"
+# Курсы валют: ExchangeRate-API (https://app.exchangerate-api.com — кабинет и бесплатный ключ).
+# Без ключа используется открытый эндпоинт open.er-api.com (лимит запросов, нужна ссылка).
+DEFAULT_RATES_URL = "https://v6.exchangerate-api.com/v6"
+DEFAULT_RATES_OPEN_URL = "https://open.er-api.com/v6"
 DEFAULT_RATES_BASE = "BYN"
-DEFAULT_RATES_PERIOD = "30d"
 # Какие валюты тянем из API: бел. рубль, рос. рубль, доллар, евро, юань, тайский бат.
 DEFAULT_RATES_CURRENCIES = ("BYN", "RUB", "USD", "EUR", "CNY", "THB")
 
@@ -70,8 +71,11 @@ class Settings:
     rates_table: str = DEFAULT_RATES_TABLE
     rates_api_url: str = DEFAULT_RATES_URL
     rates_api_key: str = ""
+    # Пусто — открытый эндпоинт не используется. load_settings подставляет сюда
+    # RATES_OPEN_URL (по умолчанию open.er-api.com), поэтому в бою курсы работают и без
+    # ключа, а тесты и демо (они создают Settings напрямую) в сеть не ходят.
+    rates_open_url: str = ""
     rates_base: str = DEFAULT_RATES_BASE
-    rates_period: str = DEFAULT_RATES_PERIOD
     rates_currencies: tuple[str, ...] = DEFAULT_RATES_CURRENCIES
     chat_password: str = ""
     default_currency: str = DEFAULT_CURRENCY
@@ -101,12 +105,20 @@ class Settings:
         """Проблема с настройками курсов валют (None — всё в порядке).
 
         Курсы не обязательны для учёта долгов, поэтому в problems() они не попадают:
-        без ключа бот просто работает по уже сохранённым курсам.
+        без ключа работает открытый эндпоинт, а без сети бот использует уже сохранённые
+        в базе курсы.
         """
-        if not str(self.rates_api_key or "").strip():
-            return ("RATES_API_KEY не задан — курсы валют брать негде: /d и /rates работают "
-                    "только по тем курсам, что уже лежат в базе.")
-        return None
+        if str(self.rates_api_key or "").strip() or str(self.rates_open_url or "").strip():
+            return None
+        return ("Не задан ни RATES_API_KEY, ни RATES_OPEN_URL — курсы валют брать негде: "
+                "/d и /rates будут работать только по уже сохранённым курсам.")
+
+    @property
+    def rates_source(self) -> str:
+        """Что использовать для курсов: личный кабинет с ключом или открытый эндпоинт."""
+        if str(self.rates_api_key or "").strip():
+            return "аккаунт exchangerate-api.com (ключ задан)"
+        return "открытый эндпоинт open.er-api.com (без ключа)"
 
     def problems(self) -> list[str]:
         """Список проблем конфигурации (пустой — всё настроено)."""
@@ -264,8 +276,8 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         rates_table=get("RATES_TABLE", DEFAULT_RATES_TABLE),
         rates_api_url=get("RATES_API_URL", DEFAULT_RATES_URL).rstrip("/"),
         rates_api_key=get("RATES_API_KEY"),
+        rates_open_url=get("RATES_OPEN_URL", DEFAULT_RATES_OPEN_URL).rstrip("/"),
         rates_base=get("RATES_BASE", DEFAULT_RATES_BASE).upper(),
-        rates_period=get("RATES_PERIOD", DEFAULT_RATES_PERIOD),
         rates_currencies=_parse_codes(get("RATES_CURRENCIES")),
         chat_password=get("CHAT_PASSWORD"),
         default_currency=get("DEFAULT_CURRENCY", DEFAULT_CURRENCY).upper(),
