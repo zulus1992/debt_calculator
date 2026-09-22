@@ -283,7 +283,7 @@ python bot.py                             # постоянный процесс 
 
 Локально перед загрузкой полезно прогнать проверки:
 ```powershell
-python -m unittest tests.test_pipeline   # 266 тестов, без внешних сервисов
+python -m unittest tests.test_pipeline   # 263 теста, без внешних сервисов
 python bot.py --check                    # проверка ключей и сервисов
 ```
 

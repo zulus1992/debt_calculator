@@ -34,6 +34,7 @@ from config import (
     webhook_secret_problem,
 )
 from debts import (
+    SETTLE_HINT,
     format_debts_report,
     minimal_transfers,
     name_key,
@@ -1270,8 +1271,8 @@ class RepaymentFlowTests(unittest.TestCase):
         self.assertIn("/undo", help_text)
 
 
-class SavedReplySummaryTests(unittest.TestCase):
-    """После записи бот сразу пишет итог: сальдо с учётом возвратов и минимум переводов."""
+class SavedReplyHintTests(unittest.TestCase):
+    """Ответ о записи — без итогов: только короткая подсказка «Итог: /settle» в конце."""
 
     def setUp(self) -> None:
         self.settings = Settings(default_currency="BYN")
@@ -1284,47 +1285,30 @@ class SavedReplySummaryTests(unittest.TestCase):
         return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
                            settings=self.settings, members=self.members, author=MEMBER_LEHA)
 
-    def test_debt_reply_ends_with_summary(self) -> None:
+    def assert_only_hint(self, reply: str) -> None:
+        """Никаких итогов и подсказок «подробно» — ровно одна строка в самом конце."""
+        self.assertNotIn("📊 Итог", reply)
+        self.assertNotIn("🧮", reply)
+        self.assertNotIn("Подробно", reply)
+        self.assertEqual(reply.count(SETTLE_HINT), 1)
+        self.assertEqual(reply.splitlines()[-1], SETTLE_HINT)
+
+    def test_debt_reply_has_only_hint(self) -> None:
         reply = self.send("Леша должен Диме 3 рубля")
         self.assertIn("Записал долг", reply)
-        self.assertIn("📊 Итог с учётом возвратов:", reply)
-        self.assertIn("Леша Козлов (@kozlovAlex) → Дмитрий Болт (@bdzmity): 3.00 BYN", reply)
-        self.assertIn("Подробно: /debts, взаиморасчёт: /settle", reply)
+        self.assertIn("3.00 BYN", reply)
+        self.assert_only_hint(reply)
 
-    def test_repayment_reply_shows_what_is_left(self) -> None:
+    def test_repayment_reply_has_only_hint(self) -> None:
         self.send("Леша должен Диме 5 рублей")
         reply = self.send("Леша вернул Диме 3 рубля")
         self.assertIn("Записал возврат долга", reply)
-        self.assertIn("Итог с учётом возвратов:", reply)
-        self.assertIn("→ Дмитрий Болт (@bdzmity): 2.00 BYN", reply)
+        self.assert_only_hint(reply)
 
-    def test_fully_repaid_reply_says_all_closed(self) -> None:
-        self.send("Леша должен Диме 3 рубля")
-        reply = self.send("Леша вернул Диме 3 рубля")
-        self.assertIn("всё закрыто", reply)
-        self.assertNotIn("Минимум переводов", reply)
-
-    def test_expense_reply_shows_summary(self) -> None:
+    def test_expense_reply_has_only_hint(self) -> None:
         reply = self.send("Дима заплатил 10 за всех")
         self.assertIn("Записал общий счёт", reply)
-        self.assertIn("Итог с учётом возвратов:", reply)
-
-    def test_chain_reply_shows_minimum_transfers(self) -> None:
-        """Цепочка Леша → Дима → Маша → Оля: переводов меньше, чем пар долгов."""
-        self.send("Леша должен Диме 10 рублей")
-        self.send("Дима должен Маше 10 рублей")
-        reply = self.send("Маша должна Оле 10 рублей")
-        self.assertIn("📊 Итог с учётом возвратов:", reply)
-        self.assertIn("🧮 Минимум переводов, чтобы всё закрылось:", reply)
-        self.assertIn("Леша Козлов (@kozlovAlex) → Оля Смирнова (@olga_s): 10.00 BYN", reply)
-
-    def test_summary_of_saved_reply_matches_debts_report(self) -> None:
-        """Итог в ответе и итог /debts — одно и то же."""
-        reply = self.send("Леша должен Диме 3 рубля")
-        report = self.send("/debts")
-        line = "• Леша Козлов (@kozlovAlex) → Дмитрий Болт (@bdzmity): 3.00 BYN"
-        self.assertIn(line, reply)
-        self.assertIn(line, report)
+        self.assert_only_hint(reply)
 
 
 class StorageRepaymentTests(unittest.TestCase):

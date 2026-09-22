@@ -11,6 +11,9 @@ from members import label_for, member_by_id
 from storage import ChatMember, Debt
 
 MAX_ROWS_IN_HISTORY = 15
+# Подсказка в конце ответа о записи: итоги в ответе не выводим (чтобы не засорять чат),
+# но всегда понятно, куда смотреть. Меняется в одном месте.
+SETTLE_HINT = "Итог: /settle"
 
 # Упрощённая морфология русских имён: что срезаем в ключе и что считаем падежом
 CASE_ENDINGS = "аеёиоуыэюя"
@@ -216,23 +219,28 @@ def _money_by_currency(values: dict[str, float]) -> str:
 def format_debt_saved(debt: Debt, members: Sequence[ChatMember] = ()) -> str:
     """Ответ на успешно записанный долг: сразу видно, каких участников узнали.
 
-    Итог с учётом возвратов (как /debts) и список переводов (как /settle) бот добавит ниже.
+    Итоги в ответе не выводим — только короткая подсказка SETTLE_HINT в конце.
     """
     return "\n".join([
         "✅ Записал долг:",
         f"• Кто должен: {label_for(debt.from_user_id, debt.from_name, members)}",
         f"• Кому: {label_for(debt.to_user_id, debt.to_name, members)}",
         f"• Сумма: {debt.amount:.2f} {debt.currency}",
+        SETTLE_HINT,
     ])
 
 
 def format_repayment_saved(debt: Debt, members: Sequence[ChatMember] = ()) -> str:
-    """Ответ на записанный возврат долга (итог с учётом возврата бот добавит ниже)."""
+    """Ответ на записанный возврат долга.
+
+    Итоги в ответе не выводим — только короткая подсказка SETTLE_HINT в конце.
+    """
     return "\n".join([
         "↩️ Записал возврат долга:",
         f"• Кто вернул: {label_for(debt.from_user_id, debt.from_name, members)}",
         f"• Кому вернул: {label_for(debt.to_user_id, debt.to_name, members)}",
         f"• Сумма: {debt.amount:.2f} {debt.currency}",
+        SETTLE_HINT,
     ])
 
 
@@ -254,7 +262,7 @@ class ExpenseSummary:
 def format_expense_saved(summary: ExpenseSummary) -> str:
     """Ответ на записанный общий счёт: кто платил, на кого делили и сколько с каждого.
 
-    Итог с учётом счёта (как /debts) бот добавит ниже.
+    Итоги в ответе не выводим — только короткая подсказка SETTLE_HINT в конце.
     """
     lines = [
         "🧾 Записал общий счёт:",
@@ -276,6 +284,7 @@ def format_expense_saved(summary: ExpenseSummary) -> str:
         lines.append("• Не участвуют (не зарегистрированы): " + ", ".join(summary.skipped))
     if summary.raw_text:
         lines.append(f"• Оригинал сохранён: «{summary.raw_text}»")
+    lines.append(SETTLE_HINT)
     return "\n".join(lines)
 
 
@@ -427,31 +436,6 @@ def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN",
         lines.append("")
         lines.append("Все записи:")
         lines.extend(f"• {_row_line(debt, labels)}" for debt in debts)
-    return "\n".join(lines)
-
-
-def format_result_summary(debts: Sequence[Debt], members: Sequence[ChatMember] = ()) -> str:
-    """Итог после сохранённой записи: сальдо с учётом возвратов (как /debts) и переводы (/settle).
-
-    Показывается сразу в ответе на запись, чтобы не открывать /debts руками: сначала
-    взаимозачёт по парам, затем — если он короче — минимальный список переводов.
-    """
-    if not debts:
-        return ""
-    balances = net_balances(debts, members)
-    transfers = minimal_transfers(debts, members)
-    lines: list[str] = []
-    if balances:
-        lines.append("📊 Итог с учётом возвратов:")
-        lines.extend(f"• {balance.pretty()}" for balance in balances)
-    else:
-        lines.append("🎉 Итог с учётом возвратов: всё закрыто, никто ничего не должен.")
-    if transfers and [item.pretty() for item in transfers] != [item.pretty() for item in balances]:
-        lines.append("")
-        lines.append("🧮 Минимум переводов, чтобы всё закрылось:")
-        lines.extend(f"• {transfer.pretty()}" for transfer in transfers)
-    lines.append("")
-    lines.append("Подробно: /debts, взаиморасчёт: /settle")
     return "\n".join(lines)
 
 

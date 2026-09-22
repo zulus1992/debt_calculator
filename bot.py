@@ -53,7 +53,6 @@ from debts import (
     format_members_report,
     format_registered,
     format_repayment_saved,
-    format_result_summary,
     format_transfers,
     minimal_transfers,
     normalize_name,
@@ -454,22 +453,6 @@ def _resolve_group_names(names: Sequence[str], members: Sequence[ChatMember],
     return found, unknown
 
 
-def saved_reply(message: str, chat_id: int, storage: Storage,
-                members: Sequence[ChatMember]) -> str:
-    """Ответ о сохранённой записи с итогом: сальдо с учётом возвратов и переводы.
-
-    Сразу после «Записал…» показываем то же, что видно в /debts (взаимозачёт по парам),
-    и — если он короче — минимум переводов из /settle, чтобы не открывать команды руками.
-    """
-    try:
-        debts = storage.list_debts(chat_id)
-    except StorageError as exc:
-        logger.warning("Итог после записи показать не удалось: %s", exc)
-        return f"{message}\n\n⚠️ Итог показать не удалось: {exc}"
-    summary = format_result_summary(debts, members)
-    return f"{message}\n\n{summary}" if summary else message
-
-
 def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage,
                  members: Sequence[ChatMember], author: ChatMember | None,
                  currency: str = "BYN") -> str:
@@ -540,7 +523,7 @@ def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage
         }
         for member, share in pair_shares
     ])
-    return saved_reply(format_expense_saved(ExpenseSummary(
+    return format_expense_saved(ExpenseSummary(
         payer=payer,
         currency=currency,
         amount=amount,
@@ -550,7 +533,7 @@ def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage
         excluded=excluded,
         skipped=_skipped_names(members, excluded),
         raw_text=raw,
-    )), chat_id, storage, members)
+    ))
 
 
 def handle_text(
@@ -650,7 +633,7 @@ def handle_text(
             to_user_id=member_to.user_id if member_to else None,
         )
         formatter = format_repayment_saved if is_repayment else format_debt_saved
-        return saved_reply(formatter(record, members), chat_id, storage, members)
+        return formatter(record, members)
 
     if parsed.intent == "expense":
         return save_expense(
