@@ -7,7 +7,8 @@
     python bot.py --demo     # демонстрация без Telegram (в памяти, офлайн-разбор)
     python bot.py --rates    # обновить курсы валют вручную (--rates --force — заново за сегодня)
 
-Курсы валют подтягиваются сами раз в день — при первом обращении к /d или /rates за сутки.
+Курсы валют подтягиваются сами раз в день в 12:00 по Минску (RATES_HOUR): постоянный процесс
+проверяет расписание сам, а режим вебхука — при первом апдейте после назначенного часа.
 
 Вебхук (мгновенные ответы на serverless-хостингах — Vercel, PythonAnywhere, WSGI):
     python bot.py --set-webhook https://<домен>/api/telegram   # Telegram шлёт апдейты нам
@@ -35,6 +36,7 @@ from typing import Any, Mapping, Sequence
 
 from config import (
     ConfigError,
+    DEFAULT_RATES_HOUR,
     Settings,
     load_settings,
     require_settings,
@@ -51,6 +53,7 @@ from debts import (
     format_members_report,
     format_registered,
     format_repayment_saved,
+    format_result_summary,
     format_transfers,
     minimal_transfers,
     normalize_name,
@@ -78,6 +81,7 @@ from rates import (
     history_start,
     rate_table,
     update_rates,
+    update_rates_scheduled,
 )
 from storage import ChatMember, InMemoryStorage, Storage, StorageError, SupabaseStorage
 from telegram_api import TelegramBot, TelegramError
@@ -241,6 +245,15 @@ def added_to_chat_reply(settings: Settings) -> str:
     return ADDED_REPLY
 
 
+def rates_schedule_text(settings: Settings) -> str:
+    """Как курсы обновляются сами: раз в день, час — по Минску (RATES_HOUR)."""
+    try:
+        hour = int(getattr(settings, "rates_hour", DEFAULT_RATES_HOUR))
+    except (TypeError, ValueError):
+        hour = DEFAULT_RATES_HOUR
+    return f"раз в день в {hour:02d}:00 по Минску"
+
+
 def rates_report(storage: Storage, settings: Settings, chat_currency: str) -> str:
     """Команда /rates: показать курсы валют (обновив их, если за сегодня их ещё нет)."""
     base = str(settings.rates_base or "BYN").upper()
@@ -250,7 +263,8 @@ def rates_report(storage: Storage, settings: Settings, chat_currency: str) -> st
         points = storage.rates_since(base, since)
     except StorageError as exc:
         return f"⚠️ Проблема с базой данных: {exc}"
-    report = format_rates_report(points, base, target=chat_currency)
+    report = format_rates_report(points, base, target=chat_currency,
+                                 schedule=rates_schedule_text(settings))
     extras: list[str] = []
     if update.problems:
         extras.append("⚠️ " + "; ".join(update.problems[:3]))
@@ -440,6 +454,22 @@ def _resolve_group_names(names: Sequence[str], members: Sequence[ChatMember],
     return found, unknown
 
 
+def saved_reply(message: str, chat_id: int, storage: Storage,
+                members: Sequence[ChatMember]) -> str:
+    """Ответ о сохранённой записи с итогом: сальдо с учётом возвратов и переводы.
+
+    Сразу после «Записал…» показываем то же, что видно в /debts (взаимозачёт по парам),
+    и — если он короче — минимум переводов из /settle, чтобы не открывать команды руками.
+    """
+    try:
+        debts = storage.list_debts(chat_id)
+    except StorageError as exc:
+        logger.warning("Итог после записи показать не удалось: %s", exc)
+        return f"{message}\n\n⚠️ Итог показать не удалось: {exc}"
+    summary = format_result_summary(debts, members)
+    return f"{message}\n\n{summary}" if summary else message
+
+
 def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage,
                  members: Sequence[ChatMember], author: ChatMember | None,
                  currency: str = "BYN") -> str:
@@ -510,7 +540,7 @@ def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage
         }
         for member, share in pair_shares
     ])
-    return format_expense_saved(ExpenseSummary(
+    return saved_reply(format_expense_saved(ExpenseSummary(
         payer=payer,
         currency=currency,
         amount=amount,
@@ -520,7 +550,7 @@ def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage
         excluded=excluded,
         skipped=_skipped_names(members, excluded),
         raw_text=raw,
-    ))
+    )), chat_id, storage, members)
 
 
 def handle_text(
@@ -620,7 +650,7 @@ def handle_text(
             to_user_id=member_to.user_id if member_to else None,
         )
         formatter = format_repayment_saved if is_repayment else format_debt_saved
-        return formatter(record, members)
+        return saved_reply(formatter(record, members), chat_id, storage, members)
 
     if parsed.intent == "expense":
         return save_expense(
@@ -799,6 +829,30 @@ class DebtBot:
             self._bot_username = str(me.get("username") or "").lstrip("@")
         return self._bot_username
 
+    def _refresh_rates_if_due(self) -> None:
+        """Подтягивает курсы, если по расписанию пора (раз в день в settings.rates_hour).
+
+        Вызывается и в цикле опроса, и при обработке апдейта: на serverless-хостинге
+        фонового цикла нет, поэтому первый апдейт после назначенного часа запускает
+        обновление сам. Пока час не наступил и пока курсы за сегодня уже есть, обращений
+        к API и базе не будет. Проблемы пишем только в лог — сообщения важнее.
+        """
+        try:
+            result = update_rates_scheduled(self._settings, self._storage)
+        except RatesError as exc:
+            logger.warning("Автообновление курсов: %s", exc)
+            return
+        except StorageError as exc:
+            logger.warning("Автообновление курсов, база недоступна: %s", exc)
+            return
+        if result is None:
+            return
+        if result.saved:
+            logger.info("Курсы обновлены автоматически: %s значений на %s (%s)",
+                        result.saved, result.rate_date, ", ".join(result.currencies))
+        for problem in result.problems:
+            logger.warning("Курсы: %s", problem)
+
     def run(self, poll_timeout: int = 25, max_updates: int | None = None) -> int:
         """Постоянный режим (long polling): ответы приходят мгновенно.
 
@@ -817,6 +871,7 @@ class DebtBot:
         processed = 0
         try:
             while not self._stop:
+                self._refresh_rates_if_due()      # 12:00 по Минску — курсы обновляются сами
                 try:
                     updates = self._telegram.get_updates(offset, poll_timeout=poll_timeout)
                 except TelegramError as exc:
@@ -906,6 +961,7 @@ class DebtBot:
 
     def _process(self, update: Mapping[str, Any]) -> None:
         """Обрабатывает один апдейт Telegram."""
+        self._refresh_rates_if_due()              # в вебхук-режиме это единственный «таймер»
         membership = update.get("my_chat_member")
         if isinstance(membership, Mapping):
             self._handle_membership(membership)
@@ -1057,6 +1113,7 @@ def update_rates_mode(settings: Settings, *, force: bool = False) -> int:
     for problem in result.problems:
         print("⚠", problem)
     print("  посмотреть в Telegram: /rates, привести долги к валюте чата: /d")
+    print(f"  дальше курсы подтягиваются сами: {rates_schedule_text(settings)}")
     return 0 if (result.saved or not result.problems) else 1
 
 
@@ -1169,7 +1226,7 @@ def check_services(settings: Settings) -> bool:
     else:
         print(f"✓ Курсы валют: {settings.rates_source}, база {settings.rates_base}, "
               f"валюты {', '.join(settings.rates_currencies)}")
-        print("  обновление — раз в день при первом обращении; вручную: python bot.py --rates")
+        print(f"  обновление — {rates_schedule_text(settings)}; вручную: python bot.py --rates")
 
     if settings.password_required:
         print("• CHAT_PASSWORD задан — бот просит пароль при добавлении в чат "

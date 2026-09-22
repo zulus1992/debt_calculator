@@ -205,7 +205,7 @@ python bot.py                             # постоянный процесс 
 | На PythonAnywhere в error log `ImportError: No module named webhook` | в WSGI-файле неверный путь к проекту (должен быть `/home/USERNAME/debt_calculator`) или не сделан **Reload** |
 | `Таблица не найдена (HTTP 404): chat_members` | не применена свежая схема: выполните `db/schema.sql` в Supabase → SQL Editor (таблица добавляется идемпотентно) |
 | `column is_registered does not exist` или `column group_id does not exist` | схема в Supabase старее кода: выполните `db/schema.sql` ещё раз — колонки и тип `kind = 'expense'` добавляются идемпотентно |
-| Хочется «пинговать» сервис, чтобы не остывал | `GET https://<адрес>/api/telegram` отвечает `ok` — годится для uptime-мониторов |
+| Хочется «пинговать» сервис, чтобы не остывал | `GET https://<адрес>/api/telegram` отвечает `ok` — годится для uptime-мониторов; заодно такой пинг запускает автообновление курсов, если уже прошло время `RATES_HOUR` |
 
 Дальше в этом файле описан **способ 1** — постоянный процесс на панели хостинга.
 
@@ -217,7 +217,9 @@ python bot.py                             # постоянный процесс 
 * токен бота от `@BotFather`;
 * `SUPABASE_SERVICE_KEY` — **service_role** (не anon!), иначе запись блокирует RLS;
 * необязательно: `CHAT_PASSWORD` (пароль для чатов) и `RATES_API_KEY` (ключ ExchangeRate-API
-  для `/d` и `/rates`; без ключа работает открытый эндпоинт `open.er-api.com`).
+  для `/d` и `/rates`; без ключа работает открытый эндпоинт `open.er-api.com`). Курсы бот
+  подтягивает сам раз в день в 12:00 по Минску — час задаётся в `RATES_HOUR` (0–23),
+  cron и ручные запуски не нужны.
 
 ## Шаги на HidenCloud (панель в стиле Pterodactyl)
 
@@ -275,11 +277,13 @@ python bot.py                             # постоянный процесс 
 3. Если код обновился до версии с регистрацией участников (`/reg`), паролем чата, общими счетами
    и курсами валют — **повторно выполните `db/schema.sql`** в Supabase → SQL Editor: добавятся
    таблица `currency_rates`, колонки `chat_members.is_registered`, `debts.group_id`,
-   `bot_settings.is_authorized` и тип записи `kind = 'expense'`.
+   `bot_settings.is_authorized` и тип записи `kind = 'expense'`. Заодно колонка
+   `currency_rates.rate` переведётся из `numeric(20, 8)` в `bigint` (`курс × 10⁸`) —
+   скрипт идемпотентный, данные не теряются.
 
 Локально перед загрузкой полезно прогнать проверки:
 ```powershell
-python -m unittest tests.test_pipeline   # 246 тестов, без внешних сервисов
+python -m unittest tests.test_pipeline   # 266 тестов, без внешних сервисов
 python bot.py --check                    # проверка ключей и сервисов
 ```
 
@@ -292,7 +296,8 @@ python bot.py --check                    # проверка ключей и се
 | `Таблица не найдена (HTTP 404)` | в Supabase не применён `db/schema.sql` (нужны `debts`, `chat_members`, `currency_rates`, `bot_settings`, `bot_state`) |
 | `ключ с ролью «anon»` | в `.env` попал anon-ключ; нужен `service_role` (Supabase → API Keys → Reveal) |
 | Бот просит пароль | задан `CHAT_PASSWORD`: пришлите `/password ваш-пароль` (пароль задаётся в окружении хостинга) |
-| `/d` пишет «Курсов за эти даты нет» | не задан `RATES_API_KEY` или курсы ещё не обновлялись: выполните `python bot.py --rates` |
+| `/d` пишет «Курсов за эти даты нет» | не задан `RATES_API_KEY` (и не задан `RATES_OPEN_URL`) или курсы ещё не обновлялись: подождите ближайшие 12:00 по Минску либо выполните `python bot.py --rates` |
+| Курсы обновились не в 12:00 | на постоянном процессе обновление случается при первой проверке после 12:00 (обычно в течение получаса), а на вебхуке — при первом апдейте или пинге `GET /`; час задаётся в `RATES_HOUR` |
 | Ответ приходит с задержкой | хостинг «усыпляет» процесс (у бесплатных тарифов бывает авто-сон) — см. раздел ниже |
 | Контейнер перезапускается сам | смотрите лимиты RAM/CPU тарифа; боту достаточно 256–512 МБ, но панель может ограничивать жёстче |
 

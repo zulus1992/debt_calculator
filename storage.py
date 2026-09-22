@@ -5,11 +5,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Mapping, Protocol, Sequence
 
 import requests
 
 DEFAULT_CURRENCY = "BYN"
+# Курс хранится целым числом (bigint/int8): rate = курс × RATE_SCALE.
+# Так база не «плывёт» на дробных числах, а точность (8 знаков) сохраняется полностью.
+RATE_SCALE = 100_000_000
+RATE_DIGITS = 8
 
 
 class StorageError(RuntimeError):
@@ -86,8 +91,26 @@ class RatePoint:
     rate_date: str                     # ISO-дата: 2026-09-21
     base: str                          # базовая валюта, к которой приведён курс (обычно BYN)
     currency: str                      # валюта, курс которой храним
-    rate: float                        # 1 USD = 3.25 BYN → rate = 3.25 при base = BYN
+    rate: Decimal                      # 1 USD = 3.25 BYN → rate = Decimal("3.25") при base = BYN
     source: str | None = None          # откуда курс: exchangerate-api.com
+
+
+def scale_rate(value: Any) -> int:
+    """Курс → целое для базы: 3.2531 → 325310000 (умножение на RATE_SCALE)."""
+    number = value if isinstance(value, Decimal) else Decimal(str(value))
+    return int((number * RATE_SCALE).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def unscale_rate(value: Any) -> Decimal:
+    """Целое из базы → курс: 325310000 → Decimal("3.2531")."""
+    if value is None or value == "":
+        return Decimal(0)
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value).strip()) / RATE_SCALE
+    except (ArithmeticError, TypeError, ValueError):
+        return Decimal(0)
 
 
 def _row_to_rate(row: dict[str, Any]) -> RatePoint:
@@ -96,7 +119,7 @@ def _row_to_rate(row: dict[str, Any]) -> RatePoint:
         rate_date=str(row.get("rate_date") or "")[:10],
         base=str(row.get("base") or DEFAULT_CURRENCY).upper(),
         currency=str(row.get("currency") or "").upper(),
-        rate=float(row.get("rate") or 0),
+        rate=unscale_rate(row.get("rate")),
         source=str(row.get("source") or "") or None,
     )
 
@@ -514,13 +537,16 @@ class SupabaseStorage:
         )
 
     def save_rates(self, points: Sequence[Mapping[str, Any]]) -> int:
-        """Сохраняет курсы валют (upsert по дате, базовой и целевой валюте)."""
+        """Сохраняет курсы валют (upsert по дате, базовой и целевой валюте).
+
+        Курс кладём целым (курс × RATE_SCALE) — колонка rate объявлена как bigint.
+        """
         rows = [
             {
                 "rate_date": str(point.get("rate_date") or "")[:10],
                 "base": str(point.get("base") or DEFAULT_CURRENCY).upper(),
                 "currency": str(point.get("currency") or "").upper(),
-                "rate": round(float(point.get("rate") or 0), 8),
+                "rate": scale_rate(point.get("rate") or 0),
                 "source": point.get("source"),
             }
             for point in points
@@ -731,7 +757,7 @@ class InMemoryStorage:
             self.authorized.discard(int(chat_id))
 
     def save_rates(self, points: Sequence[Mapping[str, Any]]) -> int:
-        """Сохраняет курсы валют в памяти: ключ — дата + база + валюта."""
+        """Сохраняет курсы валют в памяти: ключ — дата + база + валюта (курс как в базе, целым)."""
         saved = 0
         for point in points:
             currency = str(point.get("currency") or "").strip().upper()
@@ -743,7 +769,7 @@ class InMemoryStorage:
                 rate_date=rate_date,
                 base=base,
                 currency=currency,
-                rate=float(point.get("rate") or 0),
+                rate=unscale_rate(scale_rate(point.get("rate") or 0)),
                 source=str(point.get("source") or "") or None,
             )
             for index, existing in enumerate(self.rates):

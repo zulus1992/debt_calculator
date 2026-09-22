@@ -11,6 +11,8 @@ import io
 import json
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Sequence
 
 from bot import (
@@ -55,18 +57,25 @@ from rates import (
     fetch_latest,
     format_rates_report,
     latest_url,
+    minsk_now,
     parse_rates,
     rate_for,
     rate_table,
+    rates_day,
     update_rates,
+    update_rates_scheduled,
 )
 from storage import (
     ChatMember,
     Debt,
     InMemoryStorage,
+    RATE_DIGITS,
+    RATE_SCALE,
     RatePoint,
     StorageError,
     SupabaseStorage,
+    scale_rate,
+    unscale_rate,
 )
 from telegram_api import TelegramBot, TelegramError, split_message
 from webhook import SECRET_HEADER, LazyWebhookApp, WebhookApp, build_app
@@ -675,7 +684,7 @@ class FakeSession:
 
     def get(self, url: str, params: Any = None, headers: Any = None,
             timeout: float | None = None, **kwargs: Any) -> FakeResponse:
-        """Имитация requests.get (курсы валют allratestoday)."""
+        """Имитация requests.get (курсы валют ExchangeRate-API)."""
         self.calls.append({
             "method": "GET", "url": url, "params": params, "payload": None,
             "headers": dict(headers or {}), "timeout": timeout,
@@ -1259,6 +1268,63 @@ class RepaymentFlowTests(unittest.TestCase):
         help_text = self.send("/help")
         self.assertIn("возврат", help_text)
         self.assertIn("/undo", help_text)
+
+
+class SavedReplySummaryTests(unittest.TestCase):
+    """После записи бот сразу пишет итог: сальдо с учётом возвратов и минимум переводов."""
+
+    def setUp(self) -> None:
+        self.settings = Settings(default_currency="BYN")
+        self.storage = InMemoryStorage(default_currency="BYN")
+        self.parser = HeuristicParser()
+        self.members = seed_chat(self.storage)
+
+    def send(self, text: str) -> str:
+        """Отправляет сообщение боту (автор — Леша Козлов) и возвращает ответ."""
+        return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
+                           settings=self.settings, members=self.members, author=MEMBER_LEHA)
+
+    def test_debt_reply_ends_with_summary(self) -> None:
+        reply = self.send("Леша должен Диме 3 рубля")
+        self.assertIn("Записал долг", reply)
+        self.assertIn("📊 Итог с учётом возвратов:", reply)
+        self.assertIn("Леша Козлов (@kozlovAlex) → Дмитрий Болт (@bdzmity): 3.00 BYN", reply)
+        self.assertIn("Подробно: /debts, взаиморасчёт: /settle", reply)
+
+    def test_repayment_reply_shows_what_is_left(self) -> None:
+        self.send("Леша должен Диме 5 рублей")
+        reply = self.send("Леша вернул Диме 3 рубля")
+        self.assertIn("Записал возврат долга", reply)
+        self.assertIn("Итог с учётом возвратов:", reply)
+        self.assertIn("→ Дмитрий Болт (@bdzmity): 2.00 BYN", reply)
+
+    def test_fully_repaid_reply_says_all_closed(self) -> None:
+        self.send("Леша должен Диме 3 рубля")
+        reply = self.send("Леша вернул Диме 3 рубля")
+        self.assertIn("всё закрыто", reply)
+        self.assertNotIn("Минимум переводов", reply)
+
+    def test_expense_reply_shows_summary(self) -> None:
+        reply = self.send("Дима заплатил 10 за всех")
+        self.assertIn("Записал общий счёт", reply)
+        self.assertIn("Итог с учётом возвратов:", reply)
+
+    def test_chain_reply_shows_minimum_transfers(self) -> None:
+        """Цепочка Леша → Дима → Маша → Оля: переводов меньше, чем пар долгов."""
+        self.send("Леша должен Диме 10 рублей")
+        self.send("Дима должен Маше 10 рублей")
+        reply = self.send("Маша должна Оле 10 рублей")
+        self.assertIn("📊 Итог с учётом возвратов:", reply)
+        self.assertIn("🧮 Минимум переводов, чтобы всё закрылось:", reply)
+        self.assertIn("Леша Козлов (@kozlovAlex) → Оля Смирнова (@olga_s): 10.00 BYN", reply)
+
+    def test_summary_of_saved_reply_matches_debts_report(self) -> None:
+        """Итог в ответе и итог /debts — одно и то же."""
+        reply = self.send("Леша должен Диме 3 рубля")
+        report = self.send("/debts")
+        line = "• Леша Козлов (@kozlovAlex) → Дмитрий Болт (@bdzmity): 3.00 BYN"
+        self.assertIn(line, reply)
+        self.assertIn(line, report)
 
 
 class StorageRepaymentTests(unittest.TestCase):
@@ -2032,16 +2098,18 @@ class RatesParsingTests(unittest.TestCase):
         }
         rates = parse_rates(payload, "BYN")
         self.assertEqual(sorted(rates), ["BYN", "EUR", "RUB", "USD"])
-        self.assertEqual(rates["BYN"], 1.0)
+        self.assertEqual(rates["BYN"], Decimal(1))
+        self.assertIsInstance(rates["USD"], Decimal)      # курсы держим точными, не float
         # сервис отдаёт «сколько USD за 1 BYN» — храним обратный курс (1 USD = 3.25 BYN)
-        self.assertAlmostEqual(rates["USD"], 1 / 0.3077, places=6)
+        self.assertAlmostEqual(float(rates["USD"]), 1 / 0.3077, places=8)
+        self.assertEqual(rates["USD"], Decimal("3.24991875"))       # 8 знаков, как в базе
 
     def test_parse_open_endpoint_uses_rates_field(self) -> None:
         payload = {"result": "success", "provider": "https://www.exchangerate-api.com",
                    "base_code": "USD", "rates": {"USD": 1, "BYN": 3.2, "EUR": "0,91"}}
         rates = parse_rates(payload, "USD")
-        self.assertAlmostEqual(rates["BYN"], 1 / 3.2, places=6)
-        self.assertAlmostEqual(rates["EUR"], 1 / 0.91, places=6)
+        self.assertAlmostEqual(float(rates["BYN"]), 1 / 3.2, places=6)
+        self.assertAlmostEqual(float(rates["EUR"]), 1 / 0.91, places=6)
 
     def test_error_types_are_explained(self) -> None:
         cases = {
@@ -2063,28 +2131,28 @@ class RatesParsingTests(unittest.TestCase):
 
     def test_rate_table_and_lookup(self) -> None:
         table = rate_table([
-            RatePoint(rate_date="2026-09-20", base="BYN", currency="USD", rate=3.20),
-            RatePoint(rate_date="2026-09-21", base="BYN", currency="USD", rate=3.25),
-            RatePoint(rate_date="2026-09-21", base="BYN", currency="EUR", rate=3.50),
+            RatePoint(rate_date="2026-09-20", base="BYN", currency="USD", rate=Decimal("3.20")),
+            RatePoint(rate_date="2026-09-21", base="BYN", currency="USD", rate=Decimal("3.25")),
+            RatePoint(rate_date="2026-09-21", base="BYN", currency="EUR", rate=Decimal("3.50")),
         ])
-        self.assertEqual(table["2026-09-20"]["BYN"], 1.0)
-        self.assertEqual(rate_for(table, "2026-09-21", "USD"), (3.25, "2026-09-21"))
+        self.assertEqual(table["2026-09-20"]["BYN"], Decimal(1))
+        self.assertEqual(rate_for(table, "2026-09-21", "USD"), (Decimal("3.25"), "2026-09-21"))
         # на дату без курса берём ближайший сохранённый: сначала предыдущий…
-        self.assertEqual(rate_for(table, "2026-09-25", "USD"), (3.25, "2026-09-21"))
+        self.assertEqual(rate_for(table, "2026-09-25", "USD"), (Decimal("3.25"), "2026-09-21"))
         # …а если предыдущих нет — следующий (курсы копятся начиная с какого-то дня)
-        self.assertEqual(rate_for(table, "2026-09-19", "USD"), (3.20, "2026-09-20"))
-        self.assertEqual(rate_for(table, "2026-09-21", "BYN"), (1.0, "2026-09-21"))
+        self.assertEqual(rate_for(table, "2026-09-19", "USD"), (Decimal("3.20"), "2026-09-20"))
+        self.assertEqual(rate_for(table, "2026-09-21", "BYN"), (Decimal(1), "2026-09-21"))
         self.assertEqual(rate_for(table, "2026-09-21", "THB"), (None, None))
 
     def test_convert_amount(self) -> None:
         table = rate_table([
-            RatePoint(rate_date="2026-09-21", base="BYN", currency="USD", rate=3.25),
-            RatePoint(rate_date="2026-09-21", base="BYN", currency="EUR", rate=3.50),
+            RatePoint(rate_date="2026-09-21", base="BYN", currency="USD", rate=Decimal("3.25")),
+            RatePoint(rate_date="2026-09-21", base="BYN", currency="EUR", rate=Decimal("3.50")),
         ])
         self.assertEqual(convert_amount(10, "USD", "BYN", table, "2026-09-21"),
                          (32.5, "2026-09-21"))
         self.assertEqual(convert_amount(10, "USD", "EUR", table, "2026-09-21"),
-                         (round(10 * 3.25 / 3.50, 2), "2026-09-21"))
+                         (9.29, "2026-09-21"))            # 10 × 3.25 ÷ 3.50 = 9.2857… → 9.29
         self.assertEqual(convert_amount(10, "USD", "USD", table, "2026-09-21"),
                          (10.0, "2026-09-21"))
         self.assertEqual(convert_amount(10, "THB", "BYN", table, "2026-09-21"), (None, None))
@@ -2115,13 +2183,14 @@ class RatesParsingTests(unittest.TestCase):
 
     def test_rates_report_text(self) -> None:
         report = format_rates_report([
-            RatePoint(rate_date="2026-09-21", base="BYN", currency="USD", rate=3.2531),
-            RatePoint(rate_date="2026-09-21", base="BYN", currency="RUB", rate=0.0331),
-        ], "BYN", target="USD")
+            RatePoint(rate_date="2026-09-21", base="BYN", currency="USD", rate=Decimal("3.2531")),
+            RatePoint(rate_date="2026-09-21", base="BYN", currency="RUB", rate=Decimal("0.0331")),
+        ], "BYN", target="USD", schedule="раз в день в 12:00 по Минску")
         self.assertIn("1 USD = 3.2531 BYN (доллар США)", report)
         self.assertIn("1 RUB = 0.0331 BYN", report)
         self.assertIn("21.09.2026", report)
         self.assertIn("Валюта чата: USD", report)
+        self.assertIn("раз в день в 12:00 по Минску", report)
         self.assertIn("Курсов валют пока нет", format_rates_report([], "BYN"))
 
 
@@ -2147,7 +2216,7 @@ class RatesUpdateTests(unittest.TestCase):
         self.assertEqual(result.saved, 2)                # BYN — база, THB не в списке
         self.assertEqual(result.currencies, ("USD", "EUR"))
         self.assertEqual([point.currency for point in storage.rates], ["USD", "EUR"])
-        self.assertAlmostEqual(storage.rates[0].rate, 4.0)      # 1 USD = 4 BYN
+        self.assertEqual(storage.rates[0].rate, Decimal("4"))   # 1 USD = 4 BYN
         self.assertEqual(storage.rates[0].source, "exchangerate-api.com")
 
     def test_second_call_same_day_does_not_fetch(self) -> None:
@@ -2191,6 +2260,123 @@ class RatesUpdateTests(unittest.TestCase):
         self.assertEqual(result.saved, 1)                # EUR сохранили
         self.assertEqual(result.currencies, ("EUR",))
         self.assertTrue(any("USD" in problem for problem in result.problems))
+
+
+class RatesScheduleTests(unittest.TestCase):
+    """Автообновление курсов: раз в день в RATES_HOUR по Минску, без cron."""
+
+    def settings(self, **kwargs: Any) -> Settings:
+        """Настройки с тестовым ключом и расписанием по умолчанию (12:00)."""
+        return Settings(
+            rates_api_key="test-key", rates_api_url="https://v6.exchangerate-api.com/v6",
+            rates_base="BYN", rates_currencies=("BYN", "USD"), request_timeout=5.0, **kwargs,
+        )
+
+    def payload(self) -> FakeResponse:
+        """Ответ API: 1 BYN = 0.25 USD, то есть 1 USD = 4 BYN."""
+        return FakeResponse({"result": "success", "base_code": "BYN",
+                             "conversion_rates": {"BYN": 1, "USD": 0.25}})
+
+    def test_before_schedule_hour_nothing_happens(self) -> None:
+        storage = InMemoryStorage()
+        session = FakeSession([])
+        result = update_rates_scheduled(self.settings(), storage, session=session,
+                                        now=datetime(2026, 9, 21, 11, 59), cache={})
+        self.assertIsNone(result)
+        self.assertEqual(session.calls, [])              # до 12:00 ни API, ни база не нужны
+        self.assertEqual(storage.rates, [])
+
+    def test_rates_are_loaded_at_schedule_hour(self) -> None:
+        storage = InMemoryStorage()
+        session = FakeSession([self.payload()])
+        cache: dict[str, str] = {}
+        result = update_rates_scheduled(self.settings(), storage, session=session,
+                                        now=datetime(2026, 9, 21, 12, 0), cache=cache)
+        self.assertIsNotNone(result)
+        self.assertTrue(result.updated)
+        self.assertEqual(result.rate_date, "2026-09-21")         # дата курса — по Минску
+        self.assertEqual(cache["BYN"], "2026-09-21")
+        self.assertEqual(storage.rates[0].rate, Decimal("4"))
+
+    def test_second_check_same_day_does_not_touch_api(self) -> None:
+        storage = InMemoryStorage()
+        session = FakeSession([self.payload()])
+        cache: dict[str, str] = {}
+        update_rates_scheduled(self.settings(), storage, session=session,
+                               now=datetime(2026, 9, 21, 12, 5), cache=cache)
+        for hour in (13, 18, 23):
+            again = update_rates_scheduled(self.settings(), storage, session=session,
+                                           now=datetime(2026, 9, 21, hour, 30), cache=cache)
+            self.assertIsNone(again)
+        self.assertEqual(len(session.calls), 1)                  # запрос к API ровно один
+
+    def test_next_day_is_loaded_again(self) -> None:
+        storage = InMemoryStorage()
+        session = FakeSession([self.payload(), self.payload()])
+        cache: dict[str, str] = {}
+        update_rates_scheduled(self.settings(), storage, session=session,
+                               now=datetime(2026, 9, 21, 12, 0), cache=cache)
+        result = update_rates_scheduled(self.settings(), storage, session=session,
+                                       now=datetime(2026, 9, 22, 12, 0), cache=cache)
+        self.assertTrue(result.updated)
+        self.assertEqual(result.rate_date, "2026-09-22")
+        self.assertEqual(len(session.calls), 2)
+
+    def test_hour_is_configurable(self) -> None:
+        storage = InMemoryStorage()
+        session = FakeSession([self.payload()])
+        result = update_rates_scheduled(self.settings(rates_hour=8), storage, session=session,
+                                        now=datetime(2026, 9, 21, 8, 5), cache={})
+        self.assertTrue(result.updated)
+
+    def test_problem_is_returned_to_caller(self) -> None:
+        storage = InMemoryStorage()
+        session = FakeSession([FakeResponse({"result": "error", "error-type": "invalid-key"})])
+        result = update_rates_scheduled(self.settings(), storage, session=session,
+                                        now=datetime(2026, 9, 21, 12, 0), cache={})
+        self.assertIsNotNone(result)
+        self.assertFalse(result.updated)
+        self.assertTrue(any("RATES_API_KEY" in problem for problem in result.problems))
+
+    def test_minsk_time_and_day(self) -> None:
+        self.assertEqual(minsk_now().utcoffset(), timedelta(hours=3))   # UTC+3 круглый год
+        self.assertEqual(rates_day(datetime(2026, 9, 21, 23, 30)), "2026-09-21")
+
+
+class RateScaleTests(unittest.TestCase):
+    """Курс в базе — целое (bigint): rate = курс × RATE_SCALE (10⁸)."""
+
+    def test_scale_constants(self) -> None:
+        self.assertEqual((RATE_SCALE, RATE_DIGITS), (100_000_000, 8))
+
+    def test_scale_and_unscale(self) -> None:
+        self.assertEqual(scale_rate(3.2531), 325310000)
+        self.assertEqual(scale_rate(Decimal("0.03311106")), 3311106)
+        self.assertEqual(scale_rate("3.25"), 325000000)
+        self.assertEqual(unscale_rate(325310000), Decimal("3.2531"))
+        self.assertEqual(unscale_rate("326000000"), Decimal("3.26"))
+        self.assertEqual(unscale_rate(None), Decimal(0))
+
+    def test_rate_survives_storage_round_trip(self) -> None:
+        """После записи в базу и чтения курс не теряет знаков (раньше это был float)."""
+        original = Decimal("3.25311234")
+        stored = scale_rate(original)                     # как уходит в bigint
+        self.assertIsInstance(stored, int)
+        self.assertEqual(unscale_rate(stored), original)   # как читается обратно
+        self.assertEqual(scale_rate(unscale_rate(stored)), stored)
+
+    def test_convert_amount_rounds_half_up(self) -> None:
+        table = rate_table([
+            RatePoint(rate_date="2026-09-21", base="BYN", currency="USD",
+                      rate=Decimal("3.2531")),
+            RatePoint(rate_date="2026-09-21", base="BYN", currency="EUR",
+                      rate=Decimal("3.5012")),
+        ])
+        value, used_day = convert_amount(100, "USD", "EUR", table, "2026-09-21")
+        expected = (Decimal(100) * Decimal("3.2531") / Decimal("3.5012")
+                    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        self.assertEqual(value, float(expected))
+        self.assertEqual(used_day, "2026-09-21")
 
 
 class PasswordTests(unittest.TestCase):
@@ -2316,7 +2502,7 @@ class ConvertedReportTests(unittest.TestCase):
     def test_d_uses_nearest_previous_rate(self) -> None:
         # Оставляем только курс за 20-е: для записи от 22-го он и должен примениться.
         self.storage.rates = [
-            RatePoint(rate_date="2026-09-20", base="BYN", currency="USD", rate=3.10),
+            RatePoint(rate_date="2026-09-20", base="BYN", currency="USD", rate=Decimal("3.10")),
         ]
         self.storage.add_debt(CHAT, "Леша Козлов", "Дмитрий Болт", "USD", 10,
                               created_at="2026-09-22T10:00:00+00:00")
@@ -2371,7 +2557,7 @@ class RatesStorageTests(unittest.TestCase):
         self.assertEqual(call["params"]["on_conflict"], "rate_date,base,currency")
         self.assertEqual(call["payload"][0], {
             "rate_date": "2026-09-21", "base": "BYN", "currency": "USD",
-            "rate": 3.25314, "source": "wise",
+            "rate": 325314000, "source": "wise",          # bigint: курс × 100000000
         })
 
     def test_save_rates_without_points_makes_no_request(self) -> None:
@@ -2380,13 +2566,13 @@ class RatesStorageTests(unittest.TestCase):
 
     def test_rates_since_filters_by_base(self) -> None:
         self.session.responses = [FakeResponse([
-            {"rate_date": "2026-09-21", "base": "BYN", "currency": "USD", "rate": 3.25},
+            {"rate_date": "2026-09-21", "base": "BYN", "currency": "USD", "rate": 325000000},
         ])]
         points = self.storage.rates_since("byn", "2026-09-01")
         call = self.session.calls[0]
         self.assertEqual(call["params"]["base"], "eq.BYN")
         self.assertEqual(call["params"]["rate_date"], "gte.2026-09-01")
-        self.assertEqual((points[0].currency, points[0].rate), ("USD", 3.25))
+        self.assertEqual((points[0].currency, points[0].rate), ("USD", Decimal("3.25")))
 
     def test_has_rates(self) -> None:
         self.session.responses = [FakeResponse([{"currency": "USD"}]), FakeResponse([])]
@@ -2417,7 +2603,7 @@ class RatesStorageTests(unittest.TestCase):
             {"rate_date": "2026-09-21", "base": "BYN", "currency": "USD", "rate": 3.26},
         ])
         self.assertEqual(len(memory.rates), 1)            # upsert, а не дубль
-        self.assertEqual(memory.rates[0].rate, 3.26)
+        self.assertEqual(memory.rates[0].rate, Decimal("3.26"))
         self.assertTrue(memory.has_rates("2026-09-21", "BYN"))
         self.assertEqual(len(memory.rates_since("BYN", "2026-09-01")), 1)
         self.assertEqual(memory.rates_since("BYN", "2026-10-01"), [])

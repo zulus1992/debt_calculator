@@ -66,6 +66,8 @@ class WebhookApp:
         method = str(environ.get("REQUEST_METHOD") or "GET").upper()
         if method == "GET":
             # Сюда же стучатся «пингеры» бесплатных тарифов, чтобы контейнер не засыпал.
+            # Заодно это шанс подтянуть курсы по расписанию: у вебхука своих таймеров нет.
+            self._refresh_rates()
             return _respond(start_response, "200 OK", "ok", TEXT_TYPE)
         if method != "POST":
             return _respond(
@@ -76,6 +78,20 @@ class WebhookApp:
                 ),
             )
         return self._handle_update(environ, start_response)
+
+    def _refresh_rates(self) -> None:
+        """Тихо обновляет курсы по расписанию (раз в день в RATES_HOUR по Минску).
+
+        У вебхука нет фонового цикла, поэтому проверку расписания делает и обработка
+        апдейта, и проверка живости. Проблемы только логируем: ответ «ok» должен уйти.
+        """
+        refresh = getattr(self._bot, "_refresh_rates_if_due", None)
+        if not callable(refresh):
+            return
+        try:
+            refresh()
+        except Exception as exc:  # noqa: BLE001 — проверка живости отвечает всегда
+            logger.warning("Автообновление курсов не удалось: %s", exc)
 
     def _handle_update(self, environ: dict[str, Any], start_response: Callable) -> list[bytes]:
         """Проверяет секрет, разбирает апдейт и отдаёт ответ Telegram."""

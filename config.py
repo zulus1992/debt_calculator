@@ -34,6 +34,8 @@ DEFAULT_RATES_OPEN_URL = "https://open.er-api.com/v6"
 DEFAULT_RATES_BASE = "BYN"
 # Какие валюты тянем из API: бел. рубль, рос. рубль, доллар, евро, юань, тайский бат.
 DEFAULT_RATES_CURRENCIES = ("BYN", "RUB", "USD", "EUR", "CNY", "THB")
+# Во сколько по Минску (UTC+3) обновлять курсы: раз в день, без cron. 0–23.
+DEFAULT_RATES_HOUR = 12
 
 
 class ConfigError(RuntimeError):
@@ -77,6 +79,8 @@ class Settings:
     rates_open_url: str = ""
     rates_base: str = DEFAULT_RATES_BASE
     rates_currencies: tuple[str, ...] = DEFAULT_RATES_CURRENCIES
+    # Во сколько по Минску подтягивать курсы (раз в день, без cron).
+    rates_hour: int = DEFAULT_RATES_HOUR
     chat_password: str = ""
     default_currency: str = DEFAULT_CURRENCY
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)
@@ -171,6 +175,18 @@ def _parse_codes(raw: str) -> tuple[str, ...]:
     if not codes:
         return DEFAULT_RATES_CURRENCIES
     return tuple(codes)
+
+
+def _parse_hour(raw: str, default: int) -> int:
+    """Час суток 0–23 для расписания курсов ('12' -> 12, мусор -> значение по умолчанию)."""
+    text = _clean(raw)
+    if not text:
+        return default
+    try:
+        hour = int(text)
+    except ValueError:
+        return default
+    return hour if 0 <= hour <= 23 else default
 
 
 def _parse_user_ids(raw: str) -> frozenset[int]:
@@ -279,6 +295,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         rates_open_url=get("RATES_OPEN_URL", DEFAULT_RATES_OPEN_URL).rstrip("/"),
         rates_base=get("RATES_BASE", DEFAULT_RATES_BASE).upper(),
         rates_currencies=_parse_codes(get("RATES_CURRENCIES")),
+        rates_hour=_parse_hour(get("RATES_HOUR", str(DEFAULT_RATES_HOUR)), DEFAULT_RATES_HOUR),
         chat_password=get("CHAT_PASSWORD"),
         default_currency=get("DEFAULT_CURRENCY", DEFAULT_CURRENCY).upper(),
         allowed_user_ids=_parse_user_ids(get("ALLOWED_USER_IDS")),

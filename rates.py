@@ -17,21 +17,25 @@ API: https://www.exchangerate-api.com/docs (ключ бесплатно — app.
 означает «1 USD = 3.25 BYN». Так их удобно и показывать, и пересчитывать: сумма в базовой
 валюте равна amount × rate[валюта], а в любой другой — делится на её курс.
 
-Курсы обновляются не чаще раза в день и без cron: перед запросом к API проверяем, нет ли
-уже курсов на сегодняшнюю дату в базе (вручную — `python bot.py --rates --force`).
-Истории за прошлые дни в бесплатном тарифе нет: база копит по одному снимку в сутки,
-а для дат без снимка берётся ближайший сохранённый курс.
+Курсы обновляются сами, без cron: постоянный процесс проверяет расписание и подтягивает их
+раз в день в RATES_HOUR по Минску (по умолчанию 12:00), а режим вебхука делает это при первом
+сообщении после назначенного часа. Вручную — `python bot.py --rates [--force]`.
+
+В базе курс лежит целым числом (bigint): rate = курс × RATE_SCALE (10^8), а все пересчёты
+идут в Decimal — так суммы не накапливают ошибку float, а точность курса (8 знаков)
+сохраняется полностью.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Mapping, Sequence
 
 import requests
 
-from storage import Debt, RatePoint, Storage
+from storage import RATE_DIGITS, Debt, RatePoint, Storage
 
 # Как показывать валюты человеку.
 CURRENCY_TITLES: dict[str, str] = {
@@ -48,6 +52,10 @@ CURRENCY_TITLES: dict[str, str] = {
 }
 # Насколько назад смотреть курсы, если на дату записи их нет (выходные и праздники).
 LOOKBACK_DAYS = 7
+# Расписание: курсы подтягиваются сами раз в день в RATES_HOUR по Минску (UTC+3).
+MINSK_TZ = "Europe/Minsk"
+MINSK_OFFSET_HOURS = 3
+DEFAULT_RATES_HOUR = 12
 # Откуда берём курсы: exchangerate-api.com. Ключ бесплатный — app.exchangerate-api.com,
 # без ключа работает открытый эндпоинт (лимит запросов и обязательна ссылка на сервис).
 SOURCE_TITLE = "exchangerate-api.com"
@@ -88,27 +96,54 @@ def currency_title(code: str) -> str:
     return CURRENCY_TITLES.get(upper, upper or "валюта")
 
 
-def _to_float(value: Any) -> float | None:
-    """Число из ответа API: '3,2531' → 3.2531 (None — если это не положительное число)."""
-    try:
-        number = float(str(value).replace(",", ".").strip())
-    except (TypeError, ValueError):
+def _to_decimal(value: Any) -> Decimal | None:
+    """Число из ответа API: '3,2531' → Decimal('3.2531') (None — если это не число)."""
+    text = str(value).replace(",", ".").strip() if value is not None else ""
+    if not text:
         return None
-    return number if number > 0 else None
+    try:
+        return Decimal(text)
+    except (ArithmeticError, ValueError):
+        return None
 
 
-def rate_table(points: Sequence[RatePoint]) -> dict[str, dict[str, float]]:
+def _as_decimal(value: Any) -> Decimal:
+    """Курс/сумма в Decimal: из базы значение уже Decimal, но тесты и внешний код дают float."""
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _minsk_zone() -> Any:
+    """Часовой пояс Минска: из базы tz, а если её нет (Windows без tzdata) — UTC+3."""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(MINSK_TZ)
+    except (ImportError, KeyError, ValueError, OSError):
+        # Беларусь живёт по UTC+3 круглый год — переход на летнее время не нужен
+        return timezone(timedelta(hours=MINSK_OFFSET_HOURS))
+
+
+def minsk_now() -> datetime:
+    """Текущее время по Минску — по нему считаем расписание и дату курса."""
+    return datetime.now(_minsk_zone())
+
+
+def rates_day(moment: datetime | None = None) -> str:
+    """Дата курса по Минску: по ней курсы пишутся в базу и сравниваются."""
+    return (moment or minsk_now()).date().isoformat()
+
+
+def rate_table(points: Sequence[RatePoint]) -> dict[str, dict[str, Decimal]]:
     """Таблица курсов: {дата: {валюта: сколько базовой валюты за 1 единицу валюты}}."""
-    table: dict[str, dict[str, float]] = {}
+    table: dict[str, dict[str, Decimal]] = {}
     for point in points:
         day = table.setdefault(point.rate_date, {})
-        day[str(point.base or "BYN").upper()] = 1.0
-        day[point.currency.upper()] = point.rate
+        day[str(point.base or "BYN").upper()] = Decimal(1)
+        day[point.currency.upper()] = _as_decimal(point.rate)
     return table
 
 
-def rate_for(table: Mapping[str, Mapping[str, float]], day: str,
-             currency: str) -> tuple[float | None, str | None]:
+def rate_for(table: Mapping[str, Mapping[str, Decimal]], day: str,
+             currency: str) -> tuple[Decimal | None, str | None]:
     """Курс валюты на дату: точно на эту дату, иначе — ближайший сохранённый.
 
     Курсы копятся по одному снимку в сутки, поэтому на выходные и на дни до начала сбора
@@ -120,34 +155,38 @@ def rate_for(table: Mapping[str, Mapping[str, float]], day: str,
     target = str(day or "")
     exact = table.get(target)
     if exact and exact.get(code):
-        return float(exact[code]), target
+        return exact[code], target
     earlier = [item for item in sorted(table, reverse=True) if item <= target]
     later = [item for item in sorted(table) if item > target]
     for candidate in (*earlier, *later):
         value = table[candidate].get(code)
         if value:
-            return float(value), candidate
+            return value, candidate
     return None, None
 
 
 def convert_amount(amount: float, from_code: str, to_code: str,
-                   table: Mapping[str, Mapping[str, float]], day: str,
+                   table: Mapping[str, Mapping[str, Decimal]], day: str,
                    base: str = "BYN") -> tuple[float | None, str | None]:
     """Пересчитывает сумму из одной валюты в другую по курсу на дату.
 
-    Возвращает (сумма, дата использованного курса) или (None, None), если курса нет.
+    Считаем в Decimal: промежуточные умножения и деления не накапливают ошибку float,
+    а результат округляется до копеек (ROUND_HALF_UP).
     """
     source = str(from_code or base).upper()
     target = str(to_code or base).upper()
+    cents = Decimal("0.01")
+    amount_value = _as_decimal(amount)
     if source == target:
-        return round(float(amount), 2), str(day or "")
+        return float(amount_value.quantize(cents, rounding=ROUND_HALF_UP)), str(day or "")
     source_rate, source_day = rate_for(table, day, source)
     target_rate, target_day = rate_for(table, day, target)
     if not source_rate or not target_rate:
         return None, None
-    value = float(amount) * source_rate / target_rate
+    value = (amount_value * _as_decimal(source_rate) / _as_decimal(target_rate)
+             ).quantize(cents, rounding=ROUND_HALF_UP)
     used = [item for item in (source_day, target_day) if item]
-    return round(value, 2), (max(used) if used else None)
+    return float(value), (max(used) if used else None)
 
 
 @dataclass
@@ -156,8 +195,8 @@ class ConvertedDebts:
 
     debts: list[Debt]
     target: str
-    rates_used: dict[str, dict[str, float]]            # дата курса → {валюта: сколько target за 1}
-    skipped: list[str] = field(default_factory=list)   # записи без курса
+    rates_used: dict[str, dict[str, Decimal]]           # дата курса → {валюта: сколько target за 1}
+    skipped: list[str] = field(default_factory=list)    # записи без курса
 
     @property
     def changed(self) -> bool:
@@ -166,11 +205,11 @@ class ConvertedDebts:
 
 
 def convert_debts(debts: Sequence[Debt], target: str,
-                  table: Mapping[str, Mapping[str, float]], base: str = "BYN") -> ConvertedDebts:
+                  table: Mapping[str, Mapping[str, Decimal]], base: str = "BYN") -> ConvertedDebts:
     """Приводит все записи к валюте чата по курсу на дату самой записи."""
     converted: list[Debt] = []
     skipped: list[str] = []
-    used: dict[str, dict[str, float]] = {}
+    used: dict[str, dict[str, Decimal]] = {}
     to_code = str(target or base).upper()
     for debt in debts:
         day = debt_day(debt)
@@ -184,7 +223,9 @@ def convert_debts(debts: Sequence[Debt], target: str,
             source_rate, _ = rate_for(table, day, from_code)
             target_rate, _ = rate_for(table, day, to_code)
             if source_rate and target_rate:
-                used.setdefault(rate_day, {})[from_code] = round(source_rate / target_rate, 6)
+                used.setdefault(rate_day, {})[from_code] = (
+                    _as_decimal(source_rate) / _as_decimal(target_rate)
+                ).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
         converted.append(replace(debt, amount=value, currency=to_code))
     return ConvertedDebts(debts=converted, target=to_code, rates_used=used, skipped=skipped)
 
@@ -206,7 +247,7 @@ def history_start(debts: Sequence[Debt]) -> str:
     return start.isoformat()
 
 
-def format_used_rates(rates_used: Mapping[str, Mapping[str, float]], target: str) -> list[str]:
+def format_used_rates(rates_used: Mapping[str, Mapping[str, Decimal]], target: str) -> list[str]:
     """Строки «какой курс взят на какую дату» для шапки отчёта /d."""
     lines: list[str] = []
     for day in sorted(rates_used):
@@ -220,7 +261,8 @@ def format_used_rates(rates_used: Mapping[str, Mapping[str, float]], target: str
 
 
 def format_rates_report(points: Sequence[RatePoint], base: str, *,
-                        target: str = "", source: str = SOURCE_TITLE) -> str:
+                        target: str = "", source: str = SOURCE_TITLE,
+                        schedule: str = "") -> str:
     """Ответ на /rates: курсы к базовой валюте, которые лежат в базе."""
     base_code = str(base or "BYN").upper()
     if not points:
@@ -241,13 +283,13 @@ def format_rates_report(points: Sequence[RatePoint], base: str, *,
     else:
         lines.append("Валюта чата: " + base_code +
                      ". Нужна другая — /currency USD, потом /d.")
-    lines.append("Обновляю курсы раз в день — при первом обращении за сутки.")
+    lines.append("Обновляю курсы " + (schedule or "раз в день") + " — вручную: /rates.")
     return "\n".join(lines)
 
 
-def _pretty_rate(value: float) -> str:
+def _pretty_rate(value: Any) -> str:
     """Курс в читаемом виде: 3.2531, 0.033412, 100.00."""
-    number = float(value)
+    number = value if isinstance(value, Decimal) else Decimal(str(value))
     if number >= 100:
         return f"{number:.2f}"
     if number >= 1:
@@ -304,8 +346,8 @@ def fetch_points(settings: Any, *, session: Any = None,
     нужные — иначе каждый день сохранялось бы больше сотни строк.
     """
     base = str(settings.rates_base or "BYN").upper()
-    day = today or date.today().isoformat()
-    rates = fetch_latest(
+    day = today or rates_day()
+    rates: dict[str, Decimal] = fetch_latest(
         base,
         api_url=settings.rates_api_url,
         api_key=settings.rates_api_key,
@@ -334,8 +376,9 @@ def update_rates(settings: Any, storage: Storage, *, force: bool = False,
 
     Cron не нужен: перед обращением к API проверяем, что курсов на сегодня в базе нет.
     Без RATES_API_KEY работает открытый эндпоинт (без ключа, с лимитом запросов).
+    Дата курса — по Минску (см. rates_day): по ней же сверяем «есть ли уже на сегодня».
     """
-    day = today or date.today().isoformat()
+    day = today or rates_day()
     base = str(settings.rates_base or "BYN").upper()
     if not force and storage.has_rates(day, base):
         return RatesUpdate(rate_date=day, reason="курсы на сегодня уже сохранены")
@@ -357,17 +400,53 @@ def update_rates(settings: Any, storage: Storage, *, force: bool = False,
                        problems=tuple(problems))
 
 
+# В каком дне процесс уже убедился, что курсы за сегодня есть: чтобы не ходить в базу
+# на каждом сообщении. Ключ — базовая валюта, значение — дата по Минску.
+_SCHEDULED_CACHE: dict[str, str] = {}
+
+
+def update_rates_scheduled(settings: Any, storage: Storage, *, session: Any = None,
+                           now: datetime | None = None,
+                           cache: dict[str, str] | None = None) -> RatesUpdate | None:
+    """Обновляет курсы раз в день в RATES_HOUR по Минску (по умолчанию 12:00).
+
+    Cron не нужен: постоянный процесс проверяет расписание сам, а режим вебхука — при
+    первом сообщении после назначенного часа. До этого часа в базу не обращаемся вовсе,
+    а когда курсы за сегодня уже есть, повторных запросов к API не будет.
+    """
+    moment = now or minsk_now()
+    try:
+        hour = int(getattr(settings, "rates_hour", DEFAULT_RATES_HOUR) or DEFAULT_RATES_HOUR)
+    except (TypeError, ValueError):
+        hour = DEFAULT_RATES_HOUR
+    if moment.hour < hour:
+        return None                       # ещё не время — ждём 12:00 по Минску
+    if not str(getattr(settings, "rates_api_key", "") or "").strip() \
+            and not str(getattr(settings, "rates_open_url", "") or "").strip():
+        return None                       # курсы не настроены — ни API, ни базу не трогаем
+    day = moment.date().isoformat()
+    base = str(settings.rates_base or "BYN").upper()
+    state = _SCHEDULED_CACHE if cache is None else cache
+    if state.get(base) == day:
+        return None                       # сегодня уже проверяли в этом процессе
+    result = update_rates(settings, storage, today=day, session=session)
+    if result.updated or "уже сохранены" in (result.reason or ""):
+        state[base] = day
+    return result if (result.updated or result.problems) else None
+
+
 def _error_text(payload: Mapping[str, Any]) -> str:
     """Понятное сообщение по error-type из ответа сервиса."""
     kind = str(payload.get("error-type") or payload.get("error_type") or "").strip().lower()
     return ERROR_TITLES.get(kind, f"ошибка сервиса {SOURCE_TITLE}") + f" (error-type: {kind or '?'})"
 
 
-def parse_rates(payload: Any, base: str = "") -> dict[str, float]:
+def parse_rates(payload: Any, base: str = "") -> dict[str, Decimal]:
     """Курсы из ответа /latest: {валюта: сколько базовой валюты стоит 1 единица}.
 
     Сервис отдаёт обратные курсы (`conversion_rates[X]` = сколько X за 1 base), поэтому
-    переворачиваем: rate[X] = 1 / conversion_rates[X]. Базовая валюта — всегда 1.0.
+    переворачиваем: rate[X] = 1 / conversion_rates[X]. Базовая валюта — всегда 1.
+    Считаем в Decimal и держим RATE_DIGITS знаков — столько же, сколько влезает в базу.
     Понимает и платный эндпоинт (`conversion_rates`), и открытый (`rates`).
     """
     if not isinstance(payload, Mapping):
@@ -378,17 +457,19 @@ def parse_rates(payload: Any, base: str = "") -> dict[str, float]:
     if not isinstance(quoted, Mapping) or not quoted:
         raise RatesError(f"{SOURCE_TITLE} не вернул курсы: {str(payload)[:120]}")
     base_code = str(payload.get("base_code") or base or "").upper()
-    rates: dict[str, float] = {}
+    quantum = Decimal(1).scaleb(-RATE_DIGITS)
+    rates: dict[str, Decimal] = {}
     for code, value in quoted.items():
         currency = str(code or "").upper()
         if len(currency) != 3 or not currency.isalpha():
             continue
-        number = _to_float(value)
-        if not number:
+        number = _to_decimal(value)
+        if not number or number <= 0:
             continue
-        rates[currency] = 1.0 if currency == base_code else round(1.0 / number, 8)
+        rates[currency] = ((Decimal(1) / number).quantize(quantum, rounding=ROUND_HALF_UP)
+                           if currency != base_code else Decimal(1))
     if base_code:
-        rates[base_code] = 1.0
+        rates[base_code] = Decimal(1)
     if not rates:
         raise RatesError(f"{SOURCE_TITLE} не вернул ни одной валюты")
     return rates

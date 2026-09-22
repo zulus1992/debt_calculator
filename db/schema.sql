@@ -102,21 +102,48 @@ comment on column public.bot_settings.is_authorized is
     'true — чат подтвердил пароль, бот в нём работает';
 
 -- Курсы валют (ExchangeRate-API): сколько базовой валюты стоит 1 единица валюты на дату.
--- Обновляются раз в день — при первом за сутки обращении к /d или /rates (без cron).
+-- Обновляются сами раз в день в 12:00 по Минску (RATES_HOUR) — без cron: постоянный
+-- процесс проверяет расписание сам, а режим вебхука — при первом апдейте после 12:00.
+--
+-- rate хранится ЦЕЛЫМ (bigint/int8): rate = курс × 100000000 (10^8). Так база не «плывёт»
+-- на дробных числах, а точность курса (8 знаков после запятой) сохраняется полностью.
+-- Бот умножает на 100000000 при записи и делит при чтении (RATE_SCALE в storage.py).
 create table if not exists public.currency_rates (
     rate_date  date          not null,
     base       text          not null default 'BYN',
     currency   text          not null,
-    rate       numeric(20, 8) not null check (rate > 0),
+    rate       bigint        not null check (rate > 0),
     source     text,
     updated_at timestamptz   not null default now(),
     primary key (rate_date, base, currency)
 );
 
+-- Если таблица была создана раньше с дробным rate (numeric(20, 8)) — переводим в bigint,
+-- умножая уже сохранённые значения на масштаб. Повторный запуск схему не ломает:
+-- конвертация делается только когда колонка ещё не bigint.
+do $$
+declare
+    kind text;
+begin
+    select c.data_type into kind
+      from information_schema.columns c
+     where c.table_schema = 'public'
+       and c.table_name = 'currency_rates'
+       and c.column_name = 'rate';
+    if kind is not null and kind <> 'bigint' then
+        execute 'alter table public.currency_rates '
+                'alter column rate type bigint using round(rate * 100000000)::bigint';
+        raise notice 'currency_rates.rate: numeric -> bigint (курс × 100000000)';
+    end if;
+end $$;
+
 comment on table public.currency_rates is
-    'Курсы валют по дням: rate = сколько base стоит 1 единица currency (1 USD = 3.25 BYN)';
+    'Курсы валют по дням: rate = сколько base стоит 1 единица currency, целым числом '
+    '(1 USD = 3.25 BYN → rate = 325000000)';
 comment on column public.currency_rates.base is
     'Базовая валюта, к которой приведён курс (RATES_BASE, по умолчанию BYN)';
+comment on column public.currency_rates.rate is
+    'Курс × 100000000 (10^8), целое: 325310000 — это 3.2531 base за 1 единицу currency';
 comment on column public.currency_rates.source is
     'Источник курса: exchangerate-api.com';
 
@@ -166,3 +193,9 @@ union all
 select 'chat_members', count(*) from public.chat_members
 union all
 select 'currency_rates', count(*) from public.currency_rates;
+
+-- Проверка масштаба: rate — целое, а курс = rate / 100000000.
+select currency, rate, round(rate / 100000000.0, 8) as rate_value
+  from public.currency_rates
+ order by rate_date desc, currency
+ limit 10;
