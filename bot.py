@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import signal
 import sys
 import time
@@ -37,6 +38,7 @@ from debts import (
     format_debt_saved,
     format_debts_report,
     format_help,
+    format_repayment_saved,
     normalize_name,
 )
 from deepseek import (
@@ -55,9 +57,13 @@ logger = logging.getLogger("debt_bot")
 NOT_A_DEBT_REPLY = (
     "🤔 Похоже на долг, но не хватает данных. Пример: «Леша должен Диме 3 рубля»."
 )
+NOT_A_REPAYMENT_REPLY = (
+    "🤔 Похоже на возврат долга, но не хватает данных. Пример: «Леша вернул Диме 3 рубля»."
+)
 UNKNOWN_REPLY = (
     "🤷 Не понял сообщение.\n"
     "• Записать долг: «Леша должен Диме 3 рубля»\n"
+    "• Записать возврат: «Леша вернул Диме 3 рубля»\n"
     "• Показать долги: /debts\n"
     "• Справка: /help"
 )
@@ -123,6 +129,11 @@ def handle_text(
     if command == "/reset":
         removed = storage.delete_debts(chat_id)
         return f"🧹 Удалено записей: {removed}." if removed else "📭 Записей и так нет."
+    if command == "/undo":
+        removed = storage.delete_last_debt(chat_id)
+        if removed is None:
+            return "📭 Записей нет — удалять нечего."
+        return f"🗑 Удалил последнюю запись: {removed.pretty()}"
 
     parsed = parser.parse(raw, default_currency)
     explicit_currency = detect_currency(raw)
@@ -140,6 +151,21 @@ def handle_text(
             raw_text=raw,
         )
         return format_debt_saved(debt, used_default_currency=explicit_currency is None)
+
+    if parsed.intent == "repayment":
+        if not parsed.is_repayment:
+            return NOT_A_REPAYMENT_REPLY
+        currency = (parsed.currency or explicit_currency or default_currency).upper()
+        repayment = storage.add_debt(
+            chat_id=chat_id,
+            from_name=normalize_name(str(parsed.from_name)),
+            to_name=normalize_name(str(parsed.to_name)),
+            currency=currency,
+            amount=float(parsed.amount or 0),
+            raw_text=raw,
+            kind="repayment",
+        )
+        return format_repayment_saved(repayment, used_default_currency=explicit_currency is None)
 
     if parsed.intent == "debts":
         return format_debts_report(storage.list_debts(chat_id), default_currency)
@@ -160,6 +186,71 @@ def is_allowed(user_id: int | None, settings: Settings) -> bool:
     if not settings.allowed_user_ids:
         return True
     return user_id is not None and int(user_id) in settings.allowed_user_ids
+
+
+def mentions_bot(message: Mapping[str, Any], bot_username: str) -> bool:
+    """Обращается ли сообщение к боту: «@бот …», «/команда@бот» или ответ на его сообщение."""
+    handle = str(bot_username or "").lstrip("@")
+    if not handle:
+        return False
+    pattern = re.compile(rf"@{re.escape(handle)}(?![\w])", re.IGNORECASE)
+    if pattern.search(str(message.get("text") or "")) or pattern.search(str(message.get("caption") or "")):
+        return True
+    reply_from = (message.get("reply_to_message") or {}).get("from") or {}
+    return str(reply_from.get("username") or "").lower() == handle.lower()
+
+
+def clean_bot_mention(text: str, bot_username: str) -> str:
+    """Убирает обращение к боту, чтобы разбор текста не сбивался.
+
+    «/debts@бот» → «/debts», «@бот Леша должен Диме 3» → «Леша должен Диме 3».
+    Упоминания других людей («@Дима») при этом остаются на месте.
+    """
+    handle = str(bot_username or "").lstrip("@")
+    raw = text or ""
+    if not handle:
+        return raw.strip()
+    cleaned = re.sub(rf"(/[\w]+)@{re.escape(handle)}(?![\w])", r"\1", raw, flags=re.IGNORECASE)
+    cleaned = re.sub(rf"@{re.escape(handle)}(?![\w])", " ", cleaned, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def addressing(message: Mapping[str, Any], bot_username: str,
+               settings: Settings) -> tuple[bool, str]:
+    """Решает, отвечать ли на сообщение, и отдаёт текст без обращения к боту.
+
+    * личный чат — отвечаем всегда (там обращаться некуда);
+    * группа/супергруппа — только если позвали: «@бот …», «/команда@бот» или ответ
+      на сообщение бота (настройка `REQUIRE_MENTION=0` это правило отключает).
+
+    Если имя бота неизвестно (не задан `BOT_USERNAME` и не ответил getMe), лишнего молчания
+    не допускаем: при включённом privacy mode Telegram и так присылает в группы только
+    адресованные сообщения.
+    """
+    text = str(message.get("text") or "")
+    chat_type = str((message.get("chat") or {}).get("type") or "private").lower()
+    handle = str(bot_username or "").lstrip("@")
+    cleaned = clean_bot_mention(text, handle)
+
+    if chat_type == "private" or not settings.require_mention:
+        return True, cleaned
+    if not handle:
+        logger.warning("Имя бота неизвестно — в группе отвечаю на любое сообщение.")
+        return True, cleaned
+    return mentions_bot(message, handle), cleaned
+
+
+def configure_logging(level: str = "INFO") -> None:
+    """Включает логи с таймстампами.
+
+    Нужно и локально, и на хостингах: у WSGI-приложений (PythonAnywhere, Vercel) всё, что
+    пишется в stderr, попадает в error log веб-приложения — иначе ошибки DeepSeek/Supabase
+    будет просто негде увидеть.
+    """
+    logging.basicConfig(
+        level=getattr(logging, str(level or "INFO").upper(), logging.INFO),
+        format=LOG_FORMAT,
+    )
 
 
 def build_runtime(settings: Settings) -> tuple[Storage, DeepSeekParser, TelegramBot]:
@@ -189,12 +280,26 @@ class DebtBot:
     """Длинный опрос Telegram и обработка входящих сообщений."""
 
     def __init__(self, settings: Settings, storage: Storage, parser: Any,
-                 telegram: TelegramBot) -> None:
+                 telegram: TelegramBot, *, bot_username: str | None = None) -> None:
         self._settings = settings
         self._storage = storage
         self._parser = parser
         self._telegram = telegram
         self._stop = False
+        # Имя бота без @ нужно, чтобы понимать обращения «@бот …» в группах.
+        self._bot_username = str(bot_username or settings.bot_username or "").lstrip("@")
+
+    @property
+    def bot_username(self) -> str:
+        """Имя бота без @ (одна попытка getMe, дальше — кеш)."""
+        if not self._bot_username:
+            try:
+                me = self._telegram.get_me() or {}
+            except TelegramError as exc:
+                logger.warning("getMe не ответил (%s) — имя бота неизвестно.", exc)
+                return ""
+            self._bot_username = str(me.get("username") or "").lstrip("@")
+        return self._bot_username
 
     def run(self, poll_timeout: int = 25, max_updates: int | None = None) -> int:
         """Постоянный режим (long polling): ответы приходят мгновенно.
@@ -204,6 +309,7 @@ class DebtBot:
         чтобы после перезапуска или возврата к режиму `--once` ничего не путалось.
         """
         me = self._telegram.get_me()
+        self._bot_username = self._bot_username or str(me.get("username") or "").lstrip("@")
         offset = self._load_offset()
         logger.info(
             "Бот @%s (id %s) запущен (long polling). Стартовое смещение: %s",
@@ -331,6 +437,14 @@ class DebtBot:
         user_id = (message.get("from") or {}).get("id")
         if not text or chat_id is None:
             return
+
+        # В группе отвечаем только на обращение («@бот …», «/команда@бот», ответ на наше
+        # сообщение), иначе — молчим, чтобы не комментировать весь чат.
+        should_handle, text = addressing(message, self.bot_username, self._settings)
+        if not should_handle:
+            logger.info("Сообщение %s не адресовано боту — пропускаю.", message.get("message_id"))
+            return
+
         if not is_allowed(user_id, self._settings):
             logger.warning("Сообщение от недопущенного пользователя id=%s", user_id)
             self._send(chat_id, DENIED_REPLY, message)
@@ -454,6 +568,11 @@ def check_services(settings: Settings) -> bool:
         telegram = TelegramBot(settings.telegram_token, timeout=settings.request_timeout)
         me = telegram.get_me()
         print(f"✓ Telegram: @{me.get('username')} (id {me.get('id')})")
+        if settings.require_mention:
+            print(f"• В группах отвечаю только на обращение: «@{me.get('username')} …», "
+                  "«/debts@...» или ответ на моё сообщение")
+        else:
+            print("• REQUIRE_MENTION=0 — в группах отвечаю на любое сообщение")
         info = telegram.get_webhook_info()
         url = str(info.get("url") or "")
         if url:
@@ -514,6 +633,9 @@ DEMO_MESSAGES = (
     "Петя должен Маше 5 долларов",
     "покажи долги",
     "Леша должен Диме 2 рубля",
+    "Леша вернул Диме 1 рубль",      # возврат: уменьшает сальдо
+    "покажи долги",
+    "/undo",                         # отменяем последнюю запись (возврат)
     "/debts",
     "/currency BYN",
     "привет",
@@ -590,10 +712,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_stdout()
     args = build_parser().parse_args(argv)
     settings = load_settings()
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level, logging.INFO),
-        format=LOG_FORMAT,
-    )
+    configure_logging(settings.log_level)
 
     if args.demo:
         return run_demo()

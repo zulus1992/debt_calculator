@@ -12,7 +12,14 @@ import json
 import unittest
 from typing import Any
 
-from bot import DebtBot, HeuristicParser, handle_text, is_allowed
+from bot import (
+    DebtBot,
+    HeuristicParser,
+    clean_bot_mention,
+    handle_text,
+    is_allowed,
+    mentions_bot,
+)
 from config import (
     ConfigError,
     Settings,
@@ -21,8 +28,14 @@ from config import (
     supabase_key_problem,
     webhook_secret_problem,
 )
-from debts import name_key, net_balances, normalize_name, totals_by_person
-from deepseek import ParsedMessage, detect_currency, heuristic_parse
+from debts import (
+    format_debts_report,
+    name_key,
+    net_balances,
+    normalize_name,
+    totals_by_person,
+)
+from deepseek import SYSTEM_PROMPT, ParsedMessage, detect_currency, heuristic_parse
 from storage import Debt, InMemoryStorage, StorageError, SupabaseStorage
 from telegram_api import TelegramBot, TelegramError, split_message
 from webhook import SECRET_HEADER, LazyWebhookApp, WebhookApp, build_app
@@ -31,10 +44,10 @@ CHAT = 555
 
 
 def make_debt(debtor: str, creditor: str, amount: float, currency: str = "BYN",
-              chat: int = CHAT) -> Debt:
-    """Готовит запись о долге для проверок логики."""
+              chat: int = CHAT, kind: str = "debt") -> Debt:
+    """Готовит запись (долг или возврат) для проверок логики."""
     return Debt(chat_id=chat, from_name=debtor, to_name=creditor,
-                currency=currency, amount=amount)
+                currency=currency, amount=amount, kind=kind)
 
 
 class HeuristicParseTests(unittest.TestCase):
@@ -862,6 +875,350 @@ class LongPollingTests(unittest.TestCase):
         bot = DebtBot(settings, BrokenState(), HeuristicParser(), telegram)
         self.assertEqual(bot.run(poll_timeout=5, max_updates=1), 1)   # не падает из-за состояния
         self.assertIn("Записал долг", telegram.sent[0][1])
+
+
+GROUP = -100500
+
+
+def make_chat_update(update_id: int, text: str, *, chat: int = GROUP,
+                     chat_type: str = "supergroup", user: int = 100,
+                     username: str = "vasya",
+                     reply_from_username: str | None = None) -> dict:
+    """Апдейт с типом чата и (опционально) ответом — для проверки правил обращения к боту."""
+    message: dict[str, Any] = {
+        "message_id": update_id,
+        "chat": {"id": chat, "type": chat_type},
+        "from": {"id": user, "username": username},
+        "text": text,
+    }
+    if reply_from_username is not None:
+        message["reply_to_message"] = {
+            "message_id": update_id - 1,
+            "chat": {"id": chat, "type": chat_type},
+            "from": {"id": 1, "username": reply_from_username, "is_bot": True},
+            "text": "предыдущий ответ бота",
+        }
+    return {"update_id": update_id, "message": message}
+
+
+class MentionOnlyTests(unittest.TestCase):
+    """В группах бот работает только по обращению, в личке — как раньше."""
+
+    BOT = "test_bot"          # столько возвращает FakeTelegram.get_me()
+
+    def build(self, **settings_kwargs):
+        """Бот с хранилищем в памяти и подменённым Telegram."""
+        settings = Settings(default_currency="BYN", **settings_kwargs)
+        storage = InMemoryStorage(default_currency="BYN")
+        telegram = FakeTelegram([])
+        bot = DebtBot(settings, storage, HeuristicParser(), telegram)
+        return bot, storage, telegram
+
+    def test_group_message_without_mention_is_ignored(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля"))
+        self.assertEqual(telegram.sent, [])                 # молчим, в чат не лезем
+        self.assertEqual(storage.list_debts(GROUP), [])
+
+    def test_group_message_with_mention_is_saved(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, f"@{self.BOT} Леша должен Диме 3 рубля"))
+        self.assertIn("Записал долг", telegram.sent[0][1])
+        saved = storage.list_debts(GROUP)[0]
+        self.assertEqual(saved.raw_text, "Леша должен Диме 3 рубля")   # упоминание вырезано
+
+    def test_mention_at_the_end_is_understood(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, f"Леша должен Диме 3 рубля @{self.BOT}"))
+        self.assertIn("Записал долг", telegram.sent[0][1])
+
+    def test_command_with_bot_username(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, f"/debts@{self.BOT}"))
+        self.assertIn("Долгов нет", telegram.sent[0][1])
+
+    def test_help_command_with_bot_username(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, f"/help@{self.BOT}"))
+        self.assertIn("Калькулятор долгов", telegram.sent[0][1])
+
+    def test_bare_mention_shows_help(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, f"@{self.BOT}"))
+        self.assertIn("Калькулятор долгов", telegram.sent[0][1])
+
+    def test_reply_to_bot_is_processed(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(
+            10, "а Леша должен Диме 3 рубля?", reply_from_username=self.BOT,
+        ))
+        self.assertIn("Записал долг", telegram.sent[0][1])
+
+    def test_mention_of_another_bot_is_ignored(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "@other_bot Леша должен Диме 3 рубля"))
+        self.assertEqual(telegram.sent, [])
+
+    def test_similar_username_is_not_a_mention(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "@test_bot_super Леша должен Диме 3 рубля"))
+        self.assertEqual(telegram.sent, [])
+
+    def test_private_chat_works_without_mention(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля",
+                                            chat=7, chat_type="private"))
+        self.assertIn("Записал долг", telegram.sent[0][1])
+        self.assertEqual(len(storage.list_debts(7)), 1)
+
+    def test_mention_is_stripped_in_private_chat(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, f"@{self.BOT} /debts",
+                                            chat=7, chat_type="private"))
+        self.assertIn("Долгов нет", telegram.sent[0][1])
+
+    def test_require_mention_can_be_disabled(self) -> None:
+        bot, storage, telegram = self.build(require_mention=False)
+        bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля"))
+        self.assertIn("Записал долг", telegram.sent[0][1])
+
+    def test_bot_username_from_settings(self) -> None:
+        bot, _, _ = self.build(bot_username="@my_debt_bot")
+        self.assertEqual(bot.bot_username, "my_debt_bot")
+
+
+class MentionHelperTests(unittest.TestCase):
+    """Вспомогательные функции обращения к боту."""
+
+    def test_clean_mention(self) -> None:
+        self.assertEqual(clean_bot_mention(" /debts@test_bot ", "test_bot"), "/debts")
+        self.assertEqual(clean_bot_mention("@test_bot  Леша  должен  Диме 3", "test_bot"),
+                         "Леша должен Диме 3")
+        self.assertEqual(clean_bot_mention("привет @test_bot, как дела", "test_bot"),
+                         "привет , как дела")
+        self.assertEqual(clean_bot_mention("@Дима должен Леше 5", "test_bot"),
+                         "@Дима должен Леше 5")          # чужие упоминания не трогаем
+
+    def test_mentions(self) -> None:
+        self.assertTrue(mentions_bot({"text": "@test_bot привет"}, "test_bot"))
+        self.assertTrue(mentions_bot({"text": "@Test_Bot привет"}, "test_bot"))   # регистр не важен
+        self.assertFalse(mentions_bot({"text": "привет"}, "test_bot"))
+        self.assertFalse(mentions_bot({"text": "@test_bot_super привет"}, "test_bot"))
+        self.assertTrue(mentions_bot({"text": "", "caption": "@test_bot фото"}, "test_bot"))
+        self.assertTrue(mentions_bot(
+            {"text": "привет", "reply_to_message": {"from": {"username": "test_bot"}}}, "test_bot",
+        ))
+        self.assertFalse(mentions_bot({"text": "@test_bot"}, ""))
+
+    def test_settings_flags(self) -> None:
+        self.assertTrue(load_settings({}, use_env_file=False).require_mention)
+        self.assertFalse(load_settings({"REQUIRE_MENTION": "0"}, use_env_file=False).require_mention)
+        self.assertFalse(load_settings({"REQUIRE_MENTION": "no"}, use_env_file=False).require_mention)
+        self.assertTrue(load_settings({"REQUIRE_MENTION": "да"}, use_env_file=False).require_mention)
+        self.assertTrue(load_settings({"REQUIRE_MENTION": "мусор"}, use_env_file=False).require_mention)
+        self.assertEqual(load_settings({"BOT_USERNAME": "@my_bot"}, use_env_file=False).bot_username,
+                         "my_bot")
+
+
+class RepaymentTests(unittest.TestCase):
+    """Возврат долга: разбор текста, влияние на сальдо и отчёт."""
+
+    def test_heuristic_repayment(self) -> None:
+        parsed = heuristic_parse("Леша вернул Диме 3 рубля")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.intent, "repayment")
+        self.assertEqual((parsed.from_name, parsed.to_name), ("Леша", "Диме"))
+        self.assertEqual(parsed.amount, 3.0)
+        self.assertEqual(parsed.currency, "BYN")
+        self.assertTrue(parsed.is_repayment)
+
+    def test_repayment_with_dollar(self) -> None:
+        parsed = heuristic_parse("Маша отдала Пете 10$")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.intent, "repayment")
+        self.assertEqual(parsed.amount, 10.0)
+        self.assertEqual(parsed.currency, "USD")
+
+    def test_word_dolg_does_not_turn_repayment_into_report(self) -> None:
+        parsed = heuristic_parse("Леша вернул долг Диме 3 рубля")
+        self.assertEqual(parsed.intent, "repayment")      # а не «покажи долги»
+
+    def test_debt_parsing_is_unchanged(self) -> None:
+        parsed = heuristic_parse("Леша должен Диме 3 рубля")
+        self.assertEqual(parsed.intent, "debt")
+
+    def test_system_prompt_knows_repayment(self) -> None:
+        self.assertIn("repayment", SYSTEM_PROMPT)
+
+    def test_netting_subtracts_repayment(self) -> None:
+        balances = net_balances([
+            make_debt("Леша", "Дима", 5),
+            make_debt("Леша", "Дима", 3, kind="repayment"),
+        ])
+        self.assertEqual(len(balances), 1)
+        self.assertEqual((balances[0].debtor, balances[0].amount), ("Леша", 2.0))
+
+    def test_full_repayment_closes_the_debt(self) -> None:
+        self.assertEqual(net_balances([
+            make_debt("Леша", "Дима", 3),
+            make_debt("Леша", "Дима", 3, kind="repayment"),
+        ]), [])
+
+    def test_overpayment_flips_direction(self) -> None:
+        balances = net_balances([
+            make_debt("Леша", "Дима", 3),
+            make_debt("Леша", "Дима", 5, kind="repayment"),
+        ])
+        self.assertEqual((balances[0].debtor, balances[0].creditor, balances[0].amount),
+                         ("Дима", "Леша", 2.0))
+
+    def test_totals_are_reduced(self) -> None:
+        owes, owed = totals_by_person([
+            make_debt("Леша", "Дима", 5),
+            make_debt("Леша", "Дима", 2, kind="repayment"),
+        ])
+        self.assertEqual(owes["Леша"]["BYN"], 3.0)
+        self.assertEqual(owed["Дима"]["BYN"], 3.0)
+
+    def test_pretty_marks_repayment(self) -> None:
+        self.assertIn("вернул", make_debt("Леша", "Дима", 3, kind="repayment").pretty())
+
+    def test_report_shows_repayments_separately(self) -> None:
+        report = format_debts_report([
+            make_debt("Леша", "Дима", 5),
+            make_debt("Леша", "Дима", 3, kind="repayment"),
+        ])
+        self.assertIn("из них возвратов: 1", report)
+        self.assertIn("Итог с взаимозачётом", report)
+        self.assertIn("Леша → Дима: 2.00 BYN", report)
+        self.assertIn("Возвраты (учтены в зачёте)", report)
+        self.assertIn("Возвратов записано: 3.00 BYN", report)
+
+
+class RepaymentFlowTests(unittest.TestCase):
+    """Сценарии бота: «вернул» уменьшает долг, /undo убирает последнюю запись."""
+
+    def setUp(self) -> None:
+        self.settings = Settings(default_currency="BYN")
+        self.storage = InMemoryStorage(default_currency="BYN")
+        self.parser = HeuristicParser()
+
+    def send(self, text: str, chat: int = CHAT) -> str:
+        """Отправляет сообщение боту и возвращает ответ."""
+        return handle_text(text, chat, storage=self.storage, parser=self.parser,
+                           settings=self.settings)
+
+    def test_repayment_is_saved_and_reduces_report(self) -> None:
+        self.send("Леша должен Диме 5 рублей")
+        reply = self.send("Леша вернул Диме 3 рубля")
+        self.assertIn("Записал возврат долга", reply)
+        saved = self.storage.list_debts(CHAT)[-1]
+        self.assertEqual((saved.kind, saved.amount, saved.raw_text),
+                         ("repayment", 3.0, "Леша вернул Диме 3 рубля"))
+        # В записях встречается только «Диме», поэтому и в отчёте имя в этой форме.
+        self.assertIn("Леша → Диме: 2.00 BYN", self.send("/debts"))
+
+    def test_repayment_without_amount_asks_for_details(self) -> None:
+        reply = handle_text(
+            "Леша вернул Диме", CHAT, storage=self.storage,
+            parser=FakeParser(ParsedMessage(intent="repayment", from_name="Леша", to_name="Дима")),
+            settings=self.settings,
+        )
+        self.assertIn("не хватает данных", reply)
+        self.assertEqual(self.storage.list_debts(CHAT), [])
+
+    def test_repayment_reply_mentions_default_currency(self) -> None:
+        reply = self.send("Леша вернул Диме 3")
+        self.assertIn("3.00 BYN", reply)
+        self.assertIn("взял по умолчанию", reply)
+
+    def test_undo_removes_last_record(self) -> None:
+        self.send("Леша должен Диме 3 рубля")
+        self.send("Леша вернул Диме 1 рубль")
+        reply = self.send("/undo")
+        self.assertIn("Удалил последнюю запись", reply)
+        self.assertIn("вернул", reply)
+        self.assertEqual(len(self.storage.list_debts(CHAT)), 1)
+        self.assertNotIn("Возвраты", self.send("/debts"))
+
+    def test_undo_without_records(self) -> None:
+        self.assertIn("удалять нечего", self.send("/undo"))
+
+    def test_undo_twice_removes_two_records(self) -> None:
+        self.send("Леша должен Диме 3 рубля")
+        self.send("Маша должна Оле 5 рублей")
+        self.send("/undo")
+        self.send("/undo")
+        self.assertEqual(self.storage.list_debts(CHAT), [])
+        self.assertIn("удалять нечего", self.send("/undo"))
+
+    def test_undo_does_not_touch_other_chats(self) -> None:
+        self.send("Леша должен Диме 3 рубля", chat=1)
+        self.send("Маша должна Оле 5 рублей", chat=2)
+        self.send("/undo", chat=2)
+        self.assertEqual(len(self.storage.list_debts(1)), 1)
+        self.assertEqual(self.storage.list_debts(2), [])
+
+    def test_help_mentions_new_commands(self) -> None:
+        help_text = self.send("/help")
+        self.assertIn("возврат", help_text)
+        self.assertIn("/undo", help_text)
+
+
+class StorageRepaymentTests(unittest.TestCase):
+    """Слой Supabase и память: поле kind и удаление последней записи."""
+
+    def setUp(self) -> None:
+        self.session = FakeSession()
+        self.storage = SupabaseStorage(
+            "https://example.supabase.co/", "service-key", session=self.session,
+        )
+
+    def test_add_repayment_payload(self) -> None:
+        self.session.responses = [FakeResponse([{
+            "id": 6, "chat_id": 7, "from_name": "Леша", "to_name": "Дима",
+            "currency": "BYN", "amount": 3.0, "kind": "repayment",
+        }])]
+        debt = self.storage.add_debt(7, "Леша", "Дима", "byn", 3, kind="repayment")
+        self.assertEqual(debt.kind, "repayment")
+        self.assertTrue(debt.is_repayment)
+        self.assertEqual(self.session.calls[0]["payload"]["kind"], "repayment")
+
+    def test_default_kind_is_debt(self) -> None:
+        self.session.responses = [FakeResponse([{"id": 1, "chat_id": 7, "amount": 3.0}])]
+        self.storage.add_debt(7, "Леша", "Дима", "BYN", 3)
+        self.assertEqual(self.session.calls[0]["payload"]["kind"], "debt")
+
+    def test_delete_last_debt_reads_then_deletes(self) -> None:
+        self.session.responses = [
+            FakeResponse([{
+                "id": 5, "chat_id": 7, "from_name": "Леша", "to_name": "Дима",
+                "currency": "BYN", "amount": 3.0, "kind": "debt",
+            }]),
+            FakeResponse([{"id": 5}]),
+        ]
+        removed = self.storage.delete_last_debt(7)
+        self.assertEqual((removed.id, removed.amount), (5, 3.0))
+        read_call, delete_call = self.session.calls
+        self.assertEqual(read_call["method"], "GET")
+        self.assertEqual(read_call["params"]["order"], "created_at.desc,id.desc")
+        self.assertEqual(read_call["params"]["limit"], 1)
+        self.assertEqual(delete_call["method"], "DELETE")
+        self.assertEqual(delete_call["params"]["id"], "eq.5")
+
+    def test_delete_last_debt_without_records_does_not_delete(self) -> None:
+        self.session.responses = [FakeResponse([])]
+        self.assertIsNone(self.storage.delete_last_debt(7))
+        self.assertEqual(len(self.session.calls), 1)
+
+    def test_memory_storage_delete_last(self) -> None:
+        memory = InMemoryStorage()
+        memory.add_debt(1, "Леша", "Дима", "BYN", 3)
+        memory.add_debt(1, "Леша", "Дима", "BYN", 1, kind="repayment")
+        removed = memory.delete_last_debt(1)
+        self.assertTrue(removed.is_repayment)
+        self.assertEqual(len(memory.debts), 1)
+        self.assertIsNone(memory.delete_last_debt(99))
 
 
 if __name__ == "__main__":

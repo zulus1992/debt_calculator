@@ -33,12 +33,11 @@ import sys
 import threading
 from typing import Any, Callable
 
-from bot import DebtBot, build_runtime, configure_stdout
+from bot import DebtBot, build_runtime, configure_logging, configure_stdout
 from config import ConfigError, Settings, load_settings, require_settings, webhook_secret_problem
 from storage import StorageError
 from telegram_api import TelegramError
 
-LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 logger = logging.getLogger("debt_bot.webhook")
 
 # Telegram присылает секрет в этом заголовке (в WSGI — с префиксом HTTP_ и в верхнем регистре).
@@ -162,6 +161,9 @@ def build_app(settings: Settings, *, storage: Any = None, parser: Any = None,
 def app_from_settings() -> WebhookApp:
     """Боевая сборка: настройки из окружения/.env, сервисы Supabase + DeepSeek + Telegram."""
     settings = load_settings()
+    # На хостингах (PythonAnywhere, Vercel) stderr уходит в лог приложения — включаем логи,
+    # чтобы в error log были видны старт и ошибки DeepSeek/Supabase, а не «тишина».
+    configure_logging(settings.log_level)
     require_settings(settings)
     built = build_app(settings)
     logger.info(
@@ -233,7 +235,7 @@ def serve(host: str = "127.0.0.1", port: int = 8080) -> int:
             print("✗", secret_problem, file=sys.stderr)
         return 1
 
-    logging.basicConfig(level=getattr(logging, settings.log_level, logging.INFO), format=LOG_FORMAT)
+    configure_logging(settings.log_level)
     local_app = LazyWebhookApp(app_from_settings)
     with make_server(host, port, local_app) as server:
         print(f"Локальный вебхук: http://{host}:{port}  (проверка живости — GET /)")

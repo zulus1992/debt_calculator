@@ -63,6 +63,8 @@ class Settings:
     request_timeout: float = 30.0
     log_level: str = "INFO"
     webhook_secret: str = ""
+    require_mention: bool = True
+    bot_username: str = ""
 
     @property
     def rest_url(self) -> str:
@@ -95,6 +97,18 @@ class Settings:
 def _clean(value: object) -> str:
     """Срезает пробелы и кавычки — частая ошибка при вставке ключей."""
     return str(value or "").strip().strip("'\"").strip()
+
+
+def _parse_bool(raw: str, default: bool) -> bool:
+    """Понимает 1/0, true/false, yes/no, on/off, да/нет (пусто — значение по умолчанию)."""
+    value = _clean(raw).lower()
+    if not value:
+        return default
+    if value in ("1", "true", "yes", "on", "да", "истина"):
+        return True
+    if value in ("0", "false", "no", "off", "нет", "ложь"):
+        return False
+    return default
 
 
 def _parse_user_ids(raw: str) -> frozenset[int]:
@@ -201,6 +215,8 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         request_timeout=timeout,
         log_level=get("LOG_LEVEL", "INFO").upper(),
         webhook_secret=get("WEBHOOK_SECRET"),
+        require_mention=_parse_bool(get("REQUIRE_MENTION"), True),
+        bot_username=get("BOT_USERNAME").lstrip("@"),
     )
 
 

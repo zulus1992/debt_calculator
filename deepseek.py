@@ -3,6 +3,7 @@
 
 Результат разбора — ParsedMessage с намерением (intent):
     debt          — сообщение о долге: from / to / currency / amount
+    repayment     — возврат долга: «Леша вернул Диме 3 рубля» (from вернул to)
     debts         — просьба показать долги
     set_currency  — установить валюту по умолчанию
     help          — вопрос про возможности бота
@@ -18,7 +19,7 @@ from typing import Any, Mapping
 
 import requests
 
-INTENTS = ("debt", "debts", "set_currency", "help", "none")
+INTENTS = ("debt", "repayment", "debts", "set_currency", "help", "none")
 
 # Синонимы валют. По умолчанию «рубль» — белорусский рубль (BYN),
 # для российского указывайте «российский рубль», «руб РФ» или ₽.
@@ -39,6 +40,19 @@ NUMBER_RE = re.compile(r"\d+(?:[.,]\d{1,2})?")
 DEBT_RE = re.compile(
     rf"(?P<debtor>[A-Za-zА-Яа-яЁё][\w\-]{{1,29}})\s+{DEBT_VERBS}\s+(?:у\s+|от\s+)?"
     rf"(?P<creditor>[A-Za-zА-Яа-яЁё][\w\-]{{1,29}})\s*(?:—|-|:)?\s*"
+    rf"(?P<amount>\d+(?:[.,]\d{{1,2}})?)?(?P<tail>[^\n]*)",
+    re.IGNORECASE,
+)
+
+# Возврат долга: «Леша вернул Диме 3 рубля», «Маша отдала Пете 10$», «рассчитался с Димой на 5»
+REPAYMENT_VERBS = (
+    r"(?:вернул[аи]?|отдал[аи]?|возвратил[аи]?|возместил[аи]?|погасил[аи]?|"
+    r"рассчитал(?:ся|ась|ись)?|returned|repaid|paid\s+back)"
+)
+REPAYMENT_RE = re.compile(
+    rf"(?P<payer>[A-Za-zА-Яа-яЁё][\w\-]{{1,29}})\s+{REPAYMENT_VERBS}\s+"
+    rf"(?:мне\s+|долг\s+)?(?:у\s+|от\s+|для\s+|с\s+)?"
+    rf"(?P<payee>[A-Za-zА-Яа-яЁё][\w\-]{{1,29}})\s*(?:—|-|:)?\s*"
     rf"(?P<amount>\d+(?:[.,]\d{{1,2}})?)?(?P<tail>[^\n]*)",
     re.IGNORECASE,
 )
@@ -75,22 +89,35 @@ class ParsedMessage:
             and float(self.amount) > 0
         )
 
+    @property
+    def is_repayment(self) -> bool:
+        """Готов ли результат к сохранению как возврат долга."""
+        return (
+            self.intent == "repayment"
+            and bool(self.from_name)
+            and bool(self.to_name)
+            and isinstance(self.amount, (int, float))
+            and float(self.amount) > 0
+        )
+
 
 SYSTEM_PROMPT = """Ты — разборщик сообщений о долгах для телеграм-бота (русский и английский).
 Верни ТОЛЬКО JSON без пояснений:
-{"intent":"debt|debts|set_currency|help|none","from":"имя","to":"имя","currency":"BYN","amount":3.0,"note":"короткое пояснение"}
+{"intent":"debt|repayment|debts|set_currency|help|none","from":"имя","to":"имя","currency":"BYN","amount":3.0,"note":"короткое пояснение"}
 
 Правила:
 1. intent=debt — кто-то кому-то должен: «Леша должен Диме 3 рубля», «Маша заняла у Пети 10$».
    from — должник (кто должен), to — кредитор (кому должны), amount — число с точкой.
-2. Валюту приводи к коду ISO: рубль/руб/бр = BYN, доллар/$/бакс = USD, евро/€ = EUR,
+2. intent=repayment — долг возвращают: «Леша вернул Диме 3 рубля», «Маша отдала Пете 10$»,
+   «рассчитался с Димой на 5». from — кто вернул, to — кому вернул, amount — сумма возврата.
+3. Валюту приводи к коду ISO: рубль/руб/бр = BYN, доллар/$/бакс = USD, евро/€ = EUR,
    российский рубль/₽ = RUB, злотый = PLN, гривна = UAH, тенге = KZT, фунт = GBP.
    Если валюта не названа — поле currency не заполняй.
-3. intent=debts — просят показать или посчитать долги («покажи долги», «сколько я должен»).
-4. intent=set_currency — просят задать валюту по умолчанию («валюта по умолчанию доллар»).
-5. intent=help — спрашивают, что умеет бот.
-6. intent=none — всё остальное (в note коротко почему).
-7. Имена приводи к именительному падежу (кто?): «Диме»/«Диму» → «Дима», «Леше» → «Леша»,
+4. intent=debts — просят показать или посчитать долги («покажи долги», «сколько я должен»).
+5. intent=set_currency — просят задать валюту по умолчанию («валюта по умолчанию доллар»).
+6. intent=help — спрашивают, что умеет бот.
+7. intent=none — всё остальное (в note коротко почему).
+8. Имена приводи к именительному падежу (кто?): «Диме»/«Диму» → «Дима», «Леше» → «Леша»,
    «Пете» → «Петя». Пиши только само имя, без лишних слов."""
 
 
@@ -281,10 +308,41 @@ def _segment_names(segment: str) -> list[str]:
     ]
 
 
+def _parse_repayment(raw: str, default_currency: str = "BYN") -> ParsedMessage | None:
+    """Пытается распознать возврат долга: «Леша вернул Диме 3 рубля».
+
+    Вызывается раньше проверки на «долг/долги», иначе фраза «Леша вернул долг Диме 3»
+    была бы принята за просьбу показать отчёт.
+    """
+    match = REPAYMENT_RE.search(raw)
+    if not match:
+        return None
+    payer, payee = match.group("payer"), match.group("payee")
+    if not payer or not payee:
+        return None
+    if detect_currency(payer) is not None or detect_currency(payee) is not None:
+        return None                      # «вернул рублями»: слово похоже на имя, но это валюта
+    tail = match.group("tail") or ""
+    amount = _to_amount(match.group("amount"))
+    if amount is None:
+        numbers = NUMBER_RE.findall(tail[:60])
+        amount = _to_amount(numbers[0]) if numbers else None
+    if not amount:
+        return None
+    return ParsedMessage(
+        intent="repayment",
+        from_name=_to_name(payer),
+        to_name=_to_name(payee),
+        currency=detect_currency(tail) or detect_currency(raw) or default_currency,
+        amount=amount,
+        source="heuristic",
+    )
+
+
 def heuristic_parse(text: str, default_currency: str = "BYN") -> ParsedMessage | None:
     """Разбор сообщения без внешних сервисов (регулярные выражения).
 
-    Понимает «Леша должен Диме 3 рубля», «3 рубля: Леша должен Диме»,
+    Понимает «Леша должен Диме 3 рубля», «3 рубля: Леша должен Диме», «Леша вернул Диме 3»,
     «покажи долги», «валюта по умолчанию доллар».
     """
     raw = (text or "").strip()
@@ -298,6 +356,12 @@ def heuristic_parse(text: str, default_currency: str = "BYN") -> ParsedMessage |
             return ParsedMessage(intent="set_currency", currency=code, source="heuristic")
     if any(keyword in lowered for keyword in HELP_KEYWORDS):
         return ParsedMessage(intent="help", source="heuristic")
+
+    # Возврат проверяем до «долг/долги»: «вернул долг Диме 3» — это не отчёт.
+    repayment = _parse_repayment(raw, default_currency)
+    if repayment is not None:
+        return repayment
+
     if any(keyword in lowered for keyword in DEBTS_KEYWORDS):
         return ParsedMessage(intent="debts", source="heuristic")
 

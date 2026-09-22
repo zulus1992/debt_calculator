@@ -17,19 +17,27 @@ class StorageError(RuntimeError):
 
 @dataclass
 class Debt:
-    """Один долг: кто, кому, сколько и в какой валюте."""
+    """Одна запись: кто, кому, сколько и в какой валюте."""
 
     chat_id: int
     from_name: str
     to_name: str
     currency: str
     amount: float
+    kind: str = "debt"                 # debt — долг, repayment — возврат («Леша вернул Диме 3»)
     raw_text: str | None = None
     created_at: str | None = None
     id: int | None = None
 
+    @property
+    def is_repayment(self) -> bool:
+        """Это возврат долга, а не новый долг."""
+        return str(self.kind or "debt").lower() == "repayment"
+
     def pretty(self) -> str:
-        """Человекочитаемое описание долга."""
+        """Человекочитаемое описание записи."""
+        if self.is_repayment:
+            return f"↩️ {self.from_name} вернул {self.to_name}: {self.amount:.2f} {self.currency}"
         return f"{self.from_name} → {self.to_name}: {self.amount:.2f} {self.currency}"
 
 
@@ -42,6 +50,7 @@ def _row_to_debt(row: dict[str, Any]) -> Debt:
         to_name=str(row.get("to_name") or ""),
         currency=str(row.get("currency") or DEFAULT_CURRENCY).upper(),
         amount=float(row.get("amount") or 0),
+        kind=str(row.get("kind") or "debt").lower(),
         raw_text=row.get("raw_text"),
         created_at=str(row.get("created_at") or "") or None,
     )
@@ -51,11 +60,14 @@ class Storage(Protocol):
     """Интерфейс хранилища долгов и настроек чата."""
 
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
-                 amount: float, raw_text: str | None = None) -> Debt: ...
+                 amount: float, raw_text: str | None = None,
+                 kind: str = "debt") -> Debt: ...
 
     def list_debts(self, chat_id: int) -> list[Debt]: ...
 
     def delete_debts(self, chat_id: int) -> int: ...
+
+    def delete_last_debt(self, chat_id: int) -> Debt | None: ...
 
     def get_default_currency(self, chat_id: int, fallback: str = DEFAULT_CURRENCY) -> str: ...
 
@@ -151,8 +163,10 @@ class SupabaseStorage:
             return None
 
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
-                 amount: float, raw_text: str | None = None) -> Debt:
-        """Сохраняет долг и возвращает записанную строку."""
+                 amount: float, raw_text: str | None = None,
+                 kind: str = "debt") -> Debt:
+        """Сохраняет запись (долг или возврат) и возвращает её."""
+        kind = str(kind or "debt").lower()
         rows = self._request(
             "POST",
             self._debts_table,
@@ -162,6 +176,7 @@ class SupabaseStorage:
                 "to_name": to_name,
                 "currency": currency.upper(),
                 "amount": round(float(amount), 2),
+                "kind": kind,
                 "raw_text": raw_text,
             },
             prefer="return=representation",
@@ -170,7 +185,8 @@ class SupabaseStorage:
             return _row_to_debt(rows[0])
         return Debt(
             chat_id=chat_id, from_name=from_name, to_name=to_name,
-            currency=currency.upper(), amount=round(float(amount), 2), raw_text=raw_text,
+            currency=currency.upper(), amount=round(float(amount), 2), kind=kind,
+            raw_text=raw_text,
         )
 
     def list_debts(self, chat_id: int) -> list[Debt]:
@@ -191,6 +207,35 @@ class SupabaseStorage:
             prefer="return=representation",
         )
         return len(rows or [])
+
+    def delete_last_debt(self, chat_id: int) -> Debt | None:
+        """Удаляет последнюю запись чата (команда /undo) и возвращает её.
+
+        Последняя — по времени создания, а при равных метках по id: сначала читаем строку,
+        потом удаляем именно её, чтобы в ответе показать, что именно убрали.
+        """
+        rows = self._request(
+            "GET",
+            self._debts_table,
+            params={
+                "chat_id": f"eq.{chat_id}",
+                "select": "*",
+                "order": "created_at.desc,id.desc",
+                "limit": 1,
+            },
+        )
+        if not rows:
+            return None
+        debt = _row_to_debt(rows[0])
+        if debt.id is None:
+            return None
+        self._request(
+            "DELETE",
+            self._debts_table,
+            params={"id": f"eq.{debt.id}"},
+            prefer="return=representation",
+        )
+        return debt
 
     def get_default_currency(self, chat_id: int, fallback: str = DEFAULT_CURRENCY) -> str:
         """Валюта по умолчанию для чата."""
@@ -246,8 +291,9 @@ class InMemoryStorage:
     _next_id: int = 1
 
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
-                 amount: float, raw_text: str | None = None) -> Debt:
-        """Добавляет долг в память."""
+                 amount: float, raw_text: str | None = None,
+                 kind: str = "debt") -> Debt:
+        """Добавляет запись (долг или возврат) в память."""
         debt = Debt(
             id=self._next_id,
             chat_id=chat_id,
@@ -255,6 +301,7 @@ class InMemoryStorage:
             to_name=to_name,
             currency=currency.upper(),
             amount=round(float(amount), 2),
+            kind=str(kind or "debt").lower(),
             raw_text=raw_text,
             created_at="1970-01-01T00:00:00+00:00",
         )
@@ -271,6 +318,13 @@ class InMemoryStorage:
         before = len(self.debts)
         self.debts = [debt for debt in self.debts if debt.chat_id != chat_id]
         return before - len(self.debts)
+
+    def delete_last_debt(self, chat_id: int) -> Debt | None:
+        """Удаляет последнюю добавленную запись чата (команда /undo)."""
+        for index in range(len(self.debts) - 1, -1, -1):
+            if self.debts[index].chat_id == chat_id:
+                return self.debts.pop(index)
+        return None
 
     def get_default_currency(self, chat_id: int, fallback: str = DEFAULT_CURRENCY) -> str:
         """Валюта по умолчанию для чата."""

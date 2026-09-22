@@ -26,6 +26,20 @@ create index if not exists debts_chat_created_idx
 create index if not exists debts_pairs_idx
     on public.debts (chat_id, from_name, to_name, currency);
 
+-- Тип записи: обычный долг или возврат («Леша вернул Диме 3 рубля»).
+-- Возврат уменьшает сальдо: from_name вернул to_name сумму amount.
+alter table public.debts add column if not exists kind text not null default 'debt';
+do $$
+begin
+    alter table public.debts
+        add constraint debts_kind_check check (kind in ('debt', 'repayment'));
+exception
+    when duplicate_object then null;   -- ограничение уже есть (повторный запуск схемы)
+end $$;
+
+comment on column public.debts.kind is
+    'debt — долг, repayment — возврат: from_name вернул to_name сумму amount';
+
 create table if not exists public.bot_settings (
     chat_id          bigint      not null primary key,
     default_currency text        not null default 'BYN',

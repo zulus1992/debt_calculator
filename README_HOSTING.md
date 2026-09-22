@@ -52,25 +52,122 @@ HTTPS-запросом на наш эндпоинт (`webhook.py`, WSGI). Не �
    ```
 5. Написать боту «Леша должен Диме 3 рубля» — ответ за 1–3 секунды.
 
-### Вариант 2.2. PythonAnywhere (бесплатный тариф)
+### Вариант 2.2. PythonAnywhere (бесплатный тариф) — пошагово
 
-1. *Web → Add a new web app → Manual configuration* → Python 3.10+.
-2. Загрузить файлы проекта в `/home/USERNAME/debt_calculator` (Files/Git/Bash) и создать там `.env`
-   с теми же переменными, включая `WEBHOOK_SECRET`.
-3. В WSGI-файле (`/var/www/USERNAME_pythonanywhere_com_wsgi.py`) оставить:
-   ```python
-   import sys
-   path = "/home/USERNAME/debt_calculator"
-   if path not in sys.path:
-       sys.path.insert(0, path)
-   from webhook import app as application
-   ```
-4. Reload, затем `python bot.py --set-webhook https://USERNAME.pythonanywhere.com/api/telegram`
-   (запускать команду можно из Bash-консоли PythonAnywhere).
+Что важно знать про бесплатный аккаунт *до* начала:
 
-> ℹ️ У бесплатного PythonAnywhere есть суточный лимит CPU-секунд — для домашнего бота его хватает
-> с большим запасом (работа процессора тратится только на разбор ответа, основное время — ожидание
-> сети). Если лимит начнёт мешать, вернитесь на Vercel или на long polling.
+* своё веб-приложение живёт по адресу `https://USERNAME.pythonanywhere.com` с готовым HTTPS —
+  именно он и нужен Telegram;
+* **исходящие запросы идут через allowlist** — список разрешённых сайтов. Проверить все три
+  домена (Telegram, DeepSeek, Supabase) можно за 20 секунд командой из шага 5
+  (`python bot.py --check`). Если какой-то домен не разрешён и это Telegram — бесплатный тариф
+  для вебхука не подойдёт, берите Vercel; если DeepSeek/Supabase — заявка на добавление
+  (нужна ссылка на документацию API), платный аккаунт (там интернет без ограничений) либо Vercel;
+* лимит CPU-секунд считается для консолей и задач, **веб-приложения под него не попадают**;
+* «Always-on tasks» платные, но для вебхука они не нужны — бот живёт как веб-приложение.
+
+**1. Консоль.** Зарегистрироваться → *Consoles → Bash*.
+
+**2. Забрать код** (ветку `hosting`):
+
+```bash
+cd ~
+git clone -b hosting https://github.com/USER/REPO.git debt_calculator
+cd debt_calculator
+```
+
+Приватный репозиторий: `git clone -b hosting https://<TOKEN>@github.com/USER/REPO.git`
+(fine-grained token только на этот репозиторий) либо загрузить ZIP через *Files → Upload*.
+
+**3. Зависимости** (опционально: `requests` есть и в системном Python):
+
+```bash
+mkvirtualenv --python=/usr/bin/python3.12 debt-bot
+pip install -r requirements.txt
+echo $VIRTUAL_ENV          # пригодится путь: /home/USERNAME/.virtualenvs/debt-bot
+```
+
+**4. Файл `.env` рядом с `bot.py`** (в git его нет):
+
+```bash
+cd ~/debt_calculator
+cat > .env <<'EOF'
+TELEGRAM_BOT_TOKEN=123456789:AA...
+DEEPSEEK_API_KEY=sk-...
+SUPABASE_URL=https://xxxx.supabase.co
+SUPABASE_SERVICE_KEY=eyJhbGciOi...      # именно service_role
+DEFAULT_CURRENCY=BYN
+ALLOWED_USER_IDS=
+REQUIRE_MENTION=1        # в группах отвечать только на обращение «@бот …», в личке — всегда
+WEBHOOK_SECRET=вставьте_свой_секрет
+EOF
+chmod 600 .env
+```
+
+Секрет: `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+
+**5. Проверка ключей и allowlist** (самое важное на этом хостинге):
+
+```bash
+python bot.py --check
+```
+
+Ожидаемый результат — три строки `✓ Telegram`, `✓ DeepSeek`, `✓ Supabase` и `• Telegram: вебхук не установлен`.
+Если какой-то запрос блокируется allowlist'ом, вы увидите ошибку прокси (403/503) или таймаут —
+для такого домена нужна заявка на добавление (форма «Anaconda Notebooks/PythonAnywhere Allow List
+Request» со ссылкой на документацию API), платный аккаунт или Vercel.
+
+**6. Создать веб-приложение:** *Web → Add a new web app → Manual configuration → Python 3.12*.
+Заполнить:
+
+| Поле | Значение |
+|---|---|
+| Source code | `/home/USERNAME/debt_calculator` |
+| Working directory | `/home/USERNAME/debt_calculator` |
+| Virtualenv | `/home/USERNAME/.virtualenvs/debt-bot` (пусто, если шаг 3 пропущен) |
+
+**7. WSGI-файл** (`/var/www/USERNAME_pythonanywhere_com_wsgi.py` — ссылка на него есть на вкладке Web):
+стереть содержимое и вставить
+
+```python
+import sys
+path = "/home/USERNAME/debt_calculator"
+if path not in sys.path:
+    sys.path.insert(0, path)
+from webhook import app as application
+```
+
+или записать его из консоли одной командой:
+
+```bash
+printf 'import sys\npath = "/home/%s/debt_calculator"\nif path not in sys.path:\n    sys.path.insert(0, path)\nfrom webhook import app as application\n' "$USER" > /var/www/${USER}_pythonanywhere_com_wsgi.py
+```
+
+**8. Reload** на вкладке *Web*, затем открыть в браузере `https://USERNAME.pythonanywhere.com/` —
+должно вернуться `ok` (это проверка живости нашего вебхука).
+
+**9. Сказать Telegram адрес** (из той же Bash-консоли):
+
+```bash
+cd ~/debt_calculator
+python bot.py --set-webhook https://USERNAME.pythonanywhere.com/api/telegram
+python bot.py --webhook-info        # url, pending 0, без last error
+```
+
+**10. Проверка:** написать боту «Леша должен Диме 3 рубля» — ответ за 1–3 секунды, затем `/debts`.
+
+**11. Обновление кода:** `cd ~/debt_calculator && git pull origin hosting`,
+при новых зависимостях `pip install -r requirements.txt`, затем **Reload** на вкладке *Web*.
+
+**12. Логи:** *Web → Error log* — туда попадают наши логи с таймстампами (старт бота, ошибки
+DeepSeek/Supabase, «Повтор апдейта …»). Быстрая диагностика без логов — `python bot.py --check`
+и `python bot.py --webhook-info` из консоли.
+
+**13. Возврат на long polling:** `python bot.py --delete-webhook` (можно прямо из консоли
+PythonAnywhere) — после этого бот снова работает через `getUpdates`.
+
+> ℹ️ Если позже захочется переехать на Vercel: код уже готов (вариант 2.1), менять нужно только
+> адрес в `--set-webhook`.
 
 ### Локальная проверка перед деплоем
 
@@ -100,6 +197,9 @@ python bot.py                             # постоянный процесс,
 | В `--webhook-info` поле `last error` = `Wrong response from the webhook` | на хостинге нет ключей DeepSeek/Supabase: смотрите логи функции (Vercel → Deployments → Logs) |
 | В `--webhook-info` поле `last error` = `SSL error` / `Bad Gateway` | адрес недоступен либо сертификат не готов; проверьте деплой и повторите `--set-webhook` |
 | Ответы приходят дважды | по одному адресу работают и вебхук, и `python bot.py`: остановите постоянный процесс и cron в Actions |
+| В группе бот молчит | так задумано: нужен «@бот …», «/debts@бот» или ответ на сообщение бота. Чтобы он разбирал любые сообщения — `REQUIRE_MENTION=0` и privacy mode **Disable** у @BotFather (`/setprivacy`), иначе Telegram не отдаёт боту обычные сообщения |
+| На PythonAnywhere `--check` ругается на DeepSeek/Supabase (403/503, ошибка прокси) | домен не в allowlist бесплатного аккаунта: заявка на добавление, платный аккаунт или Vercel |
+| На PythonAnywhere в error log `ImportError: No module named webhook` | в WSGI-файле неверный путь к проекту (должен быть `/home/USERNAME/debt_calculator`) или не сделан **Reload** |
 | Хочется «пинговать» сервис, чтобы не остывал | `GET https://<адрес>/api/telegram` отвечает `ok` — годится для uptime-мониторов |
 
 Дальше в этом файле описан **способ 1** — постоянный процесс на панели хостинга.
@@ -138,6 +238,7 @@ python bot.py                             # постоянный процесс,
    SUPABASE_SERVICE_KEY=eyJhbGciOi...      # именно service_role (Reveal в Supabase → API Keys)
    DEFAULT_CURRENCY=BYN
    ALLOWED_USER_IDS=                        # пусто = отвечает всем; иначе список id через запятую
+   REQUIRE_MENTION=1                        # в группах — только по обращению «@бот …»
    LOG_LEVEL=INFO
    WEBHOOK_SECRET=                          # нужен только для режима вебхука (Способ 2)
    ```

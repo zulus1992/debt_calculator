@@ -78,7 +78,8 @@ def net_balances(debts: Sequence[Debt]) -> list[Balance]:
         if not debtor or not creditor or debtor == creditor:
             continue
         currency = (debt.currency or "BYN").upper()
-        pairs[(debtor, creditor, currency)] += float(debt.amount)
+        sign = -1.0 if debt.is_repayment else 1.0      # возврат уменьшает долг
+        pairs[(debtor, creditor, currency)] += sign * float(debt.amount)
 
     balances: list[Balance] = []
     handled: set[tuple[str, str, str]] = set()
@@ -109,8 +110,9 @@ def totals_by_person(
         debtor = display.get(name_key(debt.from_name)) or normalize_name(debt.from_name)
         creditor = display.get(name_key(debt.to_name)) or normalize_name(debt.to_name)
         currency = (debt.currency or "BYN").upper()
-        owes[debtor][currency] += float(debt.amount)
-        owed[creditor][currency] += float(debt.amount)
+        sign = -1.0 if debt.is_repayment else 1.0      # возврат уменьшает «должен» и «должны»
+        owes[debtor][currency] += sign * float(debt.amount)
+        owed[creditor][currency] += sign * float(debt.amount)
     return (
         {name: dict(values) for name, values in owes.items()},
         {name: dict(values) for name, values in owed.items()},
@@ -135,6 +137,20 @@ def format_debt_saved(debt: Debt, used_default_currency: bool) -> str:
     return "\n".join(lines)
 
 
+def format_repayment_saved(debt: Debt, used_default_currency: bool) -> str:
+    """Ответ на записанный возврат долга."""
+    lines = [
+        "↩️ Записал возврат долга:",
+        f"• Кто вернул: {debt.from_name}",
+        f"• Кому вернул: {debt.to_name}",
+        f"• Сумма: {debt.amount:.2f} {debt.currency}",
+    ]
+    if used_default_currency:
+        lines.append(f"(валюта не указана — взял по умолчанию: {debt.currency})")
+    lines.append("Итог с учётом возврата: /debts")
+    return "\n".join(lines)
+
+
 def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN") -> str:
     """Отчёт по долгам: сальдо по парам, итоги по людям и сами записи."""
     if not debts:
@@ -145,28 +161,48 @@ def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN") ->
 
     balances = net_balances(debts)
     owes, owed = totals_by_person(debts)
+    debts_only = [debt for debt in debts if not debt.is_repayment]
+    repayments = [debt for debt in debts if debt.is_repayment]
     total_by_currency: dict[str, float] = defaultdict(float)
-    for debt in debts:
+    returned_by_currency: dict[str, float] = defaultdict(float)
+    for debt in debts_only:
         total_by_currency[(debt.currency or default_currency).upper()] += float(debt.amount)
+    for debt in repayments:
+        returned_by_currency[(debt.currency or default_currency).upper()] += float(debt.amount)
 
-    lines = [f"📊 Долги (записей: {len(debts)})", ""]
+    header = f"📊 Долги (записей: {len(debts)}"
+    header += f", из них возвратов: {len(repayments)})" if repayments else ")"
+    lines = [header, ""]
     if balances:
         lines.append("Итог с взаимозачётом:")
         lines.extend(f"• {balance.pretty()}" for balance in balances)
+    elif repayments and not debts_only:
+        lines.append("По этим записям всё закрыто 🎉")
     else:
         lines.append("После взаимозачёта никто ничего не должен 🎉")
 
-    lines.append("")
-    lines.append("Итого по людям:")
+    people: list[str] = []
     for name, values in sorted(owes.items()):
         if any(amount > 0 for amount in values.values()):
-            lines.append(f"• {name} должен: {_money_by_currency(values)}")
+            people.append(f"• {name} должен: {_money_by_currency(values)}")
     for name, values in sorted(owed.items()):
         if any(amount > 0 for amount in values.values()):
-            lines.append(f"• {name} должны: {_money_by_currency(values)}")
+            people.append(f"• {name} должны: {_money_by_currency(values)}")
+    if people:
+        lines.append("")
+        lines.append("Итого по людям (с учётом возвратов):")
+        lines.extend(people)
 
-    lines.append("")
-    lines.append(f"Сумма записей без взаимозачёта: {_money_by_currency(dict(total_by_currency))}")
+    if repayments:
+        lines.append("")
+        lines.append("Возвраты (учтены в зачёте):")
+        lines.extend(f"• {debt.pretty()}" for debt in repayments[:MAX_ROWS_IN_HISTORY])
+
+    if debts_only:
+        lines.append("")
+        lines.append(f"Сумма долгов без взаимозачёта: {_money_by_currency(dict(total_by_currency))}")
+    if returned_by_currency:
+        lines.append(f"Возвратов записано: {_money_by_currency(dict(returned_by_currency))}")
 
     if len(debts) <= MAX_ROWS_IN_HISTORY:
         lines.append("")
@@ -192,13 +228,17 @@ def format_help(default_currency: str = "BYN") -> str:
         "   «Леша должен Диме 3 рубля» или «Маша заняла у Пети 10$».",
         "   Разбираю через DeepSeek: кто должен, кому, сколько и в какой валюте.",
         "",
-        "2. Показать и посчитать долги (с взаимозачётом):",
+        "2. Записать возврат долга (уменьшает сальдо):",
+        "   «Леша вернул Диме 3 рубля» или «Маша отдала Пете 10$».",
+        "",
+        "3. Показать и посчитать долги (с взаимозачётом):",
         "   /debts или «покажи долги»",
         "",
-        "3. Задать валюту по умолчанию:",
+        "4. Задать валюту по умолчанию:",
         f"   /currency BYN или «валюта по умолчанию доллар» (сейчас: {default_currency})",
         "",
-        "4. Удалить все записи этого чата: /reset",
+        "5. Удалить последнюю запись: /undo",
+        "6. Удалить все записи этого чата: /reset",
         "",
         "Данные хранятся в Supabase, отдельно по каждому чату.",
     ])
