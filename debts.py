@@ -138,6 +138,56 @@ def net_balances(debts: Sequence[Debt], members: Sequence[ChatMember] = ()) -> l
     return balances
 
 
+def minimal_transfers(debts: Sequence[Debt], members: Sequence[ChatMember] = ()) -> list[Balance]:
+    """Взаимозачёт по всему чату: минимальный набор переводов, чтобы всё закрылось.
+
+    Сначала считаем сальдо каждого человека по валюте (сколько он должен минус сколько
+    должны ему), затем «жадно» сводим крупнейшего должника с крупнейшим кредитором.
+    Благодаря этому A→B 10 и B→C 10 превращаются в один перевод A→C 10: вместо цепочки
+    платежей получается несколько, а суммы совпадают с парным взаимозачётом.
+    """
+    labels = person_labels(debts, members)
+    totals: dict[tuple[str, str], float] = defaultdict(float)
+    for debt in debts:
+        debtor = identity_of(debt.from_user_id, debt.from_name)
+        creditor = identity_of(debt.to_user_id, debt.to_name)
+        if not debtor or not creditor or debtor == creditor:
+            continue
+        currency = (debt.currency or "BYN").upper()
+        sign = -1.0 if debt.is_repayment else 1.0      # возврат уменьшает долг
+        totals[(debtor, currency)] -= sign * float(debt.amount)
+        totals[(creditor, currency)] += sign * float(debt.amount)
+
+    result: list[Balance] = []
+    for currency in sorted({currency for _, currency in totals}):
+        owing = sorted(
+            ([-amount, key] for (key, code), amount in totals.items()
+             if code == currency and amount < -0.005),
+            reverse=True,
+        )
+        owed = sorted(
+            ([amount, key] for (key, code), amount in totals.items()
+             if code == currency and amount > 0.005),
+            reverse=True,
+        )
+        debtor_index = creditor_index = 0
+        while debtor_index < len(owing) and creditor_index < len(owed):
+            debtor_amount, debtor_key = owing[debtor_index]
+            creditor_amount, creditor_key = owed[creditor_index]
+            amount = round(min(debtor_amount, creditor_amount), 2)
+            if amount > 0:
+                result.append(Balance(_label(labels, debtor_key), _label(labels, creditor_key),
+                                      currency, amount))
+            owing[debtor_index][0] = round(debtor_amount - amount, 2)
+            owed[creditor_index][0] = round(creditor_amount - amount, 2)
+            if owing[debtor_index][0] <= 0.005:
+                debtor_index += 1
+            if owed[creditor_index][0] <= 0.005:
+                creditor_index += 1
+    result.sort(key=lambda item: (-item.amount, item.currency, item.debtor))
+    return result
+
+
 def totals_by_person(
     debts: Sequence[Debt], members: Sequence[ChatMember] = (),
 ) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
@@ -311,6 +361,7 @@ def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN",
 
     labels = person_labels(debts, members)
     balances = net_balances(debts, members)
+    transfers = minimal_transfers(debts, members)
     owes, owed = totals_by_person(debts, members)
     debts_only = [debt for debt in debts if not debt.is_repayment]
     repayments = [debt for debt in debts if debt.is_repayment]
@@ -332,6 +383,13 @@ def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN",
         lines.append("По этим записям всё закрыто 🎉")
     else:
         lines.append("После взаимозачёта никто ничего не должен 🎉")
+
+    # Взаимозачёт по всему чату: если он короче парного, показываем отдельно — это
+    # готовый список переводов («Леша переводит Диме»), а не сальдо по каждой паре.
+    if transfers and [item.pretty() for item in transfers] != [item.pretty() for item in balances]:
+        lines.append("")
+        lines.append("Минимум переводов, чтобы всё закрылось:")
+        lines.extend(f"• {transfer.pretty()}" for transfer in transfers)
 
     people: list[str] = []
     for name, values in sorted(owes.items()):
@@ -376,6 +434,19 @@ def format_currency_set(currency: str) -> str:
     )
 
 
+def format_transfers(transfers: Sequence[Balance], target: str = "") -> str:
+    """Ответ /settle: только список переводов, которые закрывают все долги."""
+    title = "Минимум переводов, чтобы всё закрылось"
+    if target:
+        title += f" (валюта чата: {target.upper()})"
+    if not transfers:
+        return f"🎉 {title}: никто ничего не должен."
+    return "\n".join([f"🧮 {title}:",
+                      *(f"• {transfer.pretty()}" for transfer in transfers),
+                      "",
+                      "Перевели — и записи можно свести зачётом: /debts"])
+
+
 def format_help(default_currency: str = "BYN") -> str:
     """Справка по возможностям бота."""
     return "\n".join([
@@ -402,15 +473,18 @@ def format_help(default_currency: str = "BYN") -> str:
         "4. Показать и посчитать долги (с взаимозачётом):",
         "   /debts или «покажи долги»",
         "",
-        "5. Привести всё к валюте чата по курсу на дату записи:",
+        "5. Взаимозачёт: кто кому сколько переводит, чтобы всё закрылось:",
+        "   /settle — минимум переводов (если A→B и B→C, то A платит C)",
+        "",
+        "6. Привести всё к валюте чата по курсу на дату записи:",
         "   /d — все долги в одной валюте по курсу того дня, когда их записали",
         "   /rates — курсы валют (бел. и рос. рубли, доллар, евро, юань, бат)",
         "",
-        "6. Задать валюту по умолчанию:",
+        "7. Задать валюту по умолчанию:",
         f"   /currency BYN или «валюта по умолчанию доллар» (сейчас: {default_currency})",
         "",
-        "7. Удалить последнюю запись: /undo",
-        "8. Удалить все записи этого чата: /reset",
+        "8. Удалить последнюю запись: /undo",
+        "9. Удалить все записи этого чата: /reset",
         "",
         "Если чат защищён паролем, пришлите его один раз: /password ваш-пароль.",
         "Данные хранятся в Supabase, отдельно по каждому чату.",

@@ -16,9 +16,11 @@ from typing import Any, Sequence
 from bot import (
     DebtBot,
     HeuristicParser,
+    addressing,
     clean_bot_mention,
     handle_text,
     is_allowed,
+    is_command_for_bot,
     mentions_bot,
 )
 from config import (
@@ -31,6 +33,7 @@ from config import (
 )
 from debts import (
     format_debts_report,
+    minimal_transfers,
     name_key,
     net_balances,
     normalize_name,
@@ -973,6 +976,31 @@ class MentionOnlyTests(unittest.TestCase):
         telegram = FakeTelegram([])
         bot = DebtBot(settings, storage, HeuristicParser(), telegram)
         return bot, storage, telegram
+
+    def test_command_without_mention_is_answered(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "/help"))
+        self.assertIn("Калькулятор долгов", telegram.sent[0][1])
+
+    def test_debts_command_without_mention_is_answered(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "/debts"))
+        self.assertIn("Долгов нет", telegram.sent[0][1])
+
+    def test_command_for_another_bot_is_ignored(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "/help@other_bot"))
+        self.assertEqual(telegram.sent, [])
+
+    def test_path_is_not_a_command(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "/usr/bin/ls Леша должен Диме 3 рубля"))
+        self.assertEqual(telegram.sent, [])
+
+    def test_command_inside_text_is_not_an_address(self) -> None:
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "а покажи /debts"))
+        self.assertEqual(telegram.sent, [])
 
     def test_group_message_without_mention_is_ignored(self) -> None:
         bot, storage, telegram = self.build()
@@ -2357,6 +2385,140 @@ class RatesStorageTests(unittest.TestCase):
         self.assertTrue(memory.has_rates("2026-09-21", "BYN"))
         self.assertEqual(len(memory.rates_since("BYN", "2026-09-01")), 1)
         self.assertEqual(memory.rates_since("BYN", "2026-10-01"), [])
+
+
+class MinimalTransfersTests(unittest.TestCase):
+    """Взаимозачёт по всему чату: минимум переводов вместо цепочки долгов."""
+
+    def test_chain_collapses_to_one_transfer(self) -> None:
+        # Леша должен Диме 10, Дима должен Маше 10 → Леша переводит Маше 10
+        transfers = minimal_transfers([
+            make_debt("Леша Козлов", "Дмитрий Болт", 10, user_ids=(101, 102)),
+            make_debt("Дмитрий Болт", "Маша Петрова", 10, user_ids=(102, 103)),
+        ], [MEMBER_LEHA, MEMBER_DIMA, MEMBER_MASHA])
+        self.assertEqual([item.pretty() for item in transfers],
+                         ["Леша Козлов (@kozlovAlex) → Маша Петрова (@petrova_m): 10.00 BYN"])
+
+    def test_pairwise_netting_still_applies(self) -> None:
+        transfers = minimal_transfers([
+            make_debt("Леша Козлов", "Дмитрий Болт", 10, user_ids=(101, 102)),
+            make_debt("Дмитрий Болт", "Леша Козлов", 4, user_ids=(102, 101)),
+        ], [MEMBER_LEHA, MEMBER_DIMA])
+        self.assertEqual(len(transfers), 1)
+        self.assertEqual(transfers[0].amount, 6.0)
+
+    def test_repayments_reduce_transfers(self) -> None:
+        transfers = minimal_transfers([
+            make_debt("Леша Козлов", "Дмитрий Болт", 10, user_ids=(101, 102)),
+            make_debt("Леша Козлов", "Дмитрий Болт", 3, kind="repayment", user_ids=(101, 102)),
+        ], [MEMBER_LEHA, MEMBER_DIMA])
+        self.assertEqual([item.amount for item in transfers], [7.0])
+
+    def test_transfers_are_fewer_than_debts(self) -> None:
+        transfers = minimal_transfers([
+            make_debt("Леша Козлов", "Дмитрий Болт", 10, user_ids=(101, 102)),
+            make_debt("Маша Петрова", "Дмитрий Болт", 5, user_ids=(103, 102)),
+            make_debt("Дмитрий Болт", "Оля Смирнова", 15, user_ids=(102, 104)),
+        ], [MEMBER_LEHA, MEMBER_DIMA, MEMBER_MASHA, MEMBER_OLYA])
+        self.assertEqual(len(transfers), 2)              # вместо трёх долгов — два перевода
+        self.assertEqual({(item.debtor, item.amount) for item in transfers},
+                         {("Леша Козлов (@kozlovAlex)", 10.0), ("Маша Петрова (@petrova_m)", 5.0)})
+        self.assertTrue(all(item.creditor == "Оля Смирнова (@olga_s)" for item in transfers))
+
+    def test_currencies_are_kept_apart(self) -> None:
+        transfers = minimal_transfers([
+            make_debt("Леша Козлов", "Дмитрий Болт", 10, currency="BYN", user_ids=(101, 102)),
+            make_debt("Леша Козлов", "Дмитрий Болт", 5, currency="USD", user_ids=(101, 102)),
+        ], [MEMBER_LEHA, MEMBER_DIMA])
+        self.assertEqual([(item.currency, item.amount) for item in transfers],
+                         [("BYN", 10.0), ("USD", 5.0)])
+
+    def test_nothing_to_offset(self) -> None:
+        self.assertEqual(minimal_transfers([], []), [])
+        self.assertEqual(minimal_transfers([
+            make_debt("Леша Козлов", "Дмитрий Болт", 5, user_ids=(101, 102)),
+            make_debt("Леша Козлов", "Дмитрий Болт", 5, kind="repayment", user_ids=(101, 102)),
+        ], [MEMBER_LEHA, MEMBER_DIMA]), [])
+
+
+class BotAddressingTests(unittest.TestCase):
+    """Когда бот отвечает: обращения, команды в начале сообщения и чужие команды."""
+
+    def test_command_detection(self) -> None:
+        self.assertTrue(is_command_for_bot("/help", "test_bot"))
+        self.assertTrue(is_command_for_bot("/d 10 USD", "test_bot"))
+        self.assertTrue(is_command_for_bot("/debts@test_bot", "test_bot"))
+        self.assertTrue(is_command_for_bot("/settle", ""))
+        self.assertTrue(is_command_for_bot("/зачёт", "test_bot"))     # команда с кириллицей
+        self.assertFalse(is_command_for_bot("/help@other_bot", "test_bot"))
+        self.assertFalse(is_command_for_bot("привет /help", "test_bot"))
+        self.assertFalse(is_command_for_bot("/usr/bin/ls", "test_bot"))
+        self.assertFalse(is_command_for_bot("Леша должен Диме 3", "test_bot"))
+
+    def test_addressing_in_group(self) -> None:
+        settings = Settings(require_mention=True)
+        command = make_chat_update(1, "/help")["message"]
+        self.assertEqual(addressing(command, "test_bot", settings), (True, "/help"))
+        mention = make_chat_update(2, "@test_bot /debts")["message"]
+        self.assertEqual(addressing(mention, "test_bot", settings), (True, "/debts"))
+        plain = make_chat_update(3, "Леша должен Диме 3")["message"]
+        self.assertEqual(addressing(plain, "test_bot", settings),
+                         (False, "Леша должен Диме 3"))
+        foreign = make_chat_update(4, "/help@other_bot")["message"]
+        self.assertEqual(addressing(foreign, "test_bot", settings), (False, "/help@other_bot"))
+
+
+class SettleCommandTests(unittest.TestCase):
+    """Команда /settle: минимальный набор переводов в валюте чата."""
+
+    def setUp(self) -> None:
+        self.settings = Settings(default_currency="BYN", rates_base="BYN")
+        self.storage = InMemoryStorage(default_currency="BYN",
+                                       default_created_at="2026-09-21T10:00:00+00:00")
+        self.parser = HeuristicParser()
+        self.members = seed_chat(self.storage)
+        self.storage.save_rates([
+            {"rate_date": "2026-09-21", "base": "BYN", "currency": "USD", "rate": 3.25},
+        ])
+
+    def send(self, text: str) -> str:
+        """Отправляет сообщение от имени Леши Козлова."""
+        return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
+                           settings=self.settings, members=self.members, author=MEMBER_LEHA)
+
+    def test_fewer_transfers_than_debts(self) -> None:
+        self.send("Леша должен Диме 10 рублей")
+        self.send("Дима должен Маше 10 рублей")
+        reply = self.send("/settle")
+        self.assertIn("Минимум переводов, чтобы всё закрылось", reply)
+        self.assertIn("Леша Козлов (@kozlovAlex) → Маша Петрова (@petrova_m): 10.00 BYN", reply)
+        self.assertNotIn("Дмитрий Болт", reply)          # долг «через Диму» больше не нужен
+
+    def test_settle_converts_to_chat_currency(self) -> None:
+        self.send("Маша заняла у Пети 10$")
+        reply = self.send("/settle")
+        self.assertIn("Считаю в BYN", reply)             # по курсу на дату записи
+        self.assertIn("Маша Петрова (@petrova_m) → Петя Кузнецов (@petya_k): 32.50 BYN", reply)
+
+    def test_settle_without_debts(self) -> None:
+        self.assertIn("закрывать нечего", self.send("/settle"))
+
+    def test_settle_aliases(self) -> None:
+        self.send("Леша должен Диме 3 рубля")
+        for text in ("/offset", "/зачёт", "/зачет"):
+            self.assertIn("Леша Козлов (@kozlovAlex) → Дмитрий Болт (@bdzmity): 3.00 BYN",
+                          self.send(text))
+
+    def test_report_shows_minimal_transfers_block(self) -> None:
+        self.send("Леша должен Диме 10 рублей")
+        self.send("Дима должен Маше 10 рублей")
+        report = self.send("/debts")
+        self.assertIn("Минимум переводов, чтобы всё закрылось:", report)
+        self.assertIn("Леша Козлов (@kozlovAlex) → Маша Петрова (@petrova_m): 10.00 BYN", report)
+
+    def test_block_is_hidden_when_same_as_pairwise(self) -> None:
+        self.send("Леша должен Диме 3 рубля")
+        self.assertNotIn("Минимум переводов", self.send("/debts"))
 
 
 if __name__ == "__main__":

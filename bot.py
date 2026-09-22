@@ -41,6 +41,7 @@ from config import (
     webhook_secret_problem,
 )
 from debts import (
+    Balance,
     ExpenseSummary,
     format_currency_set,
     format_debt_saved,
@@ -50,6 +51,8 @@ from debts import (
     format_members_report,
     format_registered,
     format_repayment_saved,
+    format_transfers,
+    minimal_transfers,
     normalize_name,
     split_amount,
 )
@@ -282,6 +285,39 @@ def converted_report(chat_id: int, storage: Storage, settings: Settings,
         header.append("⚠️ " + "; ".join(update.problems[:2]))
     report = format_debts_report(converted.debts, chat_currency, members)
     return "\n".join([*header, "", report])
+
+
+def settle_report(chat_id: int, storage: Storage, settings: Settings,
+                  members: Sequence[ChatMember], chat_currency: str) -> str:
+    """Команда /settle: взаимозачёт — минимальный список переводов, чтобы всё закрылось.
+
+    Считаем в валюте чата и по курсу на дату каждой записи (как /d), поэтому суммы
+    совпадают с приведённым отчётом, а переводов получается меньше, чем пар долгов.
+    """
+    try:
+        debts = storage.list_debts(chat_id)
+        if not debts:
+            return "📭 Долгов нет — закрывать нечего."
+        base = str(settings.rates_base or "BYN").upper()
+        update = update_rates(settings, storage)
+        points = storage.rates_since(base, history_start(debts))
+    except StorageError as exc:
+        return f"⚠️ Проблема с базой данных: {exc}"
+    converted = convert_debts(debts, chat_currency, rate_table(points), base)
+    transfers = minimal_transfers(converted.debts, members)
+    if not converted.changed:
+        transfers = minimal_transfers(debts, members)      # курсов нет — считаем как есть
+    lines: list[str] = []
+    if converted.changed:
+        lines.append(f"💱 Считаю в {chat_currency.upper()} по курсу на дату записи:")
+        lines.extend(format_used_rates(converted.rates_used, chat_currency.upper()))
+        lines.append("")
+    lines.append(format_transfers(transfers, chat_currency))
+    if converted.skipped:
+        lines.append("• Без курса оставил: " + ", ".join(sorted(set(converted.skipped))))
+    if update.problems:
+        lines.append("⚠️ " + "; ".join(update.problems[:2]))
+    return "\n".join(lines)
 
 
 def _not_registered_reply(sides: Sequence[tuple[ChatMember | None, str | None]]) -> str:
@@ -535,6 +571,8 @@ def handle_text(
         return rates_report(storage, settings, default_currency)
     if command in ("/d", "/convert"):
         return converted_report(chat_id, storage, settings, members, default_currency)
+    if command in ("/settle", "/offset", "/зачёт", "/зачет"):
+        return settle_report(chat_id, storage, settings, members, default_currency)
     if command == "/debts":
         return format_debts_report(storage.list_debts(chat_id), default_currency, members)
     if command == "/currency":
@@ -623,6 +661,30 @@ def mentions_bot(message: Mapping[str, Any], bot_username: str) -> bool:
     return str(reply_from.get("username") or "").lower() == handle.lower()
 
 
+# Команда в начале сообщения: «/help», «/d 10 USD», «/debts@наш_бот», «/зачёт».
+# После команды должен идти пробел или конец строки — «/usr/bin/ls» командой не считается.
+COMMAND_HEAD_RE = re.compile(
+    r"^/(?P<name>[A-Za-zА-Яа-яЁё0-9_]{1,32})(?:@(?P<handle>[A-Za-z0-9_]{3,32}))?(?:\s|$)"
+)
+
+
+def is_command_for_bot(text: str, bot_username: str = "") -> bool:
+    """Считается ли сообщение командой боту (обращение без @упоминания).
+
+    Telegram с включённым privacy mode и сам присылает боту в группах команды в начале
+    сообщения, поэтому «/help» и «/debts» — это уже обращение к боту. Чужие команды
+    («/help@другой_бот») игнорируем, чтобы не отвечать за других ботов.
+    """
+    match = COMMAND_HEAD_RE.match(str(text or "").strip())
+    if not match:
+        return False
+    addressee = str(match.group("handle") or "").lstrip("@").lower()
+    if not addressee:
+        return True
+    handle = str(bot_username or "").lstrip("@").lower()
+    return bool(handle) and addressee == handle
+
+
 def clean_bot_mention(text: str, bot_username: str) -> str:
     """Убирает обращение к боту, чтобы разбор текста не сбивался.
 
@@ -643,8 +705,12 @@ def addressing(message: Mapping[str, Any], bot_username: str,
     """Решает, отвечать ли на сообщение, и отдаёт текст без обращения к боту.
 
     * личный чат — отвечаем всегда (там обращаться некуда);
-    * группа/супергруппа — только если позвали: «@бот …», «/команда@бот» или ответ
-      на сообщение бота (настройка `REQUIRE_MENTION=0` это правило отключает).
+    * группа/супергруппа — если позвали: «@бот …», «/команда@бот», «/команда» в начале
+      сообщения или ответ на сообщение бота (`REQUIRE_MENTION=0` это правило отключает).
+
+    Команды без упоминания (`/help`, `/debts`) считаем обращением к боту: Telegram
+    с включённым privacy mode и сам присылает их боту, а человеку лишнее «@бот» писать
+    неудобно. Чужие команды («/help@другой_бот») при этом игнорируем.
 
     Если имя бота неизвестно (не задан `BOT_USERNAME` и не ответил getMe), лишнего молчания
     не допускаем: при включённом privacy mode Telegram и так присылает в группы только
@@ -660,7 +726,9 @@ def addressing(message: Mapping[str, Any], bot_username: str,
     if not handle:
         logger.warning("Имя бота неизвестно — в группе отвечаю на любое сообщение.")
         return True, cleaned
-    return mentions_bot(message, handle), cleaned
+    if mentions_bot(message, handle):
+        return True, cleaned
+    return is_command_for_bot(cleaned, handle), cleaned
 
 
 def configure_logging(level: str = "INFO") -> None:
@@ -1133,6 +1201,7 @@ DEMO_MESSAGES = (
     "Гоша должен Диме 4 рубля",              # теперь записывается
     "/rates",                                # курсы валют из базы (в демо — без API)
     "/d",                                    # все записи в валюте чата по курсу на дату
+    "/settle",                               # взаимозачёт: минимум переводов
     "/debts",
     "/undo",                                 # убираем последний счёт или запись
     "/currency BYN",

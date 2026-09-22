@@ -200,7 +200,7 @@ python bot.py                             # постоянный процесс 
 | В `--webhook-info` поле `last error` = `Wrong response from the webhook` | на хостинге нет ключей DeepSeek/Supabase: смотрите логи функции (Vercel → Deployments → Logs) |
 | В `--webhook-info` поле `last error` = `SSL error` / `Bad Gateway` | адрес недоступен либо сертификат не готов; проверьте деплой и повторите `--set-webhook` |
 | Ответы приходят дважды | по одному адресу работают и вебхук, и `python bot.py`: остановите постоянный процесс |
-| В группе бот молчит | так задумано: нужен «@бот …», «/debts@бот» или ответ на сообщение бота. Чтобы он разбирал любые сообщения — `REQUIRE_MENTION=0` и privacy mode **Disable** у @BotFather (`/setprivacy`), иначе Telegram не отдаёт боту обычные сообщения |
+| В группе бот молчит | так задумано: нужен «@бот …», «/команда» в начале сообщения («/help», «/debts@бот») или ответ на сообщение бота. Чтобы он разбирал любые сообщения — `REQUIRE_MENTION=0` и privacy mode **Disable** у @BotFather (`/setprivacy`), иначе Telegram не отдаёт боту обычные сообщения |
 | На PythonAnywhere `--check` ругается на DeepSeek/Supabase (403/503, ошибка прокси) | домен не в allowlist бесплатного аккаунта: заявка на добавление, платный аккаунт или Vercel |
 | На PythonAnywhere в error log `ImportError: No module named webhook` | в WSGI-файле неверный путь к проекту (должен быть `/home/USERNAME/debt_calculator`) или не сделан **Reload** |
 | `Таблица не найдена (HTTP 404): chat_members` | не применена свежая схема: выполните `db/schema.sql` в Supabase → SQL Editor (таблица добавляется идемпотентно) |
@@ -279,7 +279,7 @@ python bot.py                             # постоянный процесс 
 
 Локально перед загрузкой полезно прогнать проверки:
 ```powershell
-python -m unittest tests.test_pipeline   # 227 тестов, без внешних сервисов
+python -m unittest tests.test_pipeline   # 246 тестов, без внешних сервисов
 python bot.py --check                    # проверка ключей и сервисов
 ```
 
