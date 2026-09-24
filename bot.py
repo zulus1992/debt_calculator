@@ -31,6 +31,7 @@ import signal
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Mapping, Sequence
 
@@ -47,6 +48,7 @@ from debts import (
     ExpenseSummary,
     format_currency_set,
     format_debt_saved,
+    format_debts_dump,
     format_debts_report,
     format_expense_saved,
     format_help,
@@ -140,6 +142,32 @@ REG_ALIAS_SPLIT_RE = re.compile(r"[,;]+")
 MAX_SKIPPED_SHOWN = 5
 # Сколько последних дней курсов показывать в /rates (и искать для пересчёта).
 RATES_HISTORY_DAYS = 30
+# Сколько строк TXT-отчёта печатать в консоли (--demo): сам файл целиком не нужен.
+DEMO_PREVIEW_LINES = 8
+# Команды выгрузки записей файлом TXT: копия строк таблицы debts этого чата.
+EXPORT_COMMANDS = ("/export", "/report", "/txt", "/файл")
+
+
+@dataclass(frozen=True)
+class TxtReport:
+    """Готовый TXT-отчёт: такой ответ бот отправляет файлом-документом.
+
+    handle_text отвечает обычным текстом (строкой), а отчёт — этим объектом: Telegram
+    не умеет отправлять файл сообщением, поэтому DebtBot по типу ответа решает, что
+    звать — sendMessage или sendDocument.
+    """
+
+    filename: str
+    text: str
+    caption: str = ""
+
+    def preview(self, limit: int = DEMO_PREVIEW_LINES) -> str:
+        """Отчёт там, где файла нет (демо и логи): имя файла и первые строки содержимого."""
+        lines = self.text.splitlines()
+        head = lines[:limit]
+        if len(lines) > limit:
+            head.append(f"… (в файле ещё строк: {len(lines) - limit})")
+        return "\n".join([f"[файл {self.filename}]", *head])
 
 
 class HeuristicParser:
@@ -331,6 +359,29 @@ def settle_report(chat_id: int, storage: Storage, settings: Settings,
     if update.problems:
         lines.append("⚠️ " + "; ".join(update.problems[:2]))
     return "\n".join(lines)
+
+
+def debts_txt_report(chat_id: int, storage: Storage) -> str | TxtReport:
+    """Команда /export: TXT-файл со всеми записями чата — копия строк таблицы debts.
+
+    Берутся только записи этого чата (chat_id из сообщения) и ничего не считается:
+    ни взаимозачёта, ни пересчёта по курсам — строки таблицы как есть. Если записей нет,
+    файл не отправляем: пустой документ в чате только мешает.
+    """
+    try:
+        debts = storage.list_debts(chat_id)
+    except StorageError as exc:
+        return f"⚠️ Проблема с базой данных: {exc}"
+    if not debts:
+        return (
+            "📭 Записей нет — выгружать нечего.\n"
+            "Запишите долг сообщением: «Леша должен Диме 3 рубля»."
+        )
+    return TxtReport(
+        filename=f"debts_{chat_id}_{date.today().isoformat()}.txt",
+        text=format_debts_dump(debts, chat_id),
+        caption=f"📄 Выгрузка таблицы debts: записей {len(debts)} (chat_id {chat_id}).",
+    )
 
 
 def _not_registered_reply(sides: Sequence[tuple[ChatMember | None, str | None]]) -> str:
@@ -545,12 +596,16 @@ def handle_text(
     settings: Settings,
     members: Sequence[ChatMember] | None = None,
     author: ChatMember | None = None,
-) -> str:
+) -> str | TxtReport:
     """Обрабатывает одно сообщение и формирует ответ бота.
 
     Функция не знает про Telegram — это делает её простой для тестов.
     `members` и `author` — состав чата и автор сообщения: по ним ИИ (и локальный
     резолвер) понимают, кто такой «Лешак» из текста, и запись привязывается к user id.
+
+    Обычный ответ — строка; команда выгрузки (/export) отвечает объектом TxtReport:
+    Telegram не умеет отправлять файл сообщением, поэтому решение «файл или текст»
+    принимает вызывающая сторона (DebtBot).
     """
     raw = (text or "").strip()
     if members is None:
@@ -586,6 +641,8 @@ def handle_text(
         return converted_report(chat_id, storage, settings, members, default_currency)
     if command in ("/settle", "/offset", "/зачёт", "/зачет"):
         return settle_report(chat_id, storage, settings, members, default_currency)
+    if command in EXPORT_COMMANDS:
+        return debts_txt_report(chat_id, storage)
     if command == "/debts":
         return format_debts_report(storage.list_debts(chat_id), default_currency, members)
     if command == "/currency":
@@ -985,7 +1042,7 @@ class DebtBot:
         except Exception as exc:  # noqa: BLE001 — бот не должен падать из-за одного сообщения
             logger.exception("Ошибка обработки сообщения: %s", exc)
             reply = "⚠️ Внутренняя ошибка, попробуйте ещё раз."
-        self._send(chat_id, reply, message)
+        self._send_reply(chat_id, reply, message)
 
     def _handle_membership(self, membership: Mapping[str, Any]) -> None:
         """Реакция на добавление и удаление бота: просит пароль, сбрасывает доступ.
@@ -1029,6 +1086,25 @@ class DebtBot:
             self._telegram.send_message(chat_id, text, reply_to=message.get("message_id"))
         except TelegramError as exc:
             logger.error("sendMessage: %s", exc)
+
+    def _send_reply(self, chat_id: Any, reply: str | TxtReport,
+                    message: Mapping[str, Any]) -> None:
+        """Отправляет ответ: обычный текст — сообщением, TXT-отчёт — файлом-документом.
+
+        Если документ не дошёл, честно сообщаем об этом в чат: молчание выглядело бы как
+        «бот ничего не нашёл», а причина (лимиты, права в чате) важна для человека.
+        """
+        if not isinstance(reply, TxtReport):
+            self._send(chat_id, reply, message)
+            return
+        try:
+            self._telegram.send_document(
+                chat_id, reply.filename, reply.text,
+                caption=reply.caption, reply_to=message.get("message_id"),
+            )
+        except TelegramError as exc:
+            logger.error("sendDocument: %s", exc)
+            self._send(chat_id, f"⚠️ Не удалось отправить файл {reply.filename}: {exc}", message)
 
 
 def _telegram_for(settings: Settings) -> TelegramBot:
@@ -1242,6 +1318,7 @@ DEMO_MESSAGES = (
     "/rates",                                # курсы валют из базы (в демо — без API)
     "/d",                                    # все записи в валюте чата по курсу на дату
     "/settle",                               # взаимозачёт: минимум переводов
+    "/export",                               # TXT-файл с записями чата (копия таблицы debts)
     "/debts",
     "/undo",                                 # убираем последний счёт или запись
     "/currency BYN",
@@ -1263,6 +1340,11 @@ DEMO_MEMBERS = (
 )
 
 
+def describe_reply(reply: str | TxtReport) -> str:
+    """Ответ для консоли (--demo): текст как есть, отчёт — имя файла и первые строки."""
+    return reply.preview() if isinstance(reply, TxtReport) else reply
+
+
 def run_demo() -> int:
     """Прогон сценария без внешних сервисов: хранилище в памяти + офлайн-разбор."""
     settings = Settings(default_currency="BYN")
@@ -1281,14 +1363,14 @@ def run_demo() -> int:
     for message in DEMO_MESSAGES:
         reply = handle_text(message, chat_id, storage=storage, parser=parser,
                             settings=settings, author=author)
-        print(f"\n👤 {message}\n🤖 {reply}")
+        print(f"\n👤 {message}\n🤖 {describe_reply(reply)}")
     print("\n" + "=" * 64)
     print("Чат с паролем (CHAT_PASSWORD): пока пароль не введён, бот не работает")
     protected = Settings(default_currency="BYN", chat_password="сезам")
     guarded = InMemoryStorage(default_currency="BYN")
     for message in ("Леша должен Диме 3 рубля", "/password наугад", "сезам"):
         reply = handle_text(message, 42, storage=guarded, parser=parser, settings=protected)
-        print(f"\n👤 {message}\n🤖 {reply}")
+        print(f"\n👤 {message}\n🤖 {describe_reply(reply)}")
     print("=" * 64)
     print(f"Итого записей в памяти: {len(storage.debts)}")
     return 0

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from members import label_for, member_by_id
 from storage import ChatMember, Debt
@@ -14,6 +14,14 @@ MAX_ROWS_IN_HISTORY = 15
 # Подсказка в конце ответа о записи: итоги в ответе не выводим (чтобы не засорять чат),
 # но всегда понятно, куда смотреть. Меняется в одном месте.
 SETTLE_HINT = "Итог: /settle"
+
+# TXT-выгрузка (/export): порядок колонок тот же, что и в таблице debts, — файл читается
+# как копия её строк. Колонки разделены табуляцией (TSV): открывается и в блокноте, и в Excel.
+DEBTS_DUMP_COLUMNS = (
+    "id", "created_at", "chat_id", "from_name", "to_name",
+    "from_user_id", "to_user_id", "currency", "amount", "kind", "group_id", "raw_text",
+)
+DEBTS_DUMP_SEPARATOR = "\t"
 
 # Упрощённая морфология русских имён: что срезаем в ключе и что считаем падежом
 CASE_ENDINGS = "аеёиоуыэюя"
@@ -439,6 +447,42 @@ def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN",
     return "\n".join(lines)
 
 
+def _dump_cell(value: Any) -> str:
+    """Значение для выгрузки: None → пусто, переводы строк и табы экранируются.
+
+    Так одна запись всегда остаётся одной строкой файла: в исходном сообщении (raw_text)
+    может быть перенос строки, и без экранирования «таблица» в файле разъехалась бы.
+    """
+    if value is None:
+        return ""
+    return (
+        str(value)
+        .replace("\\", "\\\\")          # обратный слэш первым: иначе экранируем свои же символы
+        .replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
+        .replace("\t", "\\t")
+    )
+
+
+def format_debts_dump(debts: Sequence[Debt], chat_id: int) -> str:
+    """TXT-отчёт: строки таблицы debts этого чата как есть, без подсчётов и пересчётов.
+
+    Шапка — комментарий с chat_id и числом записей, дальше строка названий колонок и по
+    строке на запись (значения разделены табуляцией). Суммы печатаются как в базе — с двумя
+    знаками, валюта — как записана в таблице.
+    """
+    lines = [
+        f"# Выгрузка таблицы debts: chat_id={chat_id}, записей: {len(debts)}",
+        DEBTS_DUMP_SEPARATOR.join(DEBTS_DUMP_COLUMNS),
+    ]
+    for debt in debts:
+        lines.append(DEBTS_DUMP_SEPARATOR.join(_dump_cell(value) for value in (
+            debt.id, debt.created_at, debt.chat_id, debt.from_name, debt.to_name,
+            debt.from_user_id, debt.to_user_id, debt.currency, f"{float(debt.amount):.2f}",
+            debt.kind, debt.group_id, debt.raw_text,
+        )))
+    return "\n".join(lines) + "\n"
+
+
 def format_currency_set(currency: str) -> str:
     """Ответ на смену валюты по умолчанию."""
     return (
@@ -498,6 +542,9 @@ def format_help(default_currency: str = "BYN") -> str:
         "",
         "8. Удалить последнюю запись: /undo",
         "9. Удалить все записи этого чата: /reset",
+        "",
+        "10. Выгрузить записи чата файлом TXT (копия таблицы debts):",
+        "   /export — бот пришлёт документ debts_<id чата>_<дата>.txt со всеми записями",
         "",
         "Если чат защищён паролем, пришлите его один раз: /password ваш-пароль.",
         "Данные хранятся в Supabase, отдельно по каждому чату.",

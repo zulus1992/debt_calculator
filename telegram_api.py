@@ -9,6 +9,8 @@ import requests
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 MAX_MESSAGE_LENGTH = 4096
+MAX_CAPTION_LENGTH = 1024   # лимит подписи к документу в Bot API
+TEXT_DOCUMENT_TYPE = "text/plain; charset=utf-8"
 
 
 class TelegramError(RuntimeError):
@@ -32,9 +34,22 @@ class TelegramBot:
         HTTP-таймаут вынесен в отдельный параметр http_timeout: у самого Telegram
         тоже есть параметр timeout (ожидание апдейтов), и имена не должны пересекаться.
         """
+        return self._request(method, json=payload, http_timeout=http_timeout)
+
+    def _request(self, method: str, *, json: Any = None, data: Any = None, files: Any = None,
+                 http_timeout: float | None = None) -> Any:
+        """Вызывает метод Bot API и разбирает ответ.
+
+        Обычные методы уходят JSON-ом (`json`), отправка файлов — multipart/form-data
+        (`data` + `files`): так работает sendDocument.
+        """
         url = TELEGRAM_API.format(token=self._token, method=method)
         try:
-            response = self._session.post(url, json=payload, timeout=http_timeout or self._timeout)
+            if files is None:
+                response = self._session.post(url, json=json, timeout=http_timeout or self._timeout)
+            else:
+                response = self._session.post(url, data=data, files=files,
+                                              timeout=http_timeout or self._timeout)
         except requests.RequestException as exc:
             raise TelegramError(f"Telegram недоступен: {exc}") from exc
 
@@ -141,6 +156,34 @@ class TelegramBot:
             sent.append(dict(self.call("sendMessage", **payload) or {}))
             reply_to = None  # отвечаем на исходное сообщение только первым куском
         return sent
+
+    def send_document(
+        self,
+        chat_id: int | str,
+        filename: str,
+        content: str | bytes,
+        *,
+        caption: str = "",
+        reply_to: int | None = None,
+        silent: bool = False,
+    ) -> dict[str, Any]:
+        """Отправляет файл документом (multipart/form-data): TXT-отчёты по долгам.
+
+        Telegram не принимает файл JSON-ом, поэтому содержимое уходит полем `document`
+        вместе с остальными параметрами запроса. Подпись (caption) обрезается по лимиту
+        Bot API — длинный текст запроса всё равно лёг бы ошибкой 400.
+        """
+        payload = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        data: dict[str, Any] = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = str(caption)[:MAX_CAPTION_LENGTH]
+        if reply_to is not None:
+            data["reply_to_message_id"] = reply_to
+            data["allow_sending_without_reply"] = "true"
+        if silent:
+            data["disable_notification"] = "true"
+        files = {"document": (filename, payload, TEXT_DOCUMENT_TYPE)}
+        return dict(self._request("sendDocument", data=data, files=files) or {})
 
     def send_typing(self, chat_id: int | str) -> None:
         """Показывает «печатает…» (ошибки игнорируются — это необязательный индикатор)."""
