@@ -20,7 +20,7 @@ if [ ! -f .env ] && [ -z "$TELEGRAM_BOT_TOKEN" ]; then
     echo "!! Не найден .env и переменные окружения не заданы."
     echo "!! Создайте .env на основе .env.example:"
     echo "!!   TELEGRAM_BOT_TOKEN=..., DEEPSEEK_API_KEY=...,"
-    echo "!!   SUPABASE_URL=..., SUPABASE_SERVICE_KEY=... (ключ service_role)"
+    echo "!!   SUPABASE_URL=..., SUPABASE_SECRET_KEY=... (secret-ключ sb_secret_...)"
     exit 1
 fi
 

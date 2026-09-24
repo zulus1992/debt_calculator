@@ -32,17 +32,22 @@ Telegram → bot.py ── DeepSeek (chat/completions, JSON) ──► {"from":"
 1. **Бот.** В Telegram у `@BotFather`: `/newbot` → получить токен.
 2. **DeepSeek.** platform.deepseek.com → *API keys* → создать ключ (нужен баланс).
 3. **Supabase.** Создать проект → *SQL Editor* → выполнить `db/schema.sql`
-   → *Project Settings → API*: взять `Project URL` и ключ **service_role** (secret).
+   → *Project Settings → API Keys → «Publishable and secret API keys» → Secret keys*:
+   взять `Project URL` и **secret-ключ** `sb_secret_…` (публичный publishable не подойдёт —
+   с ним запись в базу отклоняет RLS).
 4. **Настройки.** Скопировать `.env.example` в `.env` рядом с `bot.py` и заполнить:
    ```ini
    TELEGRAM_BOT_TOKEN=123456789:AA...
    DEEPSEEK_API_KEY=sk-...
    SUPABASE_URL=https://xxxx.supabase.co
-   SUPABASE_SERVICE_KEY=eyJhbGciOi...   # service_role, не anon!
+   SUPABASE_SECRET_KEY=sb_secret_...     # secret-ключ, не publishable!
    DEFAULT_CURRENCY=BYN
    ALLOWED_USER_IDS=                    # пусто = всем; иначе список id через запятую
    ```
    Узнать свой user id можно у `@userinfobot`.
+   Прежние имена ключа (`SUPABASE_SERVICE_KEY`, `SUPABASE_KEY`) и legacy-ключ
+   service_role тоже работают — можно оставить как есть, но новый secret-ключ
+   бот предпочтёт, если заданы оба.
 5. **Проверка и запуск:**
    ```powershell
    pip install -r requirements.txt

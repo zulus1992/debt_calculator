@@ -9,7 +9,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 ENV_FILE = Path(__file__).with_name(".env")
 
@@ -36,6 +36,15 @@ DEFAULT_RATES_BASE = "BYN"
 DEFAULT_RATES_CURRENCIES = ("BYN", "RUB", "USD", "EUR", "CNY", "THB")
 # Во сколько по Минску (UTC+3) обновлять курсы: раз в день, без cron. 0–23.
 DEFAULT_RATES_HOUR = 12
+
+# Ключ доступа бота к базе. Новый формат — secret-ключ Supabase (sb_secret_…):
+# Project Settings → API Keys → «Publishable and secret API keys» → Secret keys.
+# Прежние имена (SUPABASE_SERVICE_KEY, SUPABASE_KEY) и legacy-ключи service_role работают.
+SUPABASE_KEY_ENVS = ("SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_KEY", "SUPABASE_KEY")
+SUPABASE_KEY_HINT = (
+    "Supabase → Project Settings → API Keys → «Publishable and secret API keys» → "
+    "Secret keys → скопировать sb_secret_…"
+)
 
 
 class ConfigError(RuntimeError):
@@ -65,6 +74,7 @@ class Settings:
     deepseek_base_url: str = DEFAULT_DEEPSEEK_URL
     deepseek_model: str = DEFAULT_DEEPSEEK_MODEL
     supabase_url: str = ""
+    # Ключ базы: SUPABASE_SECRET_KEY (sb_secret_…) или legacy service_role
     supabase_key: str = ""
     debts_table: str = DEFAULT_DEBTS_TABLE
     settings_table: str = DEFAULT_SETTINGS_TABLE
@@ -134,7 +144,11 @@ class Settings:
         if not self.supabase_url:
             issues.append("SUPABASE_URL не задан (например https://xxxx.supabase.co)")
         if not self.supabase_key:
-            issues.append("SUPABASE_SERVICE_KEY не задан (ключ service_role из настроек проекта)")
+            issues.append(
+                "Ключ базы не задан: нужен SUPABASE_SECRET_KEY (secret-ключ). "
+                f"{SUPABASE_KEY_HINT}. Legacy-ключ service_role можно оставить "
+                "в SUPABASE_SERVICE_KEY."
+            )
         else:
             key_problem = supabase_key_problem(self.supabase_key)
             if key_problem:
@@ -213,29 +227,47 @@ def jwt_role(token: str) -> str | None:
     return str(role) if role else None
 
 
+def _supabase_key(get: Callable[[str], str]) -> str:
+    """Ключ доступа к базе: сначала новый SUPABASE_SECRET_KEY, потом прежние имена.
+
+    Приоритет важен при переезде: если в окружении остался старый service_role,
+    а рядом уже лежит новый secret-ключ, бот возьмёт новый.
+    """
+    for name in SUPABASE_KEY_ENVS:
+        value = get(name)
+        if value:
+            return value
+    return ""
+
+
 def supabase_key_problem(key: str) -> str | None:
-    """Проверяет ключ Supabase и возвращает текст проблемы (None — ключ подходит)."""
-    if not key:
+    """Проверяет ключ доступа к базе и возвращает текст проблемы (None — ключ подходит).
+
+    Подходят два варианта: новый secret-ключ (sb_secret_…) — он и рекомендуется, и
+    legacy-ключ service_role (JWT). Публичные ключи (publishable, anon) не годятся:
+    с ними RLS отклоняет запись, и бот выглядит «сломанным» при верных настройках.
+    """
+    value = _clean(key)
+    if not value:
         return None
-    role = jwt_role(key)
+    if value.lower().startswith("sb_secret_"):
+        return None
+    role = jwt_role(value)
     if role == "service_role":
         return None
     if role:
         return (
-            f"SUPABASE_SERVICE_KEY — ключ с ролью «{role}». Нужен service_role: "
-            "Supabase → Project Settings → API Keys → «Legacy anon, service_role API keys» → "
-            "service_role → Reveal (или новый secret-ключ sb_secret_…)."
+            f"Ключ базы — с ролью «{role}». Нужен secret-ключ: {SUPABASE_KEY_HINT} "
+            "(или legacy service_role в SUPABASE_SERVICE_KEY)."
         )
-    if key.startswith("sb_secret_"):
-        return None
-    if key.startswith("sb_publishable_"):
+    if value.lower().startswith("sb_publishable_"):
         return (
-            "SUPABASE_SERVICE_KEY — publishable (публичный) ключ, запись будет отклонена. "
-            "Нужен secret-ключ (sb_secret_…) или legacy service_role."
+            "Ключ базы — publishable (публичный): запись с ним отклоняет RLS. "
+            f"Нужен secret-ключ: {SUPABASE_KEY_HINT}"
         )
     return (
-        "SUPABASE_SERVICE_KEY не похож ни на JWT (eyJ…), ни на secret-ключ (sb_secret_…): "
-        "проверьте, что скопирован ключ целиком."
+        "Ключ базы не похож ни на secret-ключ (sb_secret_…), ни на legacy JWT (eyJ…): "
+        f"проверьте, что скопирован целиком. {SUPABASE_KEY_HINT}"
     )
 
 
@@ -284,7 +316,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         deepseek_base_url=get("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_URL).rstrip("/"),
         deepseek_model=get("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
         supabase_url=get("SUPABASE_URL").rstrip("/"),
-        supabase_key=get("SUPABASE_SERVICE_KEY") or get("SUPABASE_KEY"),
+        supabase_key=_supabase_key(get),
         debts_table=get("DEBTS_TABLE", DEFAULT_DEBTS_TABLE),
         settings_table=get("SETTINGS_TABLE", DEFAULT_SETTINGS_TABLE),
         state_table=get("BOT_STATE_TABLE", DEFAULT_STATE_TABLE),

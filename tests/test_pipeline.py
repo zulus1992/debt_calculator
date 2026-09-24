@@ -78,6 +78,7 @@ from storage import (
     RatePoint,
     StorageError,
     SupabaseStorage,
+    is_new_api_key,
     scale_rate,
     unscale_rate,
 )
@@ -333,7 +334,7 @@ class AccessAndConfigTests(unittest.TestCase):
                 "TELEGRAM_BOT_TOKEN": " '123:abc' ",
                 "DEEPSEEK_API_KEY": "sk-test",
                 "SUPABASE_URL": "https://example.supabase.co/",
-                "SUPABASE_SERVICE_KEY": "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.sig",
+                "SUPABASE_SECRET_KEY": "sb_secret_test_key",
                 "ALLOWED_USER_IDS": "1, 2;3",
                 "DEFAULT_CURRENCY": "usd",
             },
@@ -341,6 +342,7 @@ class AccessAndConfigTests(unittest.TestCase):
         )
         self.assertEqual(settings.telegram_token, "123:abc")
         self.assertEqual(settings.supabase_url, "https://example.supabase.co")
+        self.assertEqual(settings.supabase_key, "sb_secret_test_key")   # новый secret-ключ
         self.assertEqual(settings.rest_url, "https://example.supabase.co/rest/v1")
         self.assertEqual(settings.allowed_user_ids, frozenset({1, 2, 3}))
         self.assertEqual(settings.default_currency, "USD")
@@ -859,9 +861,35 @@ class SupabaseStorageTests(unittest.TestCase):
             self.storage.list_debts(1)
         self.assertIn("schema.sql", str(ctx.exception))
 
+    def test_secret_key_goes_only_in_apikey_header(self) -> None:
+        # Ключи нового формата — не JWT: в Authorization их слать нельзя (и не нужно).
+        storage = SupabaseStorage("https://example.supabase.co", "sb_secret_abc",
+                                  session=self.session)
+        self.session.responses = [FakeResponse([])]
+        storage.list_debts(7)
+        headers = self.session.calls[0]["headers"]
+        self.assertEqual(headers["apikey"], "sb_secret_abc")
+        self.assertNotIn("Authorization", headers)
+
+    def test_legacy_jwt_goes_in_both_headers(self) -> None:
+        # Legacy-ключ отправляем как раньше: роль service_role задаёт именно Authorization.
+        storage = SupabaseStorage("https://example.supabase.co", "eyJhbGciOi.legacy.sig",
+                                  session=self.session)
+        self.session.responses = [FakeResponse([])]
+        storage.list_debts(7)
+        headers = self.session.calls[0]["headers"]
+        self.assertEqual(headers["apikey"], "eyJhbGciOi.legacy.sig")
+        self.assertEqual(headers["Authorization"], "Bearer eyJhbGciOi.legacy.sig")
+
+    def test_is_new_api_key_detection(self) -> None:
+        self.assertTrue(is_new_api_key("sb_secret_abc"))
+        self.assertTrue(is_new_api_key("  sb_publishable_abc  "))
+        self.assertFalse(is_new_api_key("eyJhbGciOi.jwt.sig"))
+        self.assertFalse(is_new_api_key(""))
+
 
 class SupabaseKeyValidationTests(unittest.TestCase):
-    """Проверка ключа Supabase: anon вместо service_role выявляется ещё до запросов."""
+    """Проверка ключа базы: публичные ключи (publishable/anon) выявляются до запросов."""
 
     @staticmethod
     def make_jwt(role: str) -> str:
@@ -916,6 +944,51 @@ class SupabaseKeyValidationTests(unittest.TestCase):
             use_env_file=False,
         )
         self.assertEqual(settings.problems(), [])
+
+    def test_settings_accept_secret_key(self) -> None:
+        settings = load_settings(
+            {
+                "TELEGRAM_BOT_TOKEN": "1:abc",
+                "DEEPSEEK_API_KEY": "sk-x",
+                "SUPABASE_URL": "https://example.supabase.co",
+                "SUPABASE_SECRET_KEY": "sb_secret_abc123",
+            },
+            use_env_file=False,
+        )
+        self.assertEqual(settings.supabase_key, "sb_secret_abc123")
+        self.assertEqual(settings.problems(), [])
+
+    def test_secret_key_wins_over_legacy_names(self) -> None:
+        # Старый anon-ключ остался в окружении — новый secret-ключ всё равно важнее.
+        settings = load_settings(
+            {
+                "TELEGRAM_BOT_TOKEN": "1:abc",
+                "DEEPSEEK_API_KEY": "sk-x",
+                "SUPABASE_URL": "https://example.supabase.co",
+                "SUPABASE_SECRET_KEY": "sb_secret_abc123",
+                "SUPABASE_SERVICE_KEY": self.make_jwt("anon"),
+                "SUPABASE_KEY": self.make_jwt("anon"),
+            },
+            use_env_file=False,
+        )
+        self.assertEqual(settings.supabase_key, "sb_secret_abc123")
+        self.assertEqual(settings.problems(), [])
+
+    def test_empty_legacy_value_does_not_shadow_new_key(self) -> None:
+        # В .env осталась пустая строка прежней переменной — она не должна перебивать новую.
+        settings = load_settings(
+            {"SUPABASE_SERVICE_KEY": "  ", "SUPABASE_SECRET_KEY": "'sb_secret_abc123'"},
+            use_env_file=False,
+        )
+        self.assertEqual(settings.supabase_key, "sb_secret_abc123")
+
+    def test_missing_key_message_points_to_secret_env(self) -> None:
+        problems = " ".join(load_settings({}, use_env_file=False).problems())
+        self.assertIn("SUPABASE_SECRET_KEY", problems)
+        self.assertIn("Secret keys", problems)
+
+    def test_spaces_and_quotes_around_key_are_tolerated(self) -> None:
+        self.assertIsNone(supabase_key_problem("  'sb_secret_abc123'  "))
 
 
 class LongPollingTests(unittest.TestCase):

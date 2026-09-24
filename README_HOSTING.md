@@ -29,7 +29,7 @@ HTTPS-запросом на наш эндпоинт (`webhook.py`, WSGI). Не �
 |---|---|
 | HTTPS-адрес | Vercel (Hobby — бесплатно) или PythonAnywhere (free: `https://USERNAME.pythonanywhere.com`) |
 | `WEBHOOK_SECRET` | сгенерировать: `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
-| остальные ключи | те же, что и раньше (Telegram, DeepSeek, Supabase service_role) |
+| остальные ключи | те же, что и раньше (Telegram, DeepSeek, Supabase — secret-ключ базы) |
 
 Файлы режима: `webhook.py` (WSGI-приложение), `api/telegram.py` (точка входа для Vercel),
 `vercel.json` (лимит времени функции). Локальный запуск — `python webhook.py --serve`.
@@ -40,7 +40,7 @@ HTTPS-запросом на наш эндпоинт (`webhook.py`, WSGI). Не �
    Framework Preset — **Other**, Root Directory — корень (в `vercel.json` уже настроено, что
    функция `api/telegram.py` может работать до 60 секунд).
 2. *Settings → Environment Variables* — добавить:
-   `TELEGRAM_BOT_TOKEN`, `DEEPSEEK_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`,
+   `TELEGRAM_BOT_TOKEN`, `DEEPSEEK_API_KEY`, `SUPABASE_URL`, `SUPABASE_SECRET_KEY`,
    `WEBHOOK_SECRET`, при желании `DEFAULT_CURRENCY`, `ALLOWED_USER_IDS`.
 3. Deploy. Адрес обработчика: `https://<проект>.vercel.app/api/telegram`
    (любой ответ `ok` в браузере — уже хорошо: значит, функция жива).
@@ -94,7 +94,7 @@ cat > .env <<'EOF'
 TELEGRAM_BOT_TOKEN=123456789:AA...
 DEEPSEEK_API_KEY=sk-...
 SUPABASE_URL=https://xxxx.supabase.co
-SUPABASE_SERVICE_KEY=eyJhbGciOi...      # именно service_role
+SUPABASE_SECRET_KEY=sb_secret_...        # secret-ключ базы: Project Settings → API Keys → Secret keys
 DEFAULT_CURRENCY=BYN
 ALLOWED_USER_IDS=
 REQUIRE_MENTION=1        # в группах отвечать только на обращение «@бот …», в личке — всегда
@@ -215,7 +215,9 @@ python bot.py                             # постоянный процесс 
   `currency_rates`, `bot_settings`, `bot_state`);
 * ключ DeepSeek;
 * токен бота от `@BotFather`;
-* `SUPABASE_SERVICE_KEY` — **service_role** (не anon!), иначе запись блокирует RLS;
+* `SUPABASE_SECRET_KEY` — **secret-ключ базы** `sb_secret_…` (не publishable/anon!),
+  иначе запись блокирует RLS; прежний legacy-ключ service_role в `SUPABASE_SERVICE_KEY`
+  тоже принимается;
 * необязательно: `CHAT_PASSWORD` (пароль для чатов) и `RATES_API_KEY` (ключ ExchangeRate-API
   для `/d` и `/rates`; без ключа работает открытый эндпоинт `open.er-api.com`). Курсы бот
   подтягивает сам раз в день в 12:00 по Минску — час задаётся в `RATES_HOUR` (0–23),
@@ -245,7 +247,7 @@ python bot.py                             # постоянный процесс 
    TELEGRAM_BOT_TOKEN=123456789:AA...
    DEEPSEEK_API_KEY=sk-...
    SUPABASE_URL=https://xxxx.supabase.co
-   SUPABASE_SERVICE_KEY=eyJhbGciOi...      # именно service_role (Reveal в Supabase → API Keys)
+   SUPABASE_SECRET_KEY=sb_secret_...      # secret-ключ (Supabase → API Keys → «Publishable and secret API keys»)
    DEFAULT_CURRENCY=BYN
    ALLOWED_USER_IDS=                        # пусто = отвечает всем; иначе список id через запятую
    REQUIRE_MENTION=1                        # в группах — только по обращению «@бот …»
@@ -294,7 +296,7 @@ python bot.py --check                    # проверка ключей и се
 | `HTTP 409 Conflict` | работает второй «слушатель»: остановите локальный `python bot.py` (или второй процесс в панели) — Telegram отдаёт апдейты только одному |
 | `Sweep...` / бот не отвечает, в логе «Новых сообщений нет» | процесс живёт, но ключи неверны — смотрите вывод `python bot.py --check` в консоли сервера |
 | `Таблица не найдена (HTTP 404)` | в Supabase не применён `db/schema.sql` (нужны `debts`, `chat_members`, `currency_rates`, `bot_settings`, `bot_state`) |
-| `ключ с ролью «anon»` | в `.env` попал anon-ключ; нужен `service_role` (Supabase → API Keys → Reveal) |
+| `ключ базы — publishable (публичный)` / `HTTP 401` | в переменных окружения публичный ключ; нужен **secret-ключ**: Supabase → Project Settings → API Keys → «Publishable and secret API keys» → Secret keys → `sb_secret_…` |
 | Бот просит пароль | задан `CHAT_PASSWORD`: пришлите `/password ваш-пароль` (пароль задаётся в окружении хостинга) |
 | `/d` пишет «Курсов за эти даты нет» | не задан `RATES_API_KEY` (и не задан `RATES_OPEN_URL`) или курсы ещё не обновлялись: подождите ближайшие 12:00 по Минску либо выполните `python bot.py --rates` |
 | Курсы обновились не в 12:00 | на постоянном процессе обновление случается при первой проверке после 12:00 (обычно в течение получаса), а на вебхуке — при первом апдейте или пинге `GET /`; час задаётся в `RATES_HOUR` |

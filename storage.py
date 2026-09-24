@@ -21,6 +21,17 @@ class StorageError(RuntimeError):
     """Ошибка обращения к хранилищу."""
 
 
+# Новые ключи Supabase (Publishable/Secret, sb_…) — не JWT: их передают только в заголовке
+# `apikey`, а `Authorization: Bearer` с ними запрос не аутентифицирует (Supabase → API keys →
+# «Known limitations»). Legacy-ключи (eyJ…) шлём в оба заголовка, как и раньше.
+NEW_API_KEY_PREFIX = "sb_"
+
+
+def is_new_api_key(key: str) -> bool:
+    """Ключ нового формата Supabase (sb_publishable_… / sb_secret_…), а не legacy JWT."""
+    return str(key or "").strip().lower().startswith(NEW_API_KEY_PREFIX)
+
+
 @dataclass
 class Debt:
     """Одна запись: кто, кому, сколько и в какой валюте."""
@@ -211,7 +222,8 @@ class Storage(Protocol):
 
 
 class SupabaseStorage:
-    """Supabase через REST API PostgREST. Требуется ключ service_role (запуск на сервере)."""
+    """Supabase через REST API PostgREST. Нужен secret-ключ базы (sb_secret_…) или
+    legacy-ключ service_role: бот работает на сервере, а не в браузере."""
 
     def __init__(
         self,
@@ -229,7 +241,10 @@ class SupabaseStorage:
         url = str(url or "").strip().rstrip("/")
         key = str(key or "").strip().strip("'\"").strip()
         if not url or not key:
-            raise StorageError("Нужны SUPABASE_URL и SUPABASE_SERVICE_KEY.")
+            raise StorageError(
+                "Нужны SUPABASE_URL и ключ базы: SUPABASE_SECRET_KEY (sb_secret_…) "
+                "или legacy SUPABASE_SERVICE_KEY (service_role)."
+            )
         self._rest = url + "/rest/v1"
         self._key = key
         self._debts_table = debts_table
@@ -246,12 +261,20 @@ class SupabaseStorage:
         return self._debts_table, self._settings_table
 
     def _headers(self, prefer: str | None = None) -> dict[str, str]:
-        """Заголовки запроса к PostgREST."""
+        """Заголовки запроса к PostgREST.
+
+        Новый ключ базы (sb_secret_…/sb_publishable_…) уходит только в `apikey`: это не JWT,
+        и в `Authorization: Bearer` он запрос не аутентифицирует (Supabase → API keys →
+        «Known limitations»: ключи нового формата шлют в apikey, а не в Authorization).
+        Legacy-ключ (eyJ…) отправляем как раньше — в оба заголовка: именно Authorization
+        задаёт роль service_role.
+        """
         headers = {
             "apikey": self._key,
-            "Authorization": f"Bearer {self._key}",
             "Content-Type": "application/json",
         }
+        if not is_new_api_key(self._key):
+            headers["Authorization"] = f"Bearer {self._key}"
         if prefer:
             headers["Prefer"] = prefer
         return headers
@@ -280,8 +303,9 @@ class SupabaseStorage:
 
         if response.status_code in (401, 403):
             raise StorageError(
-                "Supabase отклонил ключ (HTTP 401/403): нужен ключ service_role "
-                "(с anon-ключом запись блокирует RLS)."
+                "Supabase отклонил ключ (HTTP 401/403): нужен secret-ключ базы "
+                "(sb_secret_…) или legacy service_role — с anon/publishable запись "
+                "блокирует RLS."
             )
         if response.status_code == 404:
             raise StorageError(
