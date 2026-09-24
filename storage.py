@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Хранилище долгов: Supabase через PostgREST + хранилище в памяти для тестов."""
+"""Хранилище долгов: Supabase через официальный SDK (supabase-py) + память для тестов."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Mapping, Protocol, Sequence
 
-import requests
+from supabase import Client, ClientOptions, PostgrestAPIError, SupabaseException, create_client
 
 DEFAULT_CURRENCY = "BYN"
 # Курс хранится целым числом (bigint/int8): rate = курс × RATE_SCALE.
@@ -21,15 +21,55 @@ class StorageError(RuntimeError):
     """Ошибка обращения к хранилищу."""
 
 
-# Новые ключи Supabase (Publishable/Secret, sb_…) — не JWT: их передают только в заголовке
-# `apikey`, а `Authorization: Bearer` с ними запрос не аутентифицирует (Supabase → API keys →
-# «Known limitations»). Legacy-ключи (eyJ…) шлём в оба заголовка, как и раньше.
-NEW_API_KEY_PREFIX = "sb_"
+# Коды ошибок PostgREST, которые понятнее объяснить словами, а не показывать как есть:
+# PGRST205 — таблицы нет в схеме; PGRST301/42501 — проблема с ключом или правами (RLS).
+TABLE_MISSING_CODES = ("PGRST205", "42P01")
+KEY_PROBLEM_CODES = ("PGRST301", "42501")
 
 
-def is_new_api_key(key: str) -> bool:
-    """Ключ нового формата Supabase (sb_publishable_… / sb_secret_…), а не legacy JWT."""
-    return str(key or "").strip().lower().startswith(NEW_API_KEY_PREFIX)
+def create_supabase_client(url: str, key: str, timeout: float = 30.0) -> Client:
+    """Создаёт клиент официального SDK supabase-py.
+
+    Ключ (secret sb_secret_… или legacy service_role) SDK сам подставляет в заголовки
+    запросов — вручную ничего добавлять не нужно. Таймаут задаётся для PostgREST: бот
+    обращается только к нему, а по умолчанию SDK ждёт ответа 120 секунд — для ответа
+    в Telegram это слишком долго.
+    """
+    try:
+        return create_client(url, key, options=ClientOptions(postgrest_client_timeout=timeout))
+    except SupabaseException as exc:
+        raise StorageError(f"Не удалось создать клиент Supabase: {exc}") from exc
+
+
+def _api_error_message(exc: Exception) -> str:
+    """Понятное описание ошибки PostgREST: нет таблицы, плохой ключ или код ошибки.
+
+    SDK бросает PostgrestAPIError с полями от PostgREST (message/code/hint). Разбираться
+    в них человеку не нужно, поэтому «нет таблицы» и «ключ/RLS» переводим в подсказки,
+    а остальное показываем с кодом.
+
+    Если SDK не смог разобрать тело ошибки (PostgREST вернул неполный JSON), в `code`
+    оказывается HTTP-статус, а исходный ответ — в `details`: клеим всё в одну строку,
+    чтобы 404 («нет таблицы») и 401/403 («ключ или RLS») ловились в любом случае.
+    """
+    code = str(getattr(exc, "code", "") or "")
+    message = str(getattr(exc, "message", "") or exc)
+    details = str(getattr(exc, "details", "") or "")
+    blob = f"{code} {message} {details}".lower()
+
+    if (code in ("404",) or code in TABLE_MISSING_CODES
+            or "could not find the table" in blob or "does not exist" in blob):
+        return (
+            "Таблица не найдена: выполните db/schema.sql в Supabase → SQL Editor "
+            f"(ответ PostgREST: {code or message})."
+        )
+    if (code in ("401", "403") or code in KEY_PROBLEM_CODES or "jwt" in blob
+            or "api key" in blob or "permission denied" in blob or "row-level security" in blob):
+        return (
+            "Supabase отклонил ключ или доступ: нужен secret-ключ базы (sb_secret_…) или "
+            f"legacy service_role — с anon/publishable запись блокирует RLS ({code or message})."
+        )
+    return f"Supabase вернул ошибку {code or 'без кода'}: {message}"
 
 
 @dataclass
@@ -93,6 +133,11 @@ def _row_to_debt(row: dict[str, Any]) -> Debt:
         created_at=str(row.get("created_at") or "") or None,
         group_id=str(row.get("group_id") or "") or None,
     )
+
+
+def _rows(response: Any) -> list[dict[str, Any]]:
+    """Строки ответа PostgREST: SDK кладёт их в поле data (пустой ответ — None)."""
+    return list(getattr(response, "data", None) or [])
 
 
 @dataclass
@@ -222,8 +267,14 @@ class Storage(Protocol):
 
 
 class SupabaseStorage:
-    """Supabase через REST API PostgREST. Нужен secret-ключ базы (sb_secret_…) или
-    legacy-ключ service_role: бот работает на сервере, а не в браузере."""
+    """Supabase через официальный SDK (supabase-py); под капотом — тот же PostgREST.
+
+    Ключ доступа — secret-ключ базы (sb_secret_…) или legacy service_role: SDK сам
+    подставляет его в заголовки каждого запроса, а бот работает на сервере, а не в браузере.
+    Имена таблиц приходят из настроек, по умолчанию — как в db/schema.sql.
+    В upsert-ах передаём returning="minimal" — это значение контракта PostgREST
+    («Prefer: return=minimal»): строки в ответе нужны только при вставке долгов.
+    """
 
     def __init__(
         self,
@@ -236,91 +287,47 @@ class SupabaseStorage:
         members_table: str = "chat_members",
         rates_table: str = "currency_rates",
         timeout: float = 30.0,
-        session: Any = None,
+        client: Client | None = None,
     ) -> None:
+        """Готовит клиент SDK; при передаче готового `client` url и ключ не нужны (тесты)."""
         url = str(url or "").strip().rstrip("/")
         key = str(key or "").strip().strip("'\"").strip()
-        if not url or not key:
-            raise StorageError(
-                "Нужны SUPABASE_URL и ключ базы: SUPABASE_SECRET_KEY (sb_secret_…) "
-                "или legacy SUPABASE_SERVICE_KEY (service_role)."
-            )
-        self._rest = url + "/rest/v1"
-        self._key = key
+        if client is not None:
+            self._client = client
+        else:
+            if not url or not key:
+                raise StorageError(
+                    "Нужны SUPABASE_URL и ключ базы: SUPABASE_SECRET_KEY (sb_secret_…) "
+                    "или legacy SUPABASE_SERVICE_KEY (service_role)."
+                )
+            self._client = create_supabase_client(url, key, timeout)
         self._debts_table = debts_table
         self._settings_table = settings_table
         self._state_table = state_table
         self._members_table = members_table
         self._rates_table = rates_table
         self._timeout = timeout
-        self._session = session or requests
 
     @property
     def tables(self) -> tuple[str, str]:
         """Имена таблиц (долги, настройки)."""
         return self._debts_table, self._settings_table
 
-    def _headers(self, prefer: str | None = None) -> dict[str, str]:
-        """Заголовки запроса к PostgREST.
+    def _table(self, name: str) -> Any:
+        """Билдер таблицы PostgREST: дальше цепочка select/insert/upsert/delete и execute()."""
+        return self._client.table(name)
 
-        Новый ключ базы (sb_secret_…/sb_publishable_…) уходит только в `apikey`: это не JWT,
-        и в `Authorization: Bearer` он запрос не аутентифицирует (Supabase → API keys →
-        «Known limitations»: ключи нового формата шлют в apikey, а не в Authorization).
-        Legacy-ключ (eyJ…) отправляем как раньше — в оба заголовка: именно Authorization
-        задаёт роль service_role.
+    def _execute(self, query: Any) -> Any:
+        """Выполняет запрос SDK и переводит ошибки PostgREST в StorageError.
+
+        Сообщения остаются человеческими: 401/403 («ключ или RLS») и «нет таблицы» —
+        самые частые проблемы при настройке, и по тексту ошибки должно быть понятно,
+        что править в переменных окружения или в базе.
         """
-        headers = {
-            "apikey": self._key,
-            "Content-Type": "application/json",
-        }
-        if not is_new_api_key(self._key):
-            headers["Authorization"] = f"Bearer {self._key}"
-        if prefer:
-            headers["Prefer"] = prefer
-        return headers
-
-    def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-        payload: Any = None,
-        prefer: str | None = None,
-    ) -> Any:
-        """Запрос к PostgREST с понятными сообщениями об ошибках."""
         try:
-            response = self._session.request(
-                method,
-                f"{self._rest}/{path}",
-                params=params,
-                json=payload,
-                headers=self._headers(prefer),
-                timeout=self._timeout,
-            )
-        except requests.RequestException as exc:
-            raise StorageError(f"Supabase недоступен: {exc}") from exc
-
-        if response.status_code in (401, 403):
-            raise StorageError(
-                "Supabase отклонил ключ (HTTP 401/403): нужен secret-ключ базы "
-                "(sb_secret_…) или legacy service_role — с anon/publishable запись "
-                "блокирует RLS."
-            )
-        if response.status_code == 404:
-            raise StorageError(
-                "Таблица не найдена (HTTP 404): выполните db/schema.sql в Supabase → SQL Editor."
-            )
-        if response.status_code >= 400:
-            raise StorageError(
-                f"Supabase вернул HTTP {response.status_code}: {response.text[:200]}"
-            )
-        if not response.content:
-            return None
-        try:
-            return response.json()
-        except ValueError:
-            return None
+            return query.execute()
+        except PostgrestAPIError as exc:
+            raise StorageError(_api_error_message(exc)) from exc
 
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
                  amount: float, raw_text: str | None = None,
@@ -329,16 +336,14 @@ class SupabaseStorage:
                  group_id: str | None = None) -> Debt:
         """Сохраняет запись (долг, возврат или долю общего счёта) и возвращает её."""
         kind = str(kind or "debt").lower()
-        rows = self._request(
-            "POST",
-            self._debts_table,
-            payload=self._debt_body(
+        response = self._execute(self._table(self._debts_table).insert(
+            self._debt_body(
                 chat_id, from_name, to_name, currency, amount, kind=kind,
                 from_user_id=from_user_id, to_user_id=to_user_id,
                 raw_text=raw_text, group_id=group_id,
             ),
-            prefer="return=representation",
-        )
+        ))
+        rows = _rows(response)
         if rows:
             return _row_to_debt(rows[0])
         return Debt(
@@ -372,13 +377,8 @@ class SupabaseStorage:
             )
             for record in records
         ]
-        rows = self._request(
-            "POST",
-            self._debts_table,
-            payload=payload,
-            prefer="return=representation",
-        )
-        return [_row_to_debt(row) for row in rows or []]
+        response = self._execute(self._table(self._debts_table).insert(payload))
+        return [_row_to_debt(row) for row in _rows(response)]
 
     @staticmethod
     def _debt_body(chat_id: int, from_name: str, to_name: str, currency: str, amount: float,
@@ -403,22 +403,18 @@ class SupabaseStorage:
 
     def list_debts(self, chat_id: int) -> list[Debt]:
         """Все долги чата в порядке добавления."""
-        rows = self._request(
-            "GET",
-            self._debts_table,
-            params={"chat_id": f"eq.{chat_id}", "select": "*", "order": "created_at.asc"},
+        query = (
+            self._table(self._debts_table)
+            .select("*")
+            .eq("chat_id", chat_id)
+            .order("created_at")
         )
-        return [_row_to_debt(row) for row in rows or []]
+        return [_row_to_debt(row) for row in _rows(self._execute(query))]
 
     def delete_debts(self, chat_id: int) -> int:
         """Удаляет все долги чата, возвращает число удалённых записей."""
-        rows = self._request(
-            "DELETE",
-            self._debts_table,
-            params={"chat_id": f"eq.{chat_id}"},
-            prefer="return=representation",
-        )
-        return len(rows or [])
+        query = self._table(self._debts_table).delete().eq("chat_id", chat_id)
+        return len(_rows(self._execute(query)))
 
     def delete_last_debt(self, chat_id: int) -> Debt | None:
         """Удаляет последнюю запись чата (команда /undo) и возвращает её.
@@ -426,26 +422,22 @@ class SupabaseStorage:
         Последняя — по времени создания, а при равных метках по id: сначала читаем строку,
         потом удаляем именно её, чтобы в ответе показать, что именно убрали.
         """
-        rows = self._request(
-            "GET",
-            self._debts_table,
-            params={
-                "chat_id": f"eq.{chat_id}",
-                "select": "*",
-                "order": "created_at.desc,id.desc",
-                "limit": 1,
-            },
+        query = (
+            self._table(self._debts_table)
+            .select("*")
+            .eq("chat_id", chat_id)
+            .order("created_at", desc=True)
+            .order("id", desc=True)
+            .limit(1)
         )
+        rows = _rows(self._execute(query))
         if not rows:
             return None
         debt = _row_to_debt(rows[0])
         if debt.id is None:
             return None
-        self._request(
-            "DELETE",
-            self._debts_table,
-            params={"id": f"eq.{debt.id}"},
-            prefer="return=representation",
+        self._execute(
+            self._table(self._debts_table).delete().eq("id", debt.id).eq("chat_id", chat_id)
         )
         return debt
 
@@ -453,13 +445,11 @@ class SupabaseStorage:
         """Удаляет оставшиеся доли одного общего счёта (группа записей по group_id)."""
         if not group_id:
             return 0
-        rows = self._request(
-            "DELETE",
-            self._debts_table,
-            params={"chat_id": f"eq.{chat_id}", "group_id": f"eq.{group_id}"},
-            prefer="return=representation",
+        query = (
+            self._table(self._debts_table).delete()
+            .eq("chat_id", chat_id).eq("group_id", group_id)
         )
-        return len(rows or [])
+        return len(_rows(self._execute(query)))
 
     def remember_member(self, member: ChatMember) -> None:
         """Запоминает участника чата (upsert по паре chat_id + user_id).
@@ -467,26 +457,22 @@ class SupabaseStorage:
         Это автообучение по автору сообщения: отметку /reg и уже собранные алиасы
         такие записи не трогают — иначе каждый ответ бота стирал бы регистрацию.
         """
-        self._request(
-            "POST",
-            self._members_table,
-            params={"on_conflict": "chat_id,user_id"},
-            payload=self._member_body(member),
-            prefer="resolution=merge-duplicates,return=minimal",
-        )
+        self._execute(self._table(self._members_table).upsert(
+            self._member_body(member),
+            on_conflict="chat_id,user_id",
+            returning="minimal",
+        ))
 
     def register_member(self, member: ChatMember) -> None:
         """Сохраняет участника как зарегистрированного: команда /reg с его именами."""
         payload = self._member_body(member)
         payload["aliases"] = list(member.aliases)
         payload["is_registered"] = True
-        self._request(
-            "POST",
-            self._members_table,
-            params={"on_conflict": "chat_id,user_id"},
-            payload=payload,
-            prefer="resolution=merge-duplicates,return=minimal",
-        )
+        self._execute(self._table(self._members_table).upsert(
+            payload,
+            on_conflict="chat_id,user_id",
+            returning="minimal",
+        ))
 
     @staticmethod
     def _member_body(member: ChatMember) -> dict[str, Any]:
@@ -508,57 +494,54 @@ class SupabaseStorage:
 
     def list_members(self, chat_id: int) -> list[ChatMember]:
         """Участники чата, которых бот успел запомнить (для сопоставления имён)."""
-        rows = self._request(
-            "GET",
-            self._members_table,
-            params={
-                "chat_id": f"eq.{chat_id}",
-                "select": "chat_id,user_id,username,display_name,aliases,last_seen,is_registered",
-                "order": "display_name.asc",
-                "limit": 200,
-            },
+        query = (
+            self._table(self._members_table)
+            .select("chat_id,user_id,username,display_name,aliases,last_seen,is_registered")
+            .eq("chat_id", chat_id)
+            .order("display_name")
+            .limit(200)
         )
-        return [_row_to_member(row) for row in rows or []]
+        return [_row_to_member(row) for row in _rows(self._execute(query))]
 
     def get_default_currency(self, chat_id: int, fallback: str = DEFAULT_CURRENCY) -> str:
         """Валюта по умолчанию для чата."""
-        rows = self._request(
-            "GET",
-            self._settings_table,
-            params={"chat_id": f"eq.{chat_id}", "select": "default_currency", "limit": 1},
+        query = (
+            self._table(self._settings_table)
+            .select("default_currency")
+            .eq("chat_id", chat_id)
+            .limit(1)
         )
+        rows = _rows(self._execute(query))
         if rows and rows[0].get("default_currency"):
             return str(rows[0]["default_currency"]).upper()
         return (fallback or DEFAULT_CURRENCY).upper()
 
     def set_default_currency(self, chat_id: int, currency: str) -> None:
         """Сохраняет валюту по умолчанию для чата (upsert по chat_id)."""
-        self._request(
-            "POST",
-            self._settings_table,
-            params={"on_conflict": "chat_id"},
-            payload={"chat_id": chat_id, "default_currency": currency.upper()},
-            prefer="resolution=merge-duplicates,return=representation",
-        )
+        self._execute(self._table(self._settings_table).upsert(
+            {"chat_id": chat_id, "default_currency": currency.upper()},
+            on_conflict="chat_id",
+            returning="minimal",
+        ))
 
     def chat_authorized(self, chat_id: int) -> bool:
         """Работает ли бот в этом чате (чат подтвердил пароль)."""
-        rows = self._request(
-            "GET",
-            self._settings_table,
-            params={"chat_id": f"eq.{chat_id}", "select": "is_authorized", "limit": 1},
+        query = (
+            self._table(self._settings_table)
+            .select("is_authorized")
+            .eq("chat_id", chat_id)
+            .limit(1)
         )
+        rows = _rows(self._execute(query))
         return bool(rows and rows[0].get("is_authorized"))
 
     def set_chat_authorized(self, chat_id: int, value: bool = True) -> None:
         """Запоминает, что чат ввёл верный пароль (или сбрасывает доступ)."""
-        self._request(
-            "POST",
-            self._settings_table,
-            params={"on_conflict": "chat_id"},
-            payload={"chat_id": chat_id, "is_authorized": bool(value)},
-            prefer="resolution=merge-duplicates,return=minimal",
-        )
+        self._execute(self._table(self._settings_table).upsert(
+            {"chat_id": chat_id, "is_authorized": bool(value)},
+            on_conflict="chat_id",
+            returning="minimal",
+        ))
 
     def save_rates(self, points: Sequence[Mapping[str, Any]]) -> int:
         """Сохраняет курсы валют (upsert по дате, базовой и целевой валюте).
@@ -577,64 +560,51 @@ class SupabaseStorage:
             if str(point.get("currency") or "").strip()
         ]
         for chunk in _chunks(rows, 500):
-            self._request(
-                "POST",
-                self._rates_table,
-                params={"on_conflict": "rate_date,base,currency"},
-                payload=list(chunk),
-                prefer="resolution=merge-duplicates,return=minimal",
-            )
+            self._execute(self._table(self._rates_table).upsert(
+                list(chunk),
+                on_conflict="rate_date,base,currency",
+                returning="minimal",
+            ))
         return len(rows)
 
     def rates_since(self, base: str, date_from: str) -> list[RatePoint]:
         """Курсы базовой валюты с указанной даты включительно (по возрастанию даты)."""
-        rows = self._request(
-            "GET",
-            self._rates_table,
-            params={
-                "base": f"eq.{str(base or DEFAULT_CURRENCY).upper()}",
-                "rate_date": f"gte.{date_from}",
-                "select": "*",
-                "order": "rate_date.asc",
-                "limit": 5000,
-            },
+        query = (
+            self._table(self._rates_table)
+            .select("*")
+            .eq("base", str(base or DEFAULT_CURRENCY).upper())
+            .gte("rate_date", date_from)
+            .order("rate_date")
+            .limit(5000)
         )
-        return [_row_to_rate(row) for row in rows or []]
+        return [_row_to_rate(row) for row in _rows(self._execute(query))]
 
     def has_rates(self, rate_date: str, base: str) -> bool:
         """Есть ли в базе курсы на эту дату (чтобы не дёргать API дважды в день)."""
-        rows = self._request(
-            "GET",
-            self._rates_table,
-            params={
-                "base": f"eq.{str(base or DEFAULT_CURRENCY).upper()}",
-                "rate_date": f"eq.{rate_date}",
-                "select": "currency",
-                "limit": 1,
-            },
+        query = (
+            self._table(self._rates_table)
+            .select("currency")
+            .eq("base", str(base or DEFAULT_CURRENCY).upper())
+            .eq("rate_date", rate_date)
+            .limit(1)
         )
-        return bool(rows)
+        return bool(_rows(self._execute(query)))
 
     def get_state(self, key: str, default: str | None = None) -> str | None:
         """Читает служебное значение (например last_update_id) из bot_state."""
-        rows = self._request(
-            "GET",
-            self._state_table,
-            params={"key": f"eq.{key}", "select": "value", "limit": 1},
-        )
+        query = self._table(self._state_table).select("value").eq("key", key).limit(1)
+        rows = _rows(self._execute(query))
         if rows and rows[0].get("value") is not None:
             return str(rows[0]["value"])
         return default
 
     def set_state(self, key: str, value: str) -> None:
         """Записывает служебное значение (upsert по key)."""
-        self._request(
-            "POST",
-            self._state_table,
-            params={"on_conflict": "key"},
-            payload={"key": key, "value": str(value)},
-            prefer="resolution=merge-duplicates,return=representation",
-        )
+        self._execute(self._table(self._state_table).upsert(
+            {"key": key, "value": str(value)},
+            on_conflict="key",
+            returning="minimal",
+        ))
 
 
 @dataclass

@@ -7,7 +7,7 @@
 ```
 Telegram → bot.py ── DeepSeek (chat/completions, JSON) ──► {"from":"Леша","to":"Дима","currency":"BYN","amount":3.0}
               │
-              └── Supabase (PostgREST) → таблицы debts / bot_settings
+              └── Supabase SDK (PostgREST) → таблицы debts / bot_settings
 ```
 
 | Файл | Что делает |
@@ -17,7 +17,7 @@ Telegram → bot.py ── DeepSeek (chat/completions, JSON) ──► {"from":"
 | `api/telegram.py` | точка входа для Vercel: отдаёт `webhook.app` по адресу `/api/telegram` |
 | `telegram_api.py` | Telegram Bot API: `getUpdates`, `sendMessage`, `setWebhook`/`deleteWebhook` |
 | `deepseek.py` | разбор сообщений через DeepSeek + офлайн-эвристики (фолбэк) |
-| `storage.py` | Supabase через REST (PostgREST) + хранилище в памяти для тестов |
+| `storage.py` | Supabase через официальный SDK (supabase-py) + хранилище в памяти для тестов |
 | `debts.py` | нормализация имён, взаимозачёт, итоги, тексты ответов |
 | `members.py` | участники чата: сопоставление имён с `@никами` и id, алиасы из `/reg`, подсказки для ИИ |
 | `rates.py` | курсы валют ExchangeRate-API: загрузка раз в день в 12:00 по Минску, хранение, пересчёт по дате записи |
@@ -25,7 +25,9 @@ Telegram → bot.py ── DeepSeek (chat/completions, JSON) ──► {"from":"
 | `db/schema.sql` | таблицы `debts`, `chat_members`, `currency_rates`, `bot_settings`, `bot_state`, RLS, индексы |
 | `tests/test_pipeline.py` | тесты без внешних сервисов (`unittest`) |
 
-Зависимость всего одна — `requests` (работает и на ПК, и на телефоне в Termux, и на VPS).
+Зависимости — `requests` (Telegram Bot API, DeepSeek, курсы валют) и `supabase` (официальный
+SDK: только он ходит в базу, внутри те же запросы PostgREST). Работает и на ПК, и на VPS,
+и на телефоне в Termux.
 
 ## Быстрый старт
 
@@ -308,7 +310,7 @@ python -m unittest tests.test_pipeline -v
 | VPS / HidenCloud / Render | бот работает всегда | нужен хостинг (у части сервисов есть бесплатный тариф) |
 | Android + Termux | без ПК и без облака | Android усыпляет фоновые процессы, нужен `termux-wake-lock` |
 
-Для Termux: `pkg install python`, `pip install requests`, положить проект в `~/debt_calculator`,
+Для Termux: `pkg install python`, `pip install -r requirements.txt`, положить проект в `~/debt_calculator`,
 создать `.env` и запускать `termux-wake-lock && python bot.py &`.
 
 **Нужны мгновенные ответы (ответ за 1–3 секунды)?** Два пути, оба описаны в

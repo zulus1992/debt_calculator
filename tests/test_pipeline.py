@@ -15,6 +15,9 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Sequence
 
+import httpx
+from supabase import ClientOptions, create_client
+
 from bot import (
     DebtBot,
     HeuristicParser,
@@ -78,7 +81,7 @@ from storage import (
     RatePoint,
     StorageError,
     SupabaseStorage,
-    is_new_api_key,
+    create_supabase_client,
     scale_rate,
     unscale_rate,
 )
@@ -709,6 +712,40 @@ class FakeSession:
         return self._next()
 
 
+class FakeRestApi:
+    """Подменяет HTTP-транспорт SDK supabase: запоминает запросы к PostgREST.
+
+    Хранилище работает через официальный SDK, поэтому вместо сессии requests подсовываем
+    httpx-клиент с MockTransport: настоящий SDK сам собирает запросы (URL, параметры, тело,
+    заголовки с ключом), но они никуда не уходят — тесты видят то же, что и раньше.
+    """
+
+    def __init__(self) -> None:
+        self.responses: list[FakeResponse] = []
+        self.calls: list[dict[str, Any]] = []
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        """Запоминает запрос и отдаёт следующий заготовленный ответ."""
+        self.calls.append({
+            "method": request.method,
+            "url": str(request.url.copy_with(query=None)),
+            "params": dict(request.url.params),
+            "payload": json.loads(request.content) if request.content else None,
+            "headers": {name.lower(): value for name, value in request.headers.items()},
+        })
+        response = self.responses.pop(0) if self.responses else FakeResponse([])
+        return httpx.Response(response.status_code, json=response.json(),
+                              headers={"Content-Range": "0-0/1"})
+
+    def client(self, key: str = "service-key"):
+        """Клиент SDK с подменённым транспортом: реальная логика SDK, но без сети."""
+        return create_client(
+            "https://example.supabase.co", key,
+            options=ClientOptions(httpx_client=httpx.Client(
+                transport=httpx.MockTransport(self._handle), timeout=5.0)),
+        )
+
+
 class TelegramClientTests(unittest.TestCase):
     """Сетевой слой Telegram: проверяем содержимое запросов.
 
@@ -807,12 +844,12 @@ class TelegramWebhookApiTests(unittest.TestCase):
 
 
 class SupabaseStorageTests(unittest.TestCase):
-    """Сетевой слой Supabase: payload и параметры запросов PostgREST."""
+    """Слой SDK supabase: payload, параметры и заголовки запросов PostgREST."""
 
     def setUp(self) -> None:
-        self.session = FakeSession()
+        self.session = FakeRestApi()
         self.storage = SupabaseStorage(
-            "https://example.supabase.co/", "service-key", session=self.session,
+            "https://example.supabase.co/", "service-key", client=self.session.client(),
         )
 
     def test_add_debt_payload(self) -> None:
@@ -826,7 +863,7 @@ class SupabaseStorageTests(unittest.TestCase):
         self.assertTrue(call["url"].endswith("/rest/v1/debts"))
         self.assertEqual(call["payload"]["currency"], "BYN")
         self.assertEqual(call["payload"]["amount"], 3.0)
-        self.assertIn("return=representation", call["headers"]["Prefer"])
+        self.assertIn("return=representation", call["headers"]["prefer"])
 
     def test_list_and_delete_params(self) -> None:
         self.session.responses = [FakeResponse([]), FakeResponse([{"id": 1}, {"id": 2}])]
@@ -861,31 +898,34 @@ class SupabaseStorageTests(unittest.TestCase):
             self.storage.list_debts(1)
         self.assertIn("schema.sql", str(ctx.exception))
 
-    def test_secret_key_goes_only_in_apikey_header(self) -> None:
-        # Ключи нового формата — не JWT: в Authorization их слать нельзя (и не нужно).
+    def test_key_is_sent_to_postgrest(self) -> None:
+        # Ключ подставляет SDK: он сам кладёт его в заголовки запроса к PostgREST.
         storage = SupabaseStorage("https://example.supabase.co", "sb_secret_abc",
-                                  session=self.session)
+                                  client=self.session.client("sb_secret_abc"))
         self.session.responses = [FakeResponse([])]
         storage.list_debts(7)
         headers = self.session.calls[0]["headers"]
         self.assertEqual(headers["apikey"], "sb_secret_abc")
-        self.assertNotIn("Authorization", headers)
+        self.assertEqual(headers["authorization"], "Bearer sb_secret_abc")
 
-    def test_legacy_jwt_goes_in_both_headers(self) -> None:
-        # Legacy-ключ отправляем как раньше: роль service_role задаёт именно Authorization.
+    def test_legacy_jwt_is_sent_the_same_way(self) -> None:
+        # Legacy service_role — тоже ключ: SDK шлёт его так же, роль задаёт значение ключа.
         storage = SupabaseStorage("https://example.supabase.co", "eyJhbGciOi.legacy.sig",
-                                  session=self.session)
+                                  client=self.session.client("eyJhbGciOi.legacy.sig"))
         self.session.responses = [FakeResponse([])]
         storage.list_debts(7)
         headers = self.session.calls[0]["headers"]
         self.assertEqual(headers["apikey"], "eyJhbGciOi.legacy.sig")
-        self.assertEqual(headers["Authorization"], "Bearer eyJhbGciOi.legacy.sig")
+        self.assertEqual(headers["authorization"], "Bearer eyJhbGciOi.legacy.sig")
 
-    def test_is_new_api_key_detection(self) -> None:
-        self.assertTrue(is_new_api_key("sb_secret_abc"))
-        self.assertTrue(is_new_api_key("  sb_publishable_abc  "))
-        self.assertFalse(is_new_api_key("eyJhbGciOi.jwt.sig"))
-        self.assertFalse(is_new_api_key(""))
+    def test_client_uses_configured_timeout(self) -> None:
+        client = create_supabase_client("https://example.supabase.co", "sb_secret_abc", 42.0)
+        self.assertEqual(client.options.postgrest_client_timeout, 42.0)
+
+    def test_broken_url_is_explained(self) -> None:
+        with self.assertRaises(StorageError) as ctx:
+            create_supabase_client("не-урл", "sb_secret_abc")
+        self.assertIn("клиент Supabase", str(ctx.exception))
 
 
 class SupabaseKeyValidationTests(unittest.TestCase):
@@ -1399,12 +1439,12 @@ class SavedReplyHintTests(unittest.TestCase):
 
 
 class StorageRepaymentTests(unittest.TestCase):
-    """Слой Supabase и память: поле kind и удаление последней записи."""
+    """Слой SDK supabase и память: поле kind и удаление последней записи."""
 
     def setUp(self) -> None:
-        self.session = FakeSession()
+        self.session = FakeRestApi()
         self.storage = SupabaseStorage(
-            "https://example.supabase.co/", "service-key", session=self.session,
+            "https://example.supabase.co/", "service-key", client=self.session.client(),
         )
 
     def test_add_repayment_payload(self) -> None:
@@ -1435,7 +1475,7 @@ class StorageRepaymentTests(unittest.TestCase):
         read_call, delete_call = self.session.calls
         self.assertEqual(read_call["method"], "GET")
         self.assertEqual(read_call["params"]["order"], "created_at.desc,id.desc")
-        self.assertEqual(read_call["params"]["limit"], 1)
+        self.assertEqual(int(read_call["params"]["limit"]), 1)   # в query-string всё текстом
         self.assertEqual(delete_call["method"], "DELETE")
         self.assertEqual(delete_call["params"]["id"], "eq.5")
 
@@ -1653,12 +1693,12 @@ class IdentityNettingTests(unittest.TestCase):
 
 
 class MemberStorageTests(unittest.TestCase):
-    """Слой Supabase: участники чата и привязка записей к user id."""
+    """Слой SDK supabase: участники чата и привязка записей к user id."""
 
     def setUp(self) -> None:
-        self.session = FakeSession()
+        self.session = FakeRestApi()
         self.storage = SupabaseStorage(
-            "https://example.supabase.co/", "service-key", session=self.session,
+            "https://example.supabase.co/", "service-key", client=self.session.client(),
         )
 
     def test_remember_member_upsert(self) -> None:
@@ -1673,7 +1713,7 @@ class MemberStorageTests(unittest.TestCase):
         self.assertEqual(call["payload"]["user_id"], 101)
         self.assertEqual(call["payload"]["display_name"], "Леша Козлов")
         self.assertEqual(call["payload"]["aliases"], ["Леша", "Лёха"])
-        self.assertIn("merge-duplicates", call["headers"]["Prefer"])
+        self.assertIn("merge-duplicates", call["headers"]["prefer"])
 
     def test_list_members_parsing(self) -> None:
         self.session.responses = [FakeResponse([{
@@ -1964,12 +2004,12 @@ class ExpenseFlowTests(unittest.TestCase):
 
 
 class ExpenseStorageTests(unittest.TestCase):
-    """Слой Supabase и память: массовая запись долей, группа и регистрация."""
+    """Слой SDK supabase и память: массовая запись долей, группа и регистрация."""
 
     def setUp(self) -> None:
-        self.session = FakeSession()
+        self.session = FakeRestApi()
         self.storage = SupabaseStorage(
-            "https://example.supabase.co/", "service-key", session=self.session,
+            "https://example.supabase.co/", "service-key", client=self.session.client(),
         )
 
     def test_add_debts_posts_array(self) -> None:
@@ -2608,12 +2648,12 @@ class ConvertedReportTests(unittest.TestCase):
 
 
 class RatesStorageTests(unittest.TestCase):
-    """Слой Supabase: курсы валют и признак подтверждения пароля."""
+    """Слой SDK supabase: курсы валют и признак подтверждения пароля."""
 
     def setUp(self) -> None:
-        self.session = FakeSession()
+        self.session = FakeRestApi()
         self.storage = SupabaseStorage(
-            "https://example.supabase.co/", "service-key", session=self.session,
+            "https://example.supabase.co/", "service-key", client=self.session.client(),
         )
 
     def test_save_rates_upsert(self) -> None:

@@ -1,1 +1,4 @@
+# Зависимости бота. supabase — официальный SDK (PostgREST-запросы к базе),
+# requests — Telegram Bot API, DeepSeek и курсы валют.
 requests>=2.31.0
+supabase>=2.31.0

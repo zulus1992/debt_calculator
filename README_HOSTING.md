@@ -78,7 +78,7 @@ cd debt_calculator
 Приватный репозиторий: `git clone -b hosting https://<TOKEN>@github.com/USER/REPO.git`
 (fine-grained token только на этот репозиторий) либо загрузить ZIP через *Files → Upload*.
 
-**3. Зависимости** (опционально: `requests` есть и в системном Python):
+**3. Зависимости** (в виртуальном окружении — обе зависимости из `requirements.txt`):
 
 ```bash
 mkvirtualenv --python=/usr/bin/python3.12 debt-bot
@@ -203,7 +203,7 @@ python bot.py                             # постоянный процесс 
 | В группе бот молчит | так задумано: нужен «@бот …», «/команда» в начале сообщения («/help», «/debts@бот») или ответ на сообщение бота. Чтобы он разбирал любые сообщения — `REQUIRE_MENTION=0` и privacy mode **Disable** у @BotFather (`/setprivacy`), иначе Telegram не отдаёт боту обычные сообщения |
 | На PythonAnywhere `--check` ругается на DeepSeek/Supabase (403/503, ошибка прокси) | домен не в allowlist бесплатного аккаунта: заявка на добавление, платный аккаунт или Vercel |
 | На PythonAnywhere в error log `ImportError: No module named webhook` | в WSGI-файле неверный путь к проекту (должен быть `/home/USERNAME/debt_calculator`) или не сделан **Reload** |
-| `Таблица не найдена (HTTP 404): chat_members` | не применена свежая схема: выполните `db/schema.sql` в Supabase → SQL Editor (таблица добавляется идемпотентно) |
+| `Таблица не найдена: выполните db/schema.sql` | не применена свежая схема: выполните `db/schema.sql` в Supabase → SQL Editor (таблица добавляется идемпотентно). В скобках бот показывает ответ PostgREST: `PGRST205` — таблицы нет в схеме |
 | `column is_registered does not exist` или `column group_id does not exist` | схема в Supabase старее кода: выполните `db/schema.sql` ещё раз — колонки и тип `kind = 'expense'` добавляются идемпотентно |
 | Хочется «пинговать» сервис, чтобы не остывал | `GET https://<адрес>/api/telegram` отвечает `ok` — годится для uptime-мониторов; заодно такой пинг запускает автообновление курсов, если уже прошло время `RATES_HOUR` |
 
@@ -295,7 +295,7 @@ python bot.py --check                    # проверка ключей и се
 |---|---|
 | `HTTP 409 Conflict` | работает второй «слушатель»: остановите локальный `python bot.py` (или второй процесс в панели) — Telegram отдаёт апдейты только одному |
 | `Sweep...` / бот не отвечает, в логе «Новых сообщений нет» | процесс живёт, но ключи неверны — смотрите вывод `python bot.py --check` в консоли сервера |
-| `Таблица не найдена (HTTP 404)` | в Supabase не применён `db/schema.sql` (нужны `debts`, `chat_members`, `currency_rates`, `bot_settings`, `bot_state`) |
+| `Таблица не найдена` | в Supabase не применён `db/schema.sql` (нужны `debts`, `chat_members`, `currency_rates`, `bot_settings`, `bot_state`) |
 | `ключ базы — publishable (публичный)` / `HTTP 401` | в переменных окружения публичный ключ; нужен **secret-ключ**: Supabase → Project Settings → API Keys → «Publishable and secret API keys» → Secret keys → `sb_secret_…` |
 | Бот просит пароль | задан `CHAT_PASSWORD`: пришлите `/password ваш-пароль` (пароль задаётся в окружении хостинга) |
 | `/d` пишет «Курсов за эти даты нет» | не задан `RATES_API_KEY` (и не задан `RATES_OPEN_URL`) или курсы ещё не обновлялись: подождите ближайшие 12:00 по Минску либо выполните `python bot.py --rates` |
@@ -330,7 +330,7 @@ python bot.py --check                    # проверка ключей и се
   ```bash
   systemctl enable --now debt-bot && journalctl -u debt-bot -f
   ```
-* **Android + Termux**: `pkg install python`, `pip install requests`, затем
+* **Android + Termux**: `pkg install python`, `pip install -r requirements.txt`, затем
   `termux-wake-lock && python bot.py &` (телефон должен быть включён).
 
 ## Быстрый переезд между режимами
