@@ -9,7 +9,7 @@
     python bot.py --set-commands  # объявить в Telegram список команд (меню «/»)
 
 Список команд уходит в Telegram при запуске (setMyCommands): команды видны в меню «/»,
-а в ответах бота они нажимаемые — подсказку «Итог: /settle» можно тапнуть, и команда
+а те, что бот советует в ответах (/reg и /login), нажимаемые — тапнуть, и команда
 встанет в строку ввода. Для режима вебхука список объявляется вручную: --set-commands.
 
 Курсы валют подтягиваются сами раз в день в 12:00 по Минску (RATES_HOUR): постоянный процесс
@@ -23,7 +23,9 @@
 Важно: одновременно должен работать только ОДИН режим — Telegram отдаёт апдейты
 одному «слушателю», второй получит HTTP 409 Conflict или потеряет сообщения.
 Если задан CHAT_PASSWORD, бот просит пароль при добавлении в чат и работает только
-в тех чатах, где пароль введён верно.
+в тех чатах, где пароль введён верно. Пароль принимается командой /login (или
+/password ваш-пароль, или просто сообщением с паролем); /login и /reg — нажимаемые
+команды, их бот показывает тем, кто ещё не вошёл или ещё не зарегистрировался.
 """
 
 from __future__ import annotations
@@ -121,29 +123,50 @@ LAST_UPDATE_ID_KEY = "last_update_id"
 ADDED_REPLY = (
     "👋 Привет! Я калькулятор долгов: «Леша должен Диме 3 рубля», возвраты, общие счета "
     "(«Дима заплатил 10 за всех»), учёт по участникам чата.\n"
+    "Сначала отметьтесь — нажмите /reg и допишите свои имена: /reg Женя, ЖеняШ.\n"
     "Справка: /help"
 )
+# Вход в чат по паролю. /login — та же команда, что /password, но её удобно нажать:
+# Telegram подставит её в строку ввода, а пароль человек пришлёт следующим сообщением.
+LOGIN_COMMANDS = ("/login", "/password", "/pass", "/auth", "/войти", "/вход")
+PASSWORD_COMMANDS = (*LOGIN_COMMANDS, "/start")
 PASSWORD_REPLY = (
     "🔐 Чтобы я начал работать в этом чате, пришлите пароль:\n"
-    "• /password ваш-пароль\n"
+    "• нажмите /login — и следующим сообщением пришлите пароль\n"
+    "• или сразу: /password ваш-пароль\n"
     "• или просто сообщением с паролем — второй раз спрашивать не буду."
+)
+LOGIN_DONE_REPLY = (
+    "✅ Вход в этот чат уже выполнен — пароль принят, можно работать.\n"
+    "Если вы тут впервые — отметьтесь: /reg Женя, ЖеняШ, кличка\n"
+    "Записи чата: /debts, только про вас: /mydebts, справка: /help"
+)
+LOGIN_FREE_REPLY = (
+    "🔓 В этом чате пароль не задан — вход не нужен.\n"
+    "Если вы тут впервые — отметьтесь: /reg Женя, ЖеняШ, кличка\n"
+    "Дальше просто пишите: «Леша должен Диме 3 рубля»."
 )
 PASSWORD_OK_REPLY = (
     "✅ Пароль принят — работаю в этом чате.\n"
-    "Пишите как обычно: «Леша должен Диме 3 рубля», /reg, /debts, /d, /help."
+    "Если вы тут впервые — отметьтесь: /reg Женя, ЖеняШ, кличка\n"
+    "Пишите как обычно: «Леша должен Диме 3 рубля», /debts, /d, /help."
 )
 PASSWORD_FAIL_REPLY = (
     "❌ Пароль не подошёл.\n"
-    "Пришлите его ещё раз: /password ваш-пароль"
+    "Нажмите /login и пришлите пароль ещё раз — или сразу: /password ваш-пароль"
 )
-PASSWORD_COMMANDS = ("/password", "/pass", "/auth", "/start")
 # Как связать имя из сообщения с человеком в чате: без /reg записи не ведутся.
 REGISTER_HINT = (
-    "Как это исправить:\n"
+    "Регистрация — командой /reg (её можно нажать):\n"
     "• себя: /reg Женя, ЖеняШ, как вас ещё зовут\n"
     "• другого: /reg @его_ник Гоша, Гоша Петров, кличка\n"
     "После регистрации повторите сообщение — тогда и запишу.\n"
     "Кто уже есть в чате: /who"
+)
+# Подсказка автору, который ещё не отметился /reg: его записи бот вести не может.
+REGISTER_SELF_HINT = (
+    "Вы ещё не отмечены в этом чате — нажмите /reg и напишите свои имена:\n"
+    "• /reg Женя, ЖеняШ, как вас ещё зовут"
 )
 REG_HANDLE_RE = re.compile(r"^@(?P<handle>\w{3,32})")
 REG_ALIAS_SPLIT_RE = re.compile(r"[,;]+")
@@ -161,12 +184,13 @@ STATUS_COMMANDS = ("/status", "/статус", "/диагностика")
 
 # Список команд для меню Telegram (setMyCommands): то же, что в /help, только коротко.
 # Из-за этого списка команды видны в меню «/», а в ответах бота Telegram подсвечивает
-# их как нажимаемые: подсказку «Итог: /settle» можно тапнуть, и команда встанет
-# в строку ввода — вручную набирать не нужно. Регистрация — при запуске бота
-# и вручную: python bot.py --set-commands.
+# их как нажимаемые: /reg и /login можно тапнуть, и команда встанет в строку ввода —
+# набирать вручную не нужно. Их бот показывает тем, кто ещё не отметился или не вошёл.
+# Объявляется при запуске бота и вручную: python bot.py --set-commands.
 BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("help", "что я умею и как записывать долги"),
-    ("reg", "регистрация участника: /reg Имя, кличка"),
+    ("login", "вход: прислать пароль чата, если он задан"),
+    ("reg", "регистрация: /reg Имя, кличка (или /reg @ник Имя)"),
     ("who", "кто в чате и кто уже зарегистрирован"),
     ("mydebts", "мои долги: сколько должен я и сколько должны мне"),
     ("debts", "все долги чата с взаимозачётом"),
@@ -178,7 +202,7 @@ BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("undo", "удалить последнюю запись"),
     ("reset", "удалить все записи этого чата"),
     ("status", "статус: база, курсы, ключ ИИ и настройки чата"),
-    ("password", "прислать пароль чата, если он задан"),
+    ("password", "пароль одной строкой: /password ваш-пароль"),
 )
 
 
@@ -408,7 +432,8 @@ def my_debts_report(chat_id: int, storage: Storage, members: Sequence[ChatMember
         debts = storage.list_debts(chat_id)
     except StorageError as exc:
         return f"⚠️ Проблема с базой данных: {exc}"
-    return format_person_report(debts, members, author, chat_currency)
+    report = format_person_report(debts, members, author, chat_currency)
+    return _with_registration_tip(report, author)
 
 
 def status_report(chat_id: int, storage: Storage, settings: Settings,
@@ -527,6 +552,18 @@ def _not_registered_reply(sides: Sequence[tuple[ChatMember | None, str | None]])
     return "\n".join(lines)
 
 
+def _with_registration_tip(reply: str, author: ChatMember | None) -> str:
+    """Дописывает подсказку про /reg, если автор сообщения ещё не зарегистрирован.
+
+    Нужно там, где ответ бесполезен без регистрации (не понял сообщение, /mydebts):
+    чаще всего человек просто ещё не отметился, и вместо «ничего не понял» он должен
+    увидеть нажимаемую команду /reg.
+    """
+    if author is None or author.is_registered:
+        return reply
+    return f"{reply}\n\n{REGISTER_SELF_HINT}"
+
+
 def parse_registration(argument: str, author: ChatMember | None,
                        members: Sequence[ChatMember]) -> tuple[ChatMember | None, list[str], str]:
     """Разбирает аргументы /reg и отвечает: кого регистрируем, какие имена, что не так.
@@ -576,7 +613,7 @@ def register_command(argument: str, storage: Storage, members: Sequence[ChatMemb
         return problem
     if target is None:
         return (
-            "Укажите, кого регистрируем:\n"
+            "Кого регистрируем — нажмите /reg и допишите имя:\n"
             "• себя: /reg Женя, ЖеняШ, шаман\n"
             "• другого: /reg @Genie Женя, ЖеняШ"
         )
@@ -695,11 +732,9 @@ def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage
         currency=currency,
         amount=amount,
         share=shares[0] if shares else 0.0,
-        people=people,
         debtors=pair_shares,
         excluded=excluded,
         skipped=_skipped_names(members, excluded),
-        raw_text=raw,
     ))
 
 
@@ -745,6 +780,10 @@ def handle_text(
     command, _, argument = raw.partition(" ")
     command = command.lower()
 
+    if command in LOGIN_COMMANDS:
+        # «Кнопка входа»: пароль уже принят (или не нужен) — подтверждаем это
+        # и напоминаем про регистрацию тем, кто в этом чате впервые.
+        return LOGIN_DONE_REPLY if settings.password_required else LOGIN_FREE_REPLY
     if command in ("/start", "/help"):
         return format_help(default_currency)
     if command in ("/reg", "/register"):
@@ -829,7 +868,7 @@ def handle_text(
         return format_help(default_currency)
 
     note = f"\n({parsed.note})" if parsed.note else ""
-    return UNKNOWN_REPLY + note
+    return _with_registration_tip(UNKNOWN_REPLY + note, author)
 
 
 def is_allowed(user_id: int | None, settings: Settings) -> bool:
@@ -1019,7 +1058,7 @@ class DebtBot:
         """Объявляет список команд в Telegram: меню «/» и нажимаемые команды в ответах.
 
         Благодаря этому списку Telegram подсвечивает команды в сообщениях бота как
-        ссылки — подсказку «Итог: /settle» можно тапнуть, и команда встанет в строку
+        ссылки — /reg и /login из ответов можно тапнуть, и команда встанет в строку
         ввода. Делается один раз при запуске и только как удобство: если Telegram
         не ответил, бот всё равно работает, поэтому пишем в лог и продолжаем.
         """
@@ -1360,8 +1399,8 @@ def set_commands_mode(settings: Settings) -> int:
 
     Нужна для режима вебхука (там `python bot.py` не запускается) и чтобы обновить
     меню «/» вручную. Из-за объявленного списка Telegram подсвечивает команды
-    в ответах бота как нажимаемые — подсказку «Итог: /settle» можно тапнуть,
-    и команда встанет в строку ввода.
+    в ответах бота как нажимаемые — /reg и /login можно тапнуть, и команда
+    встанет в строку ввода.
     """
     try:
         _telegram_for(settings).set_my_commands(BOT_COMMANDS)
@@ -1372,7 +1411,7 @@ def set_commands_mode(settings: Settings) -> int:
     print(f"✓ Команды бота объявлены в Telegram: {len(BOT_COMMANDS)}")
     print("  " + ", ".join(f"/{name}" for name, _ in BOT_COMMANDS))
     print("  Наберите «/» в поле ввода — список появится в меню,")
-    print("  а команды из ответов бота станут нажимаемыми (например, «Итог: /settle»).")
+    print("  а команды из ответов бота станут нажимаемыми (например, /reg и /login).")
     return 0
 
 
@@ -1473,7 +1512,7 @@ def check_services(settings: Settings) -> bool:
 
     if settings.password_required:
         print("• CHAT_PASSWORD задан — бот просит пароль при добавлении в чат "
-              "и работает только там, где пароль введён")
+              "и работает только там, где пароль введён (вход: /login)")
     else:
         print("• CHAT_PASSWORD не задан — бот работает в любом чате без пароля")
 
@@ -1485,6 +1524,7 @@ def check_services(settings: Settings) -> bool:
 
 DEMO_MESSAGES = (
     "/who",                                  # кто в чате и кто зарегистрирован
+    "/login",                                # «кнопка входа»: пароль не задан — вход не нужен
     "Лешак должен Диме 3 рубля",             # «Лешак» — это Леша Козлов, «Диме» — Дмитрий Болт
     "/reg Лёха, Лешак",                      # автор (Леша) добавляет себе имена
     "Маша заняла у Пети 10$",
@@ -1551,10 +1591,26 @@ def run_demo() -> int:
                             settings=settings, author=author)
         print(f"\n👤 {message}\n🤖 {describe_reply(reply)}")
     print("\n" + "=" * 64)
+    print("Новичок без отметки /reg: бот дописывает подсказку с нажимаемой командой /reg")
+    newcomer = ChatMember(chat_id=2, user_id=105, username="gosha_p",
+                          display_name="Гоша Петров")
+    dima = ChatMember(chat_id=2, user_id=102, username="bdzmity",
+                      display_name="Дмитрий Болт", aliases=["Дима"], is_registered=True)
+    fresh = InMemoryStorage(default_currency="BYN")
+    fresh.remember_member(newcomer)
+    fresh.remember_member(dima)
+    for message in ("привет", "я должен Диме 2 рубля", "/mydebts", "/reg Гоша",
+                    "я должен Диме 2 рубля"):
+        writer = next(m for m in fresh.list_members(2) if m.user_id == newcomer.user_id)
+        reply = handle_text(message, 2, storage=fresh, parser=parser,
+                            settings=settings, author=writer)
+        print(f"\n👤 {message}\n🤖 {describe_reply(reply)}")
+    print("\n" + "=" * 64)
     print("Чат с паролем (CHAT_PASSWORD): пока пароль не введён, бот не работает")
     protected = Settings(default_currency="BYN", chat_password="сезам")
     guarded = InMemoryStorage(default_currency="BYN")
-    for message in ("Леша должен Диме 3 рубля", "/password наугад", "сезам"):
+    for message in ("Леша должен Диме 3 рубля", "/login", "/password наугад",
+                    "сезам", "/login"):
         reply = handle_text(message, 42, storage=guarded, parser=parser, settings=protected)
         print(f"\n👤 {message}\n🤖 {describe_reply(reply)}")
     print("=" * 64)

@@ -48,7 +48,7 @@ HTTPS-запросом на наш эндпоинт (`webhook.py`, WSGI). Не �
    ```powershell
    python bot.py --set-webhook https://<проект>.vercel.app/api/telegram
    python bot.py --webhook-info                     # должно быть: url, pending 0, без ошибок
-   python bot.py --set-commands                     # команды бота в меню «/» (один раз)
+   python bot.py --set-commands                     # команды бота в меню «/» (один раз; там же /login и /reg)
    ```
 5. Написать боту «Леша должен Диме 3 рубля» — ответ за 1–3 секунды.
 
@@ -304,7 +304,7 @@ python bot.py                             # постоянный процесс 
 
 Локально перед загрузкой полезно прогнать проверки:
 ```powershell
-python -m unittest tests.test_pipeline   # 338 тестов, без внешних сервисов
+python -m unittest tests.test_pipeline   # 371 тест, без внешних сервисов
 python bot.py --check                    # проверка ключей и сервисов
 ```
 
@@ -319,7 +319,7 @@ python bot.py --check                    # проверка ключей и се
 | `Supabase отклонил ключ или доступ` (в ответе `42501`, `permission denied`, `row-level security`) | запрос ушёл от роли `anon`, а не `service_role`: в переменных окружения публичный ключ (publishable/anon) или ключ от другого проекта. Возьмите **secret-ключ** `sb_secret_…` (не publishable) и проверьте `python bot.py --check` — он печатает тип ключа и отдельно проверяет, разрешает ли база запись |
 | `permission denied for schema public` (42501) | ключ принят, но у роли нет прав на схему: выполните **`db/grants.sql`** в Supabase → SQL Editor (выдаёт права роли `service_role`, которой соответствует secret-ключ) и повторите `python bot.py --check`. Если права выданы, а ошибка осталась — проверьте, что ключ и `SUPABASE_URL` от одного проекта |
 | `ModuleNotFoundError: No module named 'supabase'` (или другого пакета из `requirements.txt`) | новая зависимость не установлена в том окружении, из которого работает веб-приложение: активируйте своё окружение (`workon debt-bot`), затем `cd ~/debt_calculator && pip install -r requirements.txt`, проверьте `python -c "import supabase"`, убедитесь, что в *Web → Virtualenv* указано то же окружение, и нажмите **Reload**. На панелях с `start.sh` зависимости ставятся сами при Restart |
-| Бот просит пароль | задан `CHAT_PASSWORD`: пришлите `/password ваш-пароль` (пароль задаётся в окружении хостинга) |
+| Бот просит пароль | задан `CHAT_PASSWORD`: нажмите `/login` и пришлите пароль следующим сообщением — или сразу `/login ваш-пароль`, `/password ваш-пароль` (пароль задаётся в окружении хостинга) |
 | `/d` пишет «Курсов за эти даты нет» | не задан `RATES_API_KEY` (и не задан `RATES_OPEN_URL`) или курсы ещё не обновлялись: подождите ближайшие 12:00 по Минску либо выполните `python bot.py --rates` |
 | Курсы обновились не в 12:00 | на постоянном процессе обновление случается при первой проверке после 12:00 (обычно в течение получаса), а на вебхуке — при первом апдейте или пинге `GET /`; час задаётся в `RATES_HOUR` |
 | Ответ приходит с задержкой | хостинг «усыпляет» процесс (у бесплатных тарифов бывает авто-сон) — см. раздел ниже |

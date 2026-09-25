@@ -176,6 +176,20 @@ def label_for(user_id: int | None, name: str, members: Sequence[ChatMember]) -> 
     return str(name or "").strip()
 
 
+def short_label(member: ChatMember) -> str:
+    """Короткое обращение для ответа о записи: «@kozlovAlex», иначе только имя."""
+    if member.username:
+        return f"@{member.username}"
+    parts = member.display_name.split()
+    return parts[0] if parts else member.label
+
+
+def short_label_for(user_id: int | None, name: str, members: Sequence[ChatMember]) -> str:
+    """Короткое обращение по данным записи: «@ник» или имя; неизвестного — как написали."""
+    member = member_by_id(user_id, members)
+    return short_label(member) if member is not None else str(name or "").strip()
+
+
 def format_roster(members: Sequence[ChatMember], author: ChatMember | None = None,
                   limit: int = 50) -> str:
     """Состав чата текстом — подсказка для ИИ, чтобы он узнавал людей по именам и никам."""

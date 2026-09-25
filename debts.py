@@ -9,13 +9,15 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
-from members import label_for, member_by_id
+from members import member_by_id, short_label, short_label_for
 from storage import ChatMember, Debt
 
 MAX_ROWS_IN_HISTORY = 15
-# Подсказка в конце ответа о записи: итоги в ответе не выводим (чтобы не засорять чат),
-# но всегда понятно, куда смотреть. Меняется в одном месте.
-SETTLE_HINT = "Итог: /settle"
+# Ответ о записи — ровно одна короткая строка («✅ @кто → @кому 3.00 BYN») и ничего больше:
+# ни итогов, ни подсказок, чтобы чат не засорялся. Суммы целиком считают команды
+# /settle и /debts. Сколько имён называть в строке общего счёта — MAX_NAMES_IN_SAVED_REPLY,
+# остальных сворачиваем в «и ещё N», чтобы строка оставалась короткой.
+MAX_NAMES_IN_SAVED_REPLY = 6
 
 # CSV-выгрузка (/export): порядок колонок тот же, что и в таблице debts, — файл читается
 # как копия её строк. Формат — стандартный CSV (csv.excel, RFC 4180): разделитель «,»,
@@ -320,75 +322,72 @@ def format_person_report(debts: Sequence[Debt], members: Sequence[ChatMember] = 
     return "\n".join(lines)
 
 
-def format_debt_saved(debt: Debt, members: Sequence[ChatMember] = ()) -> str:
-    """Ответ на успешно записанный долг: сразу видно, каких участников узнали.
+def _money(amount: float, currency: str) -> str:
+    """Сумма в ответе: «3.00 BYN»."""
+    return f"{amount:.2f} {currency}"
 
-    Итоги в ответе не выводим — только короткая подсказка SETTLE_HINT в конце.
+
+def _short_names(values: Sequence[str],
+                 limit: int = MAX_NAMES_IN_SAVED_REPLY) -> str:
+    """Перечень имён для короткого ответа: «@a, @b и ещё 2» — лишнее сворачиваем."""
+    names = [str(value).strip() for value in values if str(value).strip()]
+    shown = names[:limit]
+    text = ", ".join(shown)
+    return f"{text} и ещё {len(names) - len(shown)}" if len(names) > len(shown) else text
+
+
+def format_debt_saved(debt: Debt, members: Sequence[ChatMember] = ()) -> str:
+    """Ответ на записанный долг — ровно одна строка: «✅ @кто → @кому 3.00 BYN».
+
+    Ни итогов, ни подсказок: суммы целиком считают команды /settle и /debts.
     """
-    return "\n".join([
-        "✅ Записал долг:",
-        f"• Кто должен: {label_for(debt.from_user_id, debt.from_name, members)}",
-        f"• Кому: {label_for(debt.to_user_id, debt.to_name, members)}",
-        f"• Сумма: {debt.amount:.2f} {debt.currency}",
-        SETTLE_HINT,
-    ])
+    who = short_label_for(debt.from_user_id, debt.from_name, members)
+    whom = short_label_for(debt.to_user_id, debt.to_name, members)
+    return f"✅ {who} → {whom} {_money(debt.amount, debt.currency)}"
 
 
 def format_repayment_saved(debt: Debt, members: Sequence[ChatMember] = ()) -> str:
-    """Ответ на записанный возврат долга.
+    """Ответ на записанный возврат — ровно одна строка: «↩️ @кто → @кому 3.00 BYN — возврат».
 
-    Итоги в ответе не выводим — только короткая подсказка SETTLE_HINT в конце.
+    Ни итогов, ни подсказок: суммы целиком считают команды /settle и /debts.
     """
-    return "\n".join([
-        "↩️ Записал возврат долга:",
-        f"• Кто вернул: {label_for(debt.from_user_id, debt.from_name, members)}",
-        f"• Кому вернул: {label_for(debt.to_user_id, debt.to_name, members)}",
-        f"• Сумма: {debt.amount:.2f} {debt.currency}",
-        SETTLE_HINT,
-    ])
+    who = short_label_for(debt.from_user_id, debt.from_name, members)
+    whom = short_label_for(debt.to_user_id, debt.to_name, members)
+    return f"↩️ {who} → {whom} {_money(debt.amount, debt.currency)} — возврат"
 
 
 @dataclass(frozen=True)
 class ExpenseSummary:
-    """Что записали по общему счёту — для человеческого ответа в чат."""
+    """Что записали по общему счёту — для короткого ответа в чат."""
 
     payer: ChatMember
     currency: str
     amount: float
-    share: float
-    people: int                                        # на сколько человек разделили
-    debtors: list[tuple[ChatMember, float]]            # (участник, его доля)
+    share: float                                        # доля каждого участника счёта
+    debtors: list[tuple[ChatMember, float]]             # (участник, его доля)
     excluded: list[ChatMember] = field(default_factory=list)
-    skipped: list[str] = field(default_factory=list)   # не участвуют (не зарегистрированы)
-    raw_text: str = ""
+    skipped: list[str] = field(default_factory=list)    # не участвуют (не зарегистрированы)
 
 
 def format_expense_saved(summary: ExpenseSummary) -> str:
-    """Ответ на записанный общий счёт: кто платил, на кого делили и сколько с каждого.
+    """Ответ на записанный общий счёт — одна строка: кто платил, сколько и с кого.
 
-    Итоги в ответе не выводим — только короткая подсказка SETTLE_HINT в конце.
+    Ни итогов, ни подсказок: суммы целиком считают команды /settle и /debts.
+    Отдельной строкой — только те, кого в счёт не взяли (нет отметки /reg).
     """
-    lines = [
-        "🧾 Записал общий счёт:",
-        f"• Заплатил: {summary.payer.label}",
-        f"• Сумма: {summary.amount:.2f} {summary.currency} — делю на {summary.people} чел.",
-        f"• С каждого: {summary.share:.2f} {summary.currency}",
-    ]
+    payer = short_label(summary.payer)
+    money = _money(summary.amount, summary.currency)
     if summary.debtors:
-        shown = ", ".join(
-            f"{member.label} — {amount:.2f} {summary.currency}"
-            for member, amount in summary.debtors[:MAX_ROWS_IN_HISTORY]
-        )
-        lines.append(f"• Кто скидывается: {shown}")
+        names = _short_names([short_label(member) for member, _ in summary.debtors])
+        line = (f"🧾 {payer} заплатил {money} — "
+                f"по {_money(summary.share, summary.currency)} с {names}")
     else:
-        lines.append("• Делить не с кем — все остальные исключены.")
+        line = f"🧾 {payer} заплатил {money} — делить не с кем: остальные исключены"
     if summary.excluded:
-        lines.append("• Исключены: " + ", ".join(member.label for member in summary.excluded))
+        line += " (без " + _short_names([short_label(member) for member in summary.excluded]) + ")"
+    lines = [line]
     if summary.skipped:
-        lines.append("• Не участвуют (не зарегистрированы): " + ", ".join(summary.skipped))
-    if summary.raw_text:
-        lines.append(f"• Оригинал сохранён: «{summary.raw_text}»")
-    lines.append(SETTLE_HINT)
+        lines.append("⚠️ Не участвуют (нет /reg): " + _short_names(summary.skipped))
     return "\n".join(lines)
 
 
@@ -400,6 +399,7 @@ def format_registered(member: ChatMember, added: Sequence[str] = ()) -> str:
     else:
         lines.append("• Узнаю по имени и @нику из Telegram.")
         lines.append("• Добавить другие имена: /reg Лёха, Лешак, кличка")
+        lines.append("• Отметить другого участника: /reg @его_ник Имя, кличка")
     if added:
         lines.append("• Добавлено сейчас: " + ", ".join(added))
     lines.append("• Записи с этими именами теперь попадут на него, а не на строку текста.")
@@ -424,8 +424,8 @@ def format_members_report(members: Sequence[ChatMember]) -> str:
         names = f" — имена: {', '.join(member.aliases)}" if member.aliases else ""
         lines.append(f"{mark} {member.label}{names}")
     lines.append("")
-    lines.append("Зарегистрировать себя: /reg Женя, ЖеняШ, как вас ещё зовут")
-    lines.append("Зарегистрировать другого: /reg @его_ник Имя, кличка")
+    lines.append("Отметить себя (команду /reg можно нажать): /reg Женя, ЖеняШ, как вас ещё зовут")
+    lines.append("Отметить другого: /reg @его_ник Имя, кличка")
     return "\n".join(lines)
 
 
@@ -601,6 +601,7 @@ def format_help(default_currency: str = "BYN") -> str:
         "🤖 Калькулятор долгов. Что умею:",
         "",
         "0. Зарегистрировать участников — без этого записи не ведутся:",
+        "   нажмите /reg — команда подставится в строку ввода, допишите имена:",
         "   /reg Женя, ЖеняШ, жена, шаман — как вас ещё зовут в чате",
         "   /reg @Genia Женя, ЖеняШ, жекич — зарегистрировать другого участника",
         "   /who — кто уже есть в чате и кто зарегистрирован",
@@ -624,8 +625,7 @@ def format_help(default_currency: str = "BYN") -> str:
         "",
         "5. Взаимозачёт: кто кому сколько переводит, чтобы всё закрылось:",
         "   /settle — минимум переводов (если A→B и B→C, то A платит C)",
-        "   Подсказку «Итог: /settle» в ответе о записи можно нажать — команда",
-        "   подставится в строку ввода.",
+        "   Итоги в ответе о записи не показываю — считаю их тут, по команде.",
         "",
         "6. Привести всё к валюте чата по курсу на дату записи:",
         "   /d — все долги в одной валюте по курсу того дня, когда их записали",
@@ -645,6 +645,6 @@ def format_help(default_currency: str = "BYN") -> str:
         "   отвечает ли база, есть ли курсы на сегодня, задан ли ключ ИИ,",
         "   валюта и режим обращения в этом чате.",
         "",
-        "Если чат защищён паролем, пришлите его один раз: /password ваш-пароль.",
+        "Если чат защищён паролем, пришлите его один раз: /login (или /password ваш-пароль).",
         "Данные хранятся в Supabase, отдельно по каждому чату.",
     ])

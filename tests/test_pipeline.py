@@ -32,7 +32,12 @@ from bot import (
     handle_text,
     is_allowed,
     is_command_for_bot,
+    LOGIN_COMMANDS,
+    LOGIN_DONE_REPLY,
+    LOGIN_FREE_REPLY,
     mentions_bot,
+    PASSWORD_REPLY,
+    REGISTER_SELF_HINT,
     set_commands_mode,
     status_report,
 )
@@ -48,7 +53,6 @@ from config import (
 )
 from debts import (
     DEBTS_DUMP_COLUMNS,
-    SETTLE_HINT,
     format_debts_dump,
     format_debts_report,
     format_help,
@@ -68,7 +72,14 @@ from deepseek import (
     detect_currency,
     heuristic_parse,
 )
-from members import format_roster, member_from_telegram, resolve_member, with_aliases
+from members import (
+    format_roster,
+    member_from_telegram,
+    resolve_member,
+    short_label,
+    short_label_for,
+    with_aliases,
+)
 from rates import (
     RatesError,
     convert_amount,
@@ -118,6 +129,28 @@ def make_debt(debtor: str, creditor: str, amount: float, currency: str = "BYN",
     return Debt(chat_id=chat, from_name=debtor, to_name=creditor,
                 currency=currency, amount=amount, kind=kind,
                 from_user_id=user_ids[0], to_user_id=user_ids[1])
+
+
+# Подтверждение записи — компактная строка без блока с подробностями:
+# «✅ @кто → @кому 3.00 BYN», «↩️ … — возврат», «🧾 @кто заплатил 10.00 BYN — …».
+SAVED_DEBT_RE = re.compile(r"^✅ \S+ → \S+ \d+\.\d{2} [A-Z]{3}$", re.MULTILINE)
+SAVED_REPAYMENT_RE = re.compile(r"^↩️ \S+ → \S+ \d+\.\d{2} [A-Z]{3} — возврат$", re.MULTILINE)
+SAVED_EXPENSE_RE = re.compile(r"^🧾 \S+ заплатил \d+\.\d{2} [A-Z]{3} — ", re.MULTILINE)
+
+
+def assert_saved_debt(case: unittest.TestCase, reply: str) -> None:
+    """В ответе есть строка о записанном долге (одна строка: кто → кому и сумма)."""
+    case.assertRegex(reply, SAVED_DEBT_RE)
+
+
+def assert_saved_repayment(case: unittest.TestCase, reply: str) -> None:
+    """В ответе есть строка о записанном возврате долга."""
+    case.assertRegex(reply, SAVED_REPAYMENT_RE)
+
+
+def assert_saved_expense(case: unittest.TestCase, reply: str) -> None:
+    """В ответе есть строка о записанном общем счёте."""
+    case.assertRegex(reply, SAVED_EXPENSE_RE)
 
 
 class HeuristicParseTests(unittest.TestCase):
@@ -256,7 +289,7 @@ class BotFlowTests(unittest.TestCase):
 
     def test_saves_debt_with_explicit_currency(self) -> None:
         reply = self.send("Леша должен Диме 3 рубля")
-        self.assertIn("Записал долг", reply)
+        assert_saved_debt(self, reply)
         self.assertIn("3.00 BYN", reply)
         self.assertNotIn("взял по умолчанию", reply)
         self.assertEqual(len(self.storage.debts), 1)
@@ -572,7 +605,7 @@ class WebhookAppTests(unittest.TestCase):
         self.assertEqual(status, "200 OK")
         self.assertIn('"accepted": true', body)
         self.assertEqual(len(storage.list_debts(7)), 1)
-        self.assertIn("Записал долг", telegram.sent[0][1])
+        assert_saved_debt(self, telegram.sent[0][1])
         self.assertEqual(storage.get_state("last_update_id"), "11")
 
     def test_wrong_secret_is_rejected(self) -> None:
@@ -666,7 +699,7 @@ class LazyWebhookAppTests(unittest.TestCase):
         self.assertEqual((first[0], second[0]), ("200 OK", "200 OK"))
         self.assertEqual(len(calls), 1)              # приложение собралось один раз
         self.assertEqual(len(storage.list_debts(7)), 1)
-        self.assertIn("Записал долг", telegram.sent[0][1])
+        assert_saved_debt(self, telegram.sent[0][1])
         self.assertIn("Итог с взаимозачётом", telegram.sent[1][1])
 
 
@@ -1233,7 +1266,7 @@ class LongPollingTests(unittest.TestCase):
         self.assertEqual(telegram.offsets[0], 15)               # старт с сохранённого смещения
         self.assertEqual(storage.get_state("last_update_id"), "21")  # записал после обработки
         self.assertEqual(len(storage.list_debts(7)), 1)
-        self.assertIn("Записал долг", telegram.sent[0][1])
+        assert_saved_debt(self, telegram.sent[0][1])
 
     def test_run_without_saved_offset_requests_everything(self) -> None:
         bot, storage, telegram = self.build([make_update(1, "/help")])
@@ -1261,7 +1294,7 @@ class LongPollingTests(unittest.TestCase):
         seed_chat(storage, chat=7)
         bot = DebtBot(settings, storage, HeuristicParser(), telegram)
         self.assertEqual(bot.run(poll_timeout=5, max_updates=1), 1)   # не падает из-за состояния
-        self.assertIn("Записал долг", telegram.sent[0][1])
+        assert_saved_debt(self, telegram.sent[0][1])
 
 
 GROUP = -100500
@@ -1337,14 +1370,14 @@ class MentionOnlyTests(unittest.TestCase):
     def test_group_message_with_mention_is_saved(self) -> None:
         bot, storage, telegram = self.build()
         bot.process_update(make_chat_update(10, f"@{self.BOT} Леша должен Диме 3 рубля"))
-        self.assertIn("Записал долг", telegram.sent[0][1])
+        assert_saved_debt(self, telegram.sent[0][1])
         saved = storage.list_debts(GROUP)[0]
         self.assertEqual(saved.raw_text, "Леша должен Диме 3 рубля")   # упоминание вырезано
 
     def test_mention_at_the_end_is_understood(self) -> None:
         bot, storage, telegram = self.build()
         bot.process_update(make_chat_update(10, f"Леша должен Диме 3 рубля @{self.BOT}"))
-        self.assertIn("Записал долг", telegram.sent[0][1])
+        assert_saved_debt(self, telegram.sent[0][1])
 
     def test_command_with_bot_username(self) -> None:
         bot, storage, telegram = self.build()
@@ -1366,7 +1399,7 @@ class MentionOnlyTests(unittest.TestCase):
         bot.process_update(make_chat_update(
             10, "а Леша должен Диме 3 рубля?", reply_from_username=self.BOT,
         ))
-        self.assertIn("Записал долг", telegram.sent[0][1])
+        assert_saved_debt(self, telegram.sent[0][1])
 
     def test_mention_of_another_bot_is_ignored(self) -> None:
         bot, storage, telegram = self.build()
@@ -1382,7 +1415,7 @@ class MentionOnlyTests(unittest.TestCase):
         bot, storage, telegram = self.build()
         bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля",
                                             chat=7, chat_type="private"))
-        self.assertIn("Записал долг", telegram.sent[0][1])
+        assert_saved_debt(self, telegram.sent[0][1])
         self.assertEqual(len(storage.list_debts(7)), 1)
 
     def test_mention_is_stripped_in_private_chat(self) -> None:
@@ -1394,7 +1427,7 @@ class MentionOnlyTests(unittest.TestCase):
     def test_require_mention_can_be_disabled(self) -> None:
         bot, storage, telegram = self.build(require_mention=False)
         bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля"))
-        self.assertIn("Записал долг", telegram.sent[0][1])
+        assert_saved_debt(self, telegram.sent[0][1])
 
     def test_bot_username_from_settings(self) -> None:
         bot, _, _ = self.build(bot_username="@my_debt_bot")
@@ -1528,7 +1561,7 @@ class RepaymentFlowTests(unittest.TestCase):
     def test_repayment_is_saved_and_reduces_report(self) -> None:
         self.send("Леша должен Диме 5 рублей")
         reply = self.send("Леша вернул Диме 3 рубля")
-        self.assertIn("Записал возврат долга", reply)
+        assert_saved_repayment(self, reply)
         saved = self.storage.list_debts(CHAT)[-1]
         self.assertEqual((saved.kind, saved.amount, saved.raw_text),
                          ("repayment", 3.0, "Леша вернул Диме 3 рубля"))
@@ -1582,8 +1615,8 @@ class RepaymentFlowTests(unittest.TestCase):
         self.assertIn("/undo", help_text)
 
 
-class SavedReplyHintTests(unittest.TestCase):
-    """Ответ о записи — без итогов: только короткая подсказка «Итог: /settle» в конце."""
+class SavedReplyIsSingleLineTests(unittest.TestCase):
+    """Ответ о записи — ровно одна строка: ни итогов, ни подсказки «Итог: /settle»."""
 
     def setUp(self) -> None:
         self.settings = Settings(default_currency="BYN")
@@ -1596,30 +1629,106 @@ class SavedReplyHintTests(unittest.TestCase):
         return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
                            settings=self.settings, members=self.members, author=MEMBER_LEHA)
 
-    def assert_only_hint(self, reply: str) -> None:
-        """Никаких итогов и подсказок «подробно» — ровно одна строка в самом конце."""
-        self.assertNotIn("📊 Итог", reply)
-        self.assertNotIn("🧮", reply)
-        self.assertNotIn("Подробно", reply)
-        self.assertEqual(reply.count(SETTLE_HINT), 1)
-        self.assertEqual(reply.splitlines()[-1], SETTLE_HINT)
+    def assert_single_line(self, reply: str) -> None:
+        """Одна строка без итогов, блоков и подсказок — читается одним взглядом."""
+        self.assertEqual(reply, reply.strip())
+        self.assertEqual(len(reply.splitlines()), 1)
+        for fragment in ("/settle", "Итог", "📊", "🧮", "Подробно"):
+            self.assertNotIn(fragment, reply)
 
-    def test_debt_reply_has_only_hint(self) -> None:
+    def test_debt_reply_is_single_line(self) -> None:
         reply = self.send("Леша должен Диме 3 рубля")
-        self.assertIn("Записал долг", reply)
+        assert_saved_debt(self, reply)
         self.assertIn("3.00 BYN", reply)
-        self.assert_only_hint(reply)
+        self.assert_single_line(reply)
 
-    def test_repayment_reply_has_only_hint(self) -> None:
+    def test_repayment_reply_is_single_line(self) -> None:
         self.send("Леша должен Диме 5 рублей")
         reply = self.send("Леша вернул Диме 3 рубля")
-        self.assertIn("Записал возврат долга", reply)
-        self.assert_only_hint(reply)
+        assert_saved_repayment(self, reply)
+        self.assert_single_line(reply)
 
-    def test_expense_reply_has_only_hint(self) -> None:
+    def test_expense_reply_is_single_line(self) -> None:
         reply = self.send("Дима заплатил 10 за всех")
-        self.assertIn("Записал общий счёт", reply)
-        self.assert_only_hint(reply)
+        assert_saved_expense(self, reply)
+        self.assert_single_line(reply)
+
+
+class CompactSavedReplyTests(unittest.TestCase):
+    """Запись подтверждается одной строкой: «✅ @кто → @кому 3.00 BYN», без блока деталей."""
+
+    # Строки прежнего многострочного ответа: их в чат больше не отправляем.
+    OLD_LINES = ("Записал", "• Кто должен:", "• Кому:", "• Сумма:", "Кто скидывается",
+                 "Оригинал сохранён", "делю на", "Итог", "/settle")
+
+    def setUp(self) -> None:
+        self.settings = Settings(default_currency="BYN")
+        self.storage = InMemoryStorage(default_currency="BYN")
+        self.parser = HeuristicParser()
+        seed_chat(self.storage)
+
+    def send(self, text: str) -> str:
+        """Отправляет сообщение боту (автор — Леша Козлов) и возвращает ответ."""
+        return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
+                           settings=self.settings,
+                           members=self.storage.list_members(CHAT), author=MEMBER_LEHA)
+
+    def assert_compact(self, reply: str, expected: str) -> None:
+        """Ровно одна строка — сама запись, и ни одной строки старого формата."""
+        self.assertEqual(reply, expected)
+        for fragment in self.OLD_LINES:
+            self.assertNotIn(fragment, reply)
+
+    def test_debt_reply_is_one_line(self) -> None:
+        self.assert_compact(self.send("Леша должен Диме 3 рубля"),
+                            "✅ @kozlovAlex → @bdzmity 3.00 BYN")
+
+    def test_repayment_reply_is_one_line(self) -> None:
+        self.send("Леша должен Диме 5 рублей")
+        self.assert_compact(self.send("Леша вернул Диме 3 рубля"),
+                            "↩️ @kozlovAlex → @bdzmity 3.00 BYN — возврат")
+
+    def test_expense_reply_names_payer_share_and_debtors(self) -> None:
+        reply = self.send("Дима заплатил 10 за всех")
+        first = reply.splitlines()[0]
+        self.assertTrue(first.startswith("🧾 @bdzmity заплатил 10.00 BYN — "
+                                         "по 2.00 BYN с "), first)
+        for handle in ("@kozlovAlex", "@petrova_m", "@olga_s", "@petya_k"):
+            self.assertIn(handle, first)
+        self.assertEqual(len(reply.splitlines()), 1)      # ответ — одна строка
+        for fragment in self.OLD_LINES:
+            self.assertNotIn(fragment, reply)
+
+    def test_excluded_person_is_shown_inline(self) -> None:
+        reply = self.send("Дима заплатил 12 за всех кроме Оли")
+        self.assertIn("(без @olga_s)", reply.splitlines()[0])
+
+    def test_unregistered_are_reported_with_tappable_reg(self) -> None:
+        """Незарегистрированного в счёт не берём, но в ответе видно, кого и как позвать."""
+        self.storage.remember_member(replace(MEMBER_GOSHA, chat_id=CHAT))
+        reply = self.send("Дима заплатил 10 за всех")
+        self.assertIn("⚠️ Не участвуют (нет /reg): Гоша Петров (@gosha_p)", reply)
+
+    def test_expense_names_are_truncated(self) -> None:
+        """Много участников: длинный перечень имён сворачиваем в «и ещё N»."""
+        extra = tuple(ChatMember(chat_id=CHAT, user_id=200 + index,
+                                 username=f"user{index}", display_name=f"Участник {index}",
+                                 is_registered=True)
+                      for index in range(4))
+        self.storage = InMemoryStorage(default_currency="BYN")
+        seed_chat(self.storage, members=REGISTERED + extra)
+        first = self.send("Дима заплатил 100 за всех").splitlines()[0]
+        self.assertIn("и ещё 2", first)          # 8 должников, показываем 6
+        self.assertEqual(first.count("@"), 7)    # плативший + 6 имён
+
+    def test_member_without_username_is_called_by_name(self) -> None:
+        storage = InMemoryStorage(default_currency="BYN")
+        leha = replace(MEMBER_LEHA, username="")
+        seed_chat(storage, members=(leha, MEMBER_DIMA))
+        reply = handle_text("Леша должен Диме 3 рубля", CHAT, storage=storage,
+                            parser=self.parser, settings=self.settings,
+                            members=storage.list_members(CHAT), author=leha)
+        self.assertIn("✅ Леша → @bdzmity 3.00 BYN", reply)
 
 
 class StorageRepaymentTests(unittest.TestCase):
@@ -1780,6 +1889,26 @@ class MemberHelperTests(unittest.TestCase):
         self.assertEqual(MEMBER_LEHA.aliases, ["Леша", "Лёха"])   # исходный не меняется
 
 
+class ShortLabelTests(unittest.TestCase):
+    """Короткое обращение в ответах о записи: «@ник», а без ника — только имя."""
+
+    def test_username_wins(self) -> None:
+        self.assertEqual(short_label(MEMBER_LEHA), "@kozlovAlex")
+
+    def test_without_username_first_name(self) -> None:
+        self.assertEqual(short_label(replace(MEMBER_DIMA, username="")), "Дмитрий")
+
+    def test_member_without_name_falls_back_to_id(self) -> None:
+        self.assertEqual(short_label(ChatMember(chat_id=CHAT, user_id=107)), "id107")
+
+    def test_known_member_is_taken_by_id(self) -> None:
+        self.assertEqual(short_label_for(101, "Лешак", REGISTERED), "@kozlovAlex")
+
+    def test_unknown_member_uses_text_from_message(self) -> None:
+        self.assertEqual(short_label_for(None, "Гоша", REGISTERED), "Гоша")
+        self.assertEqual(short_label_for(999, "", REGISTERED), "")
+
+
 class MemberBindingFlowTests(unittest.TestCase):
     """Привязка записей к участникам: «Лешак», «Леша» и «@kozlovAlex» — один человек."""
 
@@ -1801,8 +1930,8 @@ class MemberBindingFlowTests(unittest.TestCase):
         saved = self.storage.list_debts(CHAT)[0]
         self.assertEqual((saved.from_user_id, saved.to_user_id), (101, 102))
         self.assertEqual((saved.from_name, saved.to_name), ("Леша Козлов", "Дмитрий Болт"))
-        self.assertIn("Леша Козлов (@kozlovAlex)", reply)
-        self.assertIn("Дмитрий Болт (@bdzmity)", reply)
+        assert_saved_debt(self, reply)
+        self.assertIn("@kozlovAlex → @bdzmity", reply)   # узнали обоих участников по никам
 
     def test_different_spellings_merge_by_id(self) -> None:
         self.send("Лешак должен Диме 3 рубля")
@@ -2035,7 +2164,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(gosha.aliases, ["Гоша", "Гоша Петров", "жекич"])
         self.assertIn("Гоша Петров (@gosha_p)", reply)
         # теперь по новому имени человек узнаётся, и запись сохраняется
-        self.assertIn("Записал долг", self.send("жекич должен Диме 2 рубля"))
+        assert_saved_debt(self, self.send("жекич должен Диме 2 рубля"))
         saved = self.storage.list_debts(CHAT)[-1]
         self.assertEqual((saved.from_user_id, saved.to_user_id), (106, 102))
 
@@ -2056,7 +2185,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(self.storage.list_debts(CHAT), [])
         self.assertIn("/reg", refused)
         self.send("/reg @gosha_p Гоша")
-        self.assertIn("Записал долг", self.send("Гоша должен Леше 5 рублей"))
+        assert_saved_debt(self, self.send("Гоша должен Леше 5 рублей"))
 
     def test_registration_is_per_chat(self) -> None:
         other = seed_chat(self.storage, chat=999, members=(MEMBER_LEHA,))
@@ -2064,6 +2193,81 @@ class RegistrationTests(unittest.TestCase):
                     settings=self.settings, members=other,
                     author=replace(MEMBER_LEHA, chat_id=999))
         self.assertEqual(self.member(101).aliases, ["Леша", "Лёха"])
+
+
+class RegistrationHintTests(unittest.TestCase):
+    """Незарегистрированному автору бот показывает нажимаемый /reg прямо в ответе."""
+
+    def setUp(self) -> None:
+        self.settings = Settings(default_currency="BYN")
+        self.storage = InMemoryStorage(default_currency="BYN")
+        self.parser = HeuristicParser()
+        seed_chat(self.storage)
+        self.storage.remember_member(replace(MEMBER_GOSHA, chat_id=CHAT))   # новичок без /reg
+
+    def send(self, text: str, author: ChatMember | None = MEMBER_GOSHA) -> str:
+        """Отправляет сообщение; состав чата всегда читаем заново — как в живом боте."""
+        return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
+                           settings=self.settings,
+                           members=self.storage.list_members(CHAT), author=author)
+
+    def member(self, user_id: int) -> ChatMember:
+        """Участник чата по user id."""
+        return next(item for item in self.storage.list_members(CHAT) if item.user_id == user_id)
+
+    def test_unknown_message_hints_registration(self) -> None:
+        """«Не понял сообщение» новичку дополняется подсказкой про /reg."""
+        reply = self.send("привет")
+        self.assertIn("Не понял сообщение", reply)
+        self.assertIn(REGISTER_SELF_HINT, reply)
+        self.assertIn("/reg", reply)
+
+    def test_registered_author_gets_no_hint(self) -> None:
+        reply = self.send("привет", author=MEMBER_LEHA)
+        self.assertNotIn(REGISTER_SELF_HINT, reply)
+
+    def test_mydebts_hints_registration(self) -> None:
+        """Личные итоги незарегистрированному автору заканчиваются подсказкой про /reg."""
+        reply = self.send("/mydebts")
+        self.assertIn(REGISTER_SELF_HINT, reply)
+
+    def test_mydebts_for_registered_author_has_no_hint(self) -> None:
+        reply = self.send("/mydebts", author=MEMBER_LEHA)
+        self.assertNotIn(REGISTER_SELF_HINT, reply)
+        self.assertIn("Записей нет", reply)
+
+    def test_author_without_records_still_gets_hint(self) -> None:
+        """Даже без записей новичок видит, что сначала нужно отметиться."""
+        reply = self.send("/mydebts", author=replace(MEMBER_GOSHA, is_registered=True))
+        self.assertNotIn(REGISTER_SELF_HINT, reply)
+
+    def test_tapped_reg_registers_author_and_shows_names(self) -> None:
+        """Нажали /reg без имён — бот регистрирует по нику и показывает, что дописать."""
+        reply = self.send("/reg")
+        self.assertIn("Зарегистрировал", reply)
+        self.assertTrue(self.member(106).is_registered)
+        self.assertIn("/reg", reply)
+
+    def test_tapped_reg_then_debt_is_recorded(self) -> None:
+        """После нажатия /reg запись проходит — новичку больше ничего не нужно."""
+        self.send("/reg Гоша")
+        author = self.member(106)
+        assert_saved_debt(self, self.send("Гоша должен Диме 3 рубля", author=author))
+
+    def test_registration_hint_advises_only_declared_commands(self) -> None:
+        declared = {name for name, _ in BOT_COMMANDS}
+        advised = set(re.findall(r"/([a-z]{2,10})\b", REGISTER_SELF_HINT))
+        self.assertTrue(advised)
+        self.assertEqual(advised - declared, set())
+
+    def test_who_report_shows_tappable_reg(self) -> None:
+        """«Кто в чате» напоминает про /reg — команду можно нажать."""
+        reply = self.send("/who")
+        self.assertIn("⬜ Гоша Петров", reply)
+        self.assertIn("/reg", reply)
+
+    def test_help_explains_tappable_reg(self) -> None:
+        self.assertIn("нажмите /reg", format_help("BYN"))
 
 
 class ExpenseFlowTests(unittest.TestCase):
@@ -2095,7 +2299,7 @@ class ExpenseFlowTests(unittest.TestCase):
         self.assertTrue(all(row.amount == 2.0 for row in rows))     # 10 / 5
         self.assertEqual(len({row.group_id for row in rows}), 1)
         self.assertTrue(all(row.raw_text == "Дима заплатил 10 за всех" for row in rows))
-        self.assertIn("Сумма: 10.00 BYN — делю на 5 чел.", reply)
+        self.assertIn("по 2.00 BYN с", reply)
 
     def test_paid_without_scope_is_for_everyone(self) -> None:
         self.send("я заплатил 20 рублей")            # автор сообщения — Дима
@@ -2109,7 +2313,7 @@ class ExpenseFlowTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertNotIn(104, {row.from_user_id for row in rows})
         self.assertTrue(all(row.amount == 3.0 for row in rows))     # 12 / 4
-        self.assertIn("Исключены: Оля Смирнова (@olga_s)", reply)
+        self.assertIn("без @olga_s", reply)
 
     def test_except_self_leaves_payer_out_of_split(self) -> None:
         self.send("я заплатил 9 за всех кроме себя")
@@ -2128,7 +2332,7 @@ class ExpenseFlowTests(unittest.TestCase):
         rows = self.rows()
         self.assertEqual({row.from_user_id for row in rows}, {103, 104})
         self.assertTrue(all(row.amount == 2.0 for row in rows))     # 6 / 3
-        self.assertIn("Кто скидывается: Маша Петрова", reply)
+        self.assertIn("с @petrova_m, @olga_s", reply)
 
     def test_unregistered_members_are_skipped(self) -> None:
         storage = InMemoryStorage(default_currency="BYN")
@@ -2142,7 +2346,7 @@ class ExpenseFlowTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)                       # только зарегистрированный Леша
         self.assertEqual(rows[0].from_user_id, 101)
         self.assertEqual(rows[0].amount, 5.0)                # 10 / 2 (Дима платил + Леша)
-        self.assertIn("Не участвуют (не зарегистрированы): Гоша Петров", reply)
+        self.assertIn("Не участвуют (нет /reg): Гоша Петров (@gosha_p)", reply)
 
     def test_unregistered_participant_is_reported(self) -> None:
         reply = self.send("Дима оплатил 10 за Гошу")
@@ -2380,7 +2584,7 @@ class AiExpenseTests(unittest.TestCase):
         rows = storage.list_debts(CHAT)
         self.assertEqual(len(rows), 3)                          # Леша, Маша, Петя
         self.assertTrue(all(row.amount == 2.25 for row in rows))     # 9 / 4 (с платившим)
-        self.assertIn("Записал общий счёт", reply)
+        assert_saved_expense(self, reply)
 
 
 class RatesParsingTests(unittest.TestCase):
@@ -2706,7 +2910,7 @@ class PasswordTests(unittest.TestCase):
     def test_correct_password_unlocks_chat(self) -> None:
         self.assertIn("Пароль принят", self.send("/password сезам"))
         self.assertTrue(self.storage.chat_authorized(CHAT))
-        self.assertIn("Записал долг", self.send("Леша должен Диме 3 рубля"))
+        assert_saved_debt(self, self.send("Леша должен Диме 3 рубля"))
 
     def test_password_as_plain_message(self) -> None:
         self.assertIn("Пароль принят", self.send("сезам"))
@@ -2721,7 +2925,7 @@ class PasswordTests(unittest.TestCase):
         reply = handle_text("Леша должен Диме 3 рубля", CHAT, storage=self.storage,
                             parser=self.parser, settings=Settings(default_currency="BYN"),
                             members=self.members, author=MEMBER_LEHA)
-        self.assertIn("Записал долг", reply)
+        assert_saved_debt(self, reply)
 
     def test_bot_added_to_chat_asks_password(self) -> None:
         telegram = FakeTelegram([])
@@ -2758,6 +2962,84 @@ class PasswordTests(unittest.TestCase):
         }})
         self.assertFalse(self.storage.chat_authorized(GROUP))
         self.assertEqual(telegram.sent, [])              # на выход ничего не пишем
+
+
+class LoginCommandTests(unittest.TestCase):
+    """Нажимаемый вход: /login — та же команда, что /password, но её удобно нажать."""
+
+    def setUp(self) -> None:
+        self.parser = HeuristicParser()
+        self.storage = InMemoryStorage(default_currency="BYN")
+        seed_chat(self.storage)
+        self.settings = Settings(default_currency="BYN", chat_password="сезам")
+
+    def send(self, text: str, settings: Settings | None = None) -> str:
+        """Отправляет сообщение от имени Леши Козлова."""
+        return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
+                           settings=settings or self.settings,
+                           members=self.storage.list_members(CHAT), author=MEMBER_LEHA)
+
+    def test_tapped_login_asks_for_password(self) -> None:
+        """Тап по /login подставляет команду без пароля — бот объясняет, что делать."""
+        reply = self.send("/login")
+        self.assertEqual(reply, PASSWORD_REPLY)
+        self.assertIn("пришлите пароль", reply)
+        self.assertIn("/login", reply)                     # подсказка нажимаема
+        self.assertFalse(self.storage.chat_authorized(CHAT))
+
+    def test_password_reply_advises_only_declared_commands(self) -> None:
+        """Всё, что бот советует в подсказке входа, объявлено в Telegram (иначе не нажать)."""
+        declared = {name for name, _ in BOT_COMMANDS}
+        advised = set(re.findall(r"/([a-z]{2,10})\b", PASSWORD_REPLY))
+        self.assertTrue(advised)
+        self.assertEqual(advised - declared, set())
+
+    def test_login_with_password_unlocks_chat(self) -> None:
+        self.assertIn("Пароль принят", self.send("/login сезам"))
+        self.assertTrue(self.storage.chat_authorized(CHAT))
+        assert_saved_debt(self, self.send("Леша должен Диме 3 рубля"))
+
+    def test_every_login_alias_unlocks_chat(self) -> None:
+        """Псевдонимы входа (/pass, /auth, /войти, /вход) работают так же, как /login."""
+        for alias in LOGIN_COMMANDS:
+            storage = InMemoryStorage(default_currency="BYN")
+            seed_chat(storage)
+            reply = handle_text(f"{alias} сезам", CHAT, storage=storage, parser=self.parser,
+                                settings=self.settings,
+                                members=storage.list_members(CHAT), author=MEMBER_LEHA)
+            self.assertIn("Пароль принят", reply, alias)
+            self.assertTrue(storage.chat_authorized(CHAT), alias)
+
+    def test_login_lists_the_declared_aliases(self) -> None:
+        self.assertEqual(LOGIN_COMMANDS[0], "/login")      # кнопка — первая в подсказке
+
+    def test_login_after_unlock_is_confirmed(self) -> None:
+        """Повторное нажатие /login не ломает вход — бот подтверждает, что всё готово."""
+        self.send("/login сезам")
+        reply = self.send("/login")
+        self.assertEqual(reply, LOGIN_DONE_REPLY)
+        self.assertIn("уже выполнен", reply)
+        self.assertIn("/reg", reply)                       # напоминание новичку
+
+    def test_login_without_password_setting(self) -> None:
+        """Пароля в чате нет: /login объясняет это и не мешает работать."""
+        reply = self.send("/login", Settings(default_currency="BYN"))
+        self.assertEqual(reply, LOGIN_FREE_REPLY)
+        self.assertIn("пароль не задан", reply)
+        self.assertIn("/reg", reply)
+
+    def test_login_aliases_after_unlock_are_answered(self) -> None:
+        """После входа ни один псевдоним /login не попадает в «не понял сообщение»."""
+        self.send("/login сезам")
+        for alias in LOGIN_COMMANDS:
+            reply = self.send(alias)
+            self.assertIn("вход", reply.lower(), alias)
+
+    def test_wrong_password_suggests_login(self) -> None:
+        """Ошибка пароля возвращает подсказку с нажимаемым /login."""
+        reply = self.send("/password наугад")
+        self.assertIn("не подошёл", reply)
+        self.assertIn("/login", reply)
 
 
 class ConvertedReportTests(unittest.TestCase):
@@ -3465,7 +3747,7 @@ class RegisterCommandsTests(unittest.TestCase):
         self.assertIn("Долгов нет", telegram.sent[0][1])
 
     def test_settle_mydebts_and_status_are_declared(self) -> None:
-        """Подсказка «Итог: /settle» нажимаема потому, что команда объявлена в Telegram."""
+        """Команды, которые бот советует в ответах, объявлены в Telegram — их можно нажать."""
         names = [name for name, _ in BOT_COMMANDS]
         for expected in ("settle", "mydebts", "status"):
             self.assertIn(expected, names)
@@ -3483,6 +3765,20 @@ class RegisterCommandsTests(unittest.TestCase):
         advised = set(re.findall(r"/([a-z]{2,10})\b", format_help("BYN")))
         self.assertTrue(advised)
         self.assertEqual(advised - declared, set())
+
+    def test_login_and_reg_are_declared(self) -> None:
+        """Вход и регистрация — нажимаемые команды: обе есть в меню Telegram («/»)."""
+        names = [name for name, _ in BOT_COMMANDS]
+        for expected in ("login", "password", "reg"):
+            self.assertIn(expected, names)
+
+    def test_hints_advise_only_declared_commands(self) -> None:
+        """Подсказки советуют только объявленные команды — иначе Telegram их не подчеркнёт."""
+        declared = {name for name, _ in BOT_COMMANDS}
+        for hint in (PASSWORD_REPLY, REGISTER_SELF_HINT, format_help("BYN")):
+            advised = set(re.findall(r"/([a-z]{2,10})\b", hint))
+            self.assertTrue(advised)
+            self.assertEqual(advised - declared, set(), hint)
 
     def test_set_commands_without_settings_explains_problem(self) -> None:
         """--set-commands без ключей сообщает об ошибке и не падает."""
