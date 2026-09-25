@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -15,13 +17,17 @@ MAX_ROWS_IN_HISTORY = 15
 # но всегда понятно, куда смотреть. Меняется в одном месте.
 SETTLE_HINT = "Итог: /settle"
 
-# TXT-выгрузка (/export): порядок колонок тот же, что и в таблице debts, — файл читается
-# как копия её строк. Колонки разделены табуляцией (TSV): открывается и в блокноте, и в Excel.
+# CSV-выгрузка (/export): порядок колонок тот же, что и в таблице debts, — файл читается
+# как копия её строк. Формат — стандартный CSV (csv.excel, RFC 4180): разделитель «,»,
+# а поле с запятой, кавычкой или переводом строки целиком берётся в кавычки; кавычки
+# внутри значения удваиваются («"» → «""»). Так файл открывают Excel, Google Sheets и
+# pandas, и он же читается обратно без потерь: csv.reader вернёт исходный текст.
 DEBTS_DUMP_COLUMNS = (
     "id", "created_at", "chat_id", "from_name", "to_name",
     "from_user_id", "to_user_id", "currency", "amount", "kind", "group_id", "raw_text",
 )
-DEBTS_DUMP_SEPARATOR = "\t"
+DEBTS_DUMP_DELIMITER = ","
+DEBTS_DUMP_LINE_END = "\r\n"      # конец строки как у csv.excel: его понимают все читатели
 
 # Упрощённая морфология русских имён: что срезаем в ключе и что считаем падежом
 CASE_ENDINGS = "аеёиоуыэюя"
@@ -447,40 +453,35 @@ def format_debts_report(debts: Sequence[Debt], default_currency: str = "BYN",
     return "\n".join(lines)
 
 
-def _dump_cell(value: Any) -> str:
-    """Значение для выгрузки: None → пусто, переводы строк и табы экранируются.
+def _dump_value(value: Any) -> str:
+    """Значение для CSV: None → пустое поле, остальное — как есть, без ручного экранирования.
 
-    Так одна запись всегда остаётся одной строкой файла: в исходном сообщении (raw_text)
-    может быть перенос строки, и без экранирования «таблица» в файле разъехалась бы.
+    Кавычки, запятые и переводы строк экранирует сам модуль csv: поле берётся в кавычки,
+    а кавычка внутри значения записывается дважды. Поэтому фраза «Дима, дай 5"» попадает в
+    файл как одно поле, и csv.reader возвращает её обратно без потерь.
     """
-    if value is None:
-        return ""
-    return (
-        str(value)
-        .replace("\\", "\\\\")          # обратный слэш первым: иначе экранируем свои же символы
-        .replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
-        .replace("\t", "\\t")
-    )
+    return "" if value is None else str(value)
 
 
-def format_debts_dump(debts: Sequence[Debt], chat_id: int) -> str:
-    """TXT-отчёт: строки таблицы debts этого чата как есть, без подсчётов и пересчётов.
+def format_debts_dump(debts: Sequence[Debt]) -> str:
+    """CSV-отчёт: строки таблицы debts этого чата как есть, без подсчётов и пересчётов.
 
-    Шапка — комментарий с chat_id и числом записей, дальше строка названий колонок и по
-    строке на запись (значения разделены табуляцией). Суммы печатаются как в базе — с двумя
-    знаками, валюта — как записана в таблице.
+    Первая строка — названия колонок (как в таблице), дальше по строке на запись; суммы
+    печатаются как в базе — с двумя знаками, валюта — как записана. Значения экранирует
+    csv: запятая, кавычка или перенос строки внутри `raw_text` не разрывают запись, а
+    оборачиваются кавычками (в TSV такие символы приходилось вычищать через «\\n»).
     """
-    lines = [
-        f"# Выгрузка таблицы debts: chat_id={chat_id}, записей: {len(debts)}",
-        DEBTS_DUMP_SEPARATOR.join(DEBTS_DUMP_COLUMNS),
-    ]
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, dialect="excel", delimiter=DEBTS_DUMP_DELIMITER,
+                        lineterminator=DEBTS_DUMP_LINE_END)
+    writer.writerow(DEBTS_DUMP_COLUMNS)
     for debt in debts:
-        lines.append(DEBTS_DUMP_SEPARATOR.join(_dump_cell(value) for value in (
+        writer.writerow(_dump_value(value) for value in (
             debt.id, debt.created_at, debt.chat_id, debt.from_name, debt.to_name,
             debt.from_user_id, debt.to_user_id, debt.currency, f"{float(debt.amount):.2f}",
             debt.kind, debt.group_id, debt.raw_text,
-        )))
-    return "\n".join(lines) + "\n"
+        ))
+    return buffer.getvalue()
 
 
 def format_currency_set(currency: str) -> str:
@@ -543,8 +544,9 @@ def format_help(default_currency: str = "BYN") -> str:
         "8. Удалить последнюю запись: /undo",
         "9. Удалить все записи этого чата: /reset",
         "",
-        "10. Выгрузить записи чата файлом TXT (копия таблицы debts):",
-        "   /export — бот пришлёт документ debts_<id чата>_<дата>.txt со всеми записями",
+        "10. Выгрузить записи чата файлом CSV (копия таблицы debts):",
+        "   /export — бот пришлёт документ debts_<id чата>_<дата>.csv со всеми записями",
+        "   (внутри файла кавычки, запятые и переносы строк в значениях экранированы)",
         "",
         "Если чат защищён паролем, пришлите его один раз: /password ваш-пароль.",
         "Данные хранятся в Supabase, отдельно по каждому чату.",

@@ -45,6 +45,12 @@ DEFAULT_RATES_HOUR = 12
 KEY_HEADER_MODES = ("apikey", "both")
 DEFAULT_KEY_HEADER = "apikey"
 
+# Сколько раз повторять запрос к базе при сетевом сбое (таймаут ответа, обрыв соединения).
+# По умолчанию 2 повтора, то есть до трёх попыток подряд; 0 — не повторять.
+# Обычная вставка (новый долг) не повторяется никогда: повтор создал бы вторую запись.
+DEFAULT_SUPABASE_RETRIES = 2
+MAX_SUPABASE_RETRIES = 10
+
 # Ключ доступа бота к базе. Новый формат — secret-ключ Supabase (sb_secret_…):
 # Project Settings → API Keys → «Publishable and secret API keys» → Secret keys.
 # Прежние имена (SUPABASE_SERVICE_KEY, SUPABASE_KEY) и legacy-ключи service_role работают.
@@ -86,6 +92,8 @@ class Settings:
     supabase_key: str = ""
     # Как ключ уходит в запросах: apikey (по умолчанию) или apikey + Authorization
     supabase_key_header: str = DEFAULT_KEY_HEADER
+    # Сколько раз повторять запрос к базе при сетевом сбое (SUPABASE_RETRIES)
+    supabase_retries: int = DEFAULT_SUPABASE_RETRIES
     debts_table: str = DEFAULT_DEBTS_TABLE
     settings_table: str = DEFAULT_SETTINGS_TABLE
     state_table: str = DEFAULT_STATE_TABLE
@@ -217,6 +225,18 @@ def _parse_hour(raw: str, default: int) -> int:
     except ValueError:
         return default
     return hour if 0 <= hour <= 23 else default
+
+
+def _parse_retries(raw: str, default: int) -> int:
+    """Число повторов запроса к базе при сетевом сбое: 0–10 (мусор — значение по умолчанию)."""
+    text = _clean(raw)
+    if not text:
+        return default
+    try:
+        retries = int(text)
+    except ValueError:
+        return default
+    return retries if 0 <= retries <= MAX_SUPABASE_RETRIES else default
 
 
 def _parse_user_ids(raw: str) -> frozenset[int]:
@@ -355,6 +375,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         supabase_url=get("SUPABASE_URL").rstrip("/"),
         supabase_key=_supabase_key(get),
         supabase_key_header=get("SUPABASE_KEY_HEADER", DEFAULT_KEY_HEADER).lower(),
+        supabase_retries=_parse_retries(get("SUPABASE_RETRIES"), DEFAULT_SUPABASE_RETRIES),
         debts_table=get("DEBTS_TABLE", DEFAULT_DEBTS_TABLE),
         settings_table=get("SETTINGS_TABLE", DEFAULT_SETTINGS_TABLE),
         state_table=get("BOT_STATE_TABLE", DEFAULT_STATE_TABLE),

@@ -157,10 +157,19 @@ python bot.py --webhook-info        # url, pending 0, без last error
 **10. Проверка:** написать боту «Леша должен Диме 3 рубля» — ответ за 1–3 секунды, затем `/debts`.
 
 **11. Обновление кода:** `cd ~/debt_calculator && git pull origin hosting`,
-при новых зависимостях `pip install -r requirements.txt`, затем **Reload** на вкладке *Web*.
-Если в обновлении менялась схема БД (появились таблицы или колонки), не забудьте ещё раз выполнить
-`db/schema.sql` в Supabase → SQL Editor: скрипт идемпотентный и просто добавит недостающее
-(например, `chat_members.is_registered`, `debts.group_id` и таблицу `currency_rates`).
+затем **обязательно обновите зависимости** (у вебхука нет `start.sh`, который делает это сам):
+
+```bash
+workon debt-bot                        # то же окружение, что указано в Web → Virtualenv
+pip install -r requirements.txt        # появились новые пакеты (например supabase)
+python -c "import supabase; print(supabase.__version__)"   # проверка
+python bot.py --check                  # ключи и права базы
+```
+
+после этого **Reload** на вкладке *Web*. Если в обновлении менялась схема БД (появились таблицы
+или колонки), не забудьте ещё раз выполнить `db/schema.sql` в Supabase → SQL Editor: скрипт
+идемпотентный и просто добавит недостающее (например, `chat_members.is_registered`,
+`debts.group_id` и таблицу `currency_rates`).
 
 **12. Логи:** *Web → Error log* — туда попадают наши логи с таймстампами (старт бота, ошибки
 DeepSeek/Supabase, «Повтор апдейта …»). Быстрая диагностика без логов — `python bot.py --check`
@@ -199,6 +208,7 @@ python bot.py                             # постоянный процесс 
 | `500 WEBHOOK_SECRET не задан` | переменная не добавлена в окружение хостинга — бот отказывается обрабатывать запросы без проверки подписи |
 | В `--webhook-info` поле `last error` = `Wrong response from the webhook` | на хостинге нет ключей DeepSeek/Supabase: смотрите логи функции (Vercel → Deployments → Logs) |
 | В `--webhook-info` поле `last error` = `SSL error` / `Bad Gateway` | адрес недоступен либо сертификат не готов; проверьте деплой и повторите `--set-webhook` |
+| В логе `Supabase не ответил (попытка 1 из 3)`, в чате `Supabase не ответил вовремя` | сетевой сбой: база или прокси не ответили. Бот повторяет запрос сам (`SUPABASE_RETRIES`, по умолчанию 2 повтора — до трёх попыток); если и это не помогло, проверьте доступность базы (`python bot.py --check`) и при необходимости увеличьте `REQUEST_TIMEOUT` |
 | Ответы приходят дважды | по одному адресу работают и вебхук, и `python bot.py`: остановите постоянный процесс |
 | В группе бот молчит | так задумано: нужен «@бот …», «/команда» в начале сообщения («/help», «/debts@бот») или ответ на сообщение бота. Чтобы он разбирал любые сообщения — `REQUIRE_MENTION=0` и privacy mode **Disable** у @BotFather (`/setprivacy`), иначе Telegram не отдаёт боту обычные сообщения |
 | На PythonAnywhere `--check` ругается на DeepSeek/Supabase (403/503, ошибка прокси) | домен не в allowlist бесплатного аккаунта: заявка на добавление, платный аккаунт или Vercel |
@@ -281,6 +291,9 @@ python bot.py                             # постоянный процесс 
    git pull origin hosting
    ```
 2. **Restart** сервера в панели. Зависимости переустановятся сами — это делает `start.sh`.
+   Если бот работает не через `start.sh`, а вебхуком (PythonAnywhere, Vercel), зависимости
+   ставятся отдельно: `pip install -r requirements.txt` в окружении веб-приложения и Reload —
+   иначе в логах будет `ModuleNotFoundError: No module named 'supabase'`.
 3. Если код обновился до версии с регистрацией участников (`/reg`), паролем чата, общими счетами
    и курсами валют — **повторно выполните `db/schema.sql`** в Supabase → SQL Editor: добавятся
    таблица `currency_rates`, колонки `chat_members.is_registered`, `debts.group_id`,
@@ -304,6 +317,7 @@ python bot.py --check                    # проверка ключей и се
 | `ключ базы — publishable (публичный)` / `HTTP 401` | в переменных окружения публичный ключ; нужен **secret-ключ**: Supabase → Project Settings → API Keys → «Publishable and secret API keys» → Secret keys → `sb_secret_…` |
 | `Supabase отклонил ключ или доступ` (в ответе `42501`, `permission denied`, `row-level security`) | запрос ушёл от роли `anon`, а не `service_role`: в переменных окружения публичный ключ (publishable/anon) или ключ от другого проекта. Возьмите **secret-ключ** `sb_secret_…` (не publishable) и проверьте `python bot.py --check` — он печатает тип ключа и отдельно проверяет, разрешает ли база запись |
 | `permission denied for schema public` (42501) | ключ принят, но у роли нет прав на схему: выполните **`db/grants.sql`** в Supabase → SQL Editor (выдаёт права роли `service_role`, которой соответствует secret-ключ) и повторите `python bot.py --check`. Если права выданы, а ошибка осталась — проверьте, что ключ и `SUPABASE_URL` от одного проекта |
+| `ModuleNotFoundError: No module named 'supabase'` (или другого пакета из `requirements.txt`) | новая зависимость не установлена в том окружении, из которого работает веб-приложение: активируйте своё окружение (`workon debt-bot`), затем `cd ~/debt_calculator && pip install -r requirements.txt`, проверьте `python -c "import supabase"`, убедитесь, что в *Web → Virtualenv* указано то же окружение, и нажмите **Reload**. На панелях с `start.sh` зависимости ставятся сами при Restart |
 | Бот просит пароль | задан `CHAT_PASSWORD`: пришлите `/password ваш-пароль` (пароль задаётся в окружении хостинга) |
 | `/d` пишет «Курсов за эти даты нет» | не задан `RATES_API_KEY` (и не задан `RATES_OPEN_URL`) или курсы ещё не обновлялись: подождите ближайшие 12:00 по Минску либо выполните `python bot.py --rates` |
 | Курсы обновились не в 12:00 | на постоянном процессе обновление случается при первой проверке после 12:00 (обычно в течение получаса), а на вебхуке — при первом апдейте или пинге `GET /`; час задаётся в `RATES_HOUR` |

@@ -3,13 +3,25 @@
 
 from __future__ import annotations
 
+import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Mapping, Protocol, Sequence
 
-from supabase import Client, ClientOptions, PostgrestAPIError, SupabaseException, create_client
+try:
+    import httpx
+    from supabase import Client, ClientOptions, PostgrestAPIError, SupabaseException, create_client
+except ImportError as exc:      # вместо «No module named 'supabase'» — что делать
+    raise ImportError(
+        "Не установлен пакет supabase (зависимость базы данных): выполните "
+        "pip install -r requirements.txt — в том же окружении, из которого запускается бот "
+        "(на хостинге: в виртуальном окружении веб-приложения, затем Reload)."
+    ) from exc
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CURRENCY = "BYN"
 # Курс хранится целым числом (bigint/int8): rate = курс × RATE_SCALE.
@@ -34,6 +46,14 @@ KEY_PROBLEM_CODES = ("PGRST301", "42501")
 # Authorization убираем сами: иначе PostgREST выполняет запрос от роли anon, и запись
 # отклоняет RLS (Postgres 42501 — «new row violates row-level security policy»).
 NEW_API_KEY_PREFIXES = ("sb_publishable_", "sb_secret_")
+
+# Сетевые сбои (таймаут ожидания ответа, обрыв связи, ошибка прокси) — не ошибка данных:
+# база на бесплатном тарифе «просыпается» после простоя дольше REQUEST_TIMEOUT, а прокси
+# рвёт соединение на середине ответа. Такие запросы повторяем: чтение, upsert и delete
+# безопасны (upsert идемпотентен по on_conflict), а обычный insert — нет: повтор создал бы
+# вторую строку долга.
+DEFAULT_DB_RETRIES = 2
+DB_RETRY_DELAY = 1.0      # пауза перед повтором, с; дальше растёт (1 с, 2 с, …)
 
 
 def is_new_api_key(key: str) -> bool:
@@ -86,6 +106,33 @@ def probe_key_headers(url: str, key: str, *, table: str = "debts", timeout: floa
         except Exception as exc:  # noqa: BLE001 — диагностика не должна падать целиком
             results.append((title, f"не удалось: {exc}"))
     return results
+
+
+def _network_error_message(exc: Exception, attempts: int, repeatable: bool = True) -> str:
+    """Понятное описание сетевого сбоя: база не ответила вовремя или связь оборвалась.
+
+    Это не ошибка данных и не отказ доступа: такой сбой обычно проходит сам (Supabase
+    «просыпается» после простоя, прокси рвёт соединение на середине ответа), поэтому
+    запрос сначала повторяется — и только потом человеку сообщается о проблеме.
+
+    `repeatable=False` — запрос не повторяли (обычная вставка): предупреждаем, что запись
+    могла не сохраниться, и подсказываем проверить её своими глазами.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        problem = f"Supabase не ответил вовремя ({exc})"
+    else:
+        problem = f"Связь с Supabase оборвалась ({exc})"
+    if repeatable:
+        repeats = f" Запрос повторяли {attempts} раз — безуспешно." if attempts > 1 else ""
+        advice = "Повторите команду."
+    else:
+        repeats = ""
+        advice = ("Запись не повторялась, чтобы не задвоить долг: загляните в /debts и, "
+                  "если её там нет, отправьте сообщение ещё раз.")
+    return (
+        f"{problem}.{repeats} {advice} Это сбой сети, а не отказ доступа к базе: "
+        "проверьте интернет и прокси (доступность базы покажет: python bot.py --check)."
+    )
 
 
 def _api_error_message(exc: Exception) -> str:
@@ -331,6 +378,8 @@ class SupabaseStorage:
     Имена таблиц приходят из настроек, по умолчанию — как в db/schema.sql.
     В upsert-ах передаём returning="minimal" — это значение контракта PostgREST
     («Prefer: return=minimal»): строки в ответе нужны только при вставке долгов.
+    Сетевые сбои (таймаут ответа, обрыв связи) повторяются до `retries` раз — кроме
+    обычных вставок долгов: повтор insert создал бы вторую запись.
     """
 
     def __init__(
@@ -345,9 +394,15 @@ class SupabaseStorage:
         rates_table: str = "currency_rates",
         timeout: float = 30.0,
         key_header: str = "apikey",
+        retries: int = DEFAULT_DB_RETRIES,
+        retry_delay: float = DB_RETRY_DELAY,
         client: Client | None = None,
     ) -> None:
-        """Готовит клиент SDK; при передаче готового `client` url и ключ не нужны (тесты)."""
+        """Готовит клиент SDK; при передаче готового `client` url и ключ не нужны (тесты).
+
+        `retries` — сколько раз повторить запрос при сетевом сбое (таймаут, обрыв связи),
+        `retry_delay` — пауза перед первым повтором, с; дальше она растёт (1 с, 2 с, …).
+        """
         url = str(url or "").strip().rstrip("/")
         key = str(key or "").strip().strip("'\"").strip()
         if client is not None:
@@ -365,6 +420,8 @@ class SupabaseStorage:
         self._members_table = members_table
         self._rates_table = rates_table
         self._timeout = timeout
+        self._retries = max(0, int(retries))
+        self._retry_delay = max(0.0, float(retry_delay))
 
     @property
     def tables(self) -> tuple[str, str]:
@@ -375,17 +432,37 @@ class SupabaseStorage:
         """Билдер таблицы PostgREST: дальше цепочка select/insert/upsert/delete и execute()."""
         return self._client.table(name)
 
-    def _execute(self, query: Any) -> Any:
-        """Выполняет запрос SDK и переводит ошибки PostgREST в StorageError.
+    def _execute(self, query: Any, *, repeatable: bool = True) -> Any:
+        """Выполняет запрос SDK, повторяет сетевые сбои и переводит ошибки в StorageError.
 
         Сообщения остаются человеческими: 401/403 («ключ или RLS») и «нет таблицы» —
         самые частые проблемы при настройке, и по тексту ошибки должно быть понятно,
         что править в переменных окружения или в базе.
+
+        `repeatable=True` — запрос можно выполнить ещё раз без последствий: таймаут ответа
+        или обрыв связи повторяются до `retries` раз с растущей паузой (такой сбой обычно
+        проходит сам: база «просыпается» после простоя, прокси переподключается).
+        `repeatable=False` — обычный insert: повтор создал бы вторую строку, поэтому о
+        сетевом сбое честно сообщаем, а не дожимаем запрос.
         """
-        try:
-            return query.execute()
-        except PostgrestAPIError as exc:
-            raise StorageError(_api_error_message(exc)) from exc
+        attempts = self._retries + 1 if repeatable else 1
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return query.execute()
+            except PostgrestAPIError as exc:
+                raise StorageError(_api_error_message(exc)) from exc
+            except httpx.RequestError as exc:
+                if attempt >= attempts:
+                    raise StorageError(
+                        _network_error_message(exc, attempts, repeatable)
+                    ) from exc
+                logger.warning(
+                    "Supabase не ответил (попытка %s из %s): %s — повторяю запрос.",
+                    attempt, attempts, exc,
+                )
+                time.sleep(self._retry_delay * attempt)
 
     def add_debt(self, chat_id: int, from_name: str, to_name: str, currency: str,
                  amount: float, raw_text: str | None = None,
@@ -400,7 +477,7 @@ class SupabaseStorage:
                 from_user_id=from_user_id, to_user_id=to_user_id,
                 raw_text=raw_text, group_id=group_id,
             ),
-        ))
+        ), repeatable=False)
         rows = _rows(response)
         if rows:
             return _row_to_debt(rows[0])
@@ -435,7 +512,7 @@ class SupabaseStorage:
             )
             for record in records
         ]
-        response = self._execute(self._table(self._debts_table).insert(payload))
+        response = self._execute(self._table(self._debts_table).insert(payload), repeatable=False)
         return [_row_to_debt(row) for row in _rows(response)]
 
     @staticmethod

@@ -86,7 +86,7 @@ from rates import (
     update_rates_scheduled,
 )
 from storage import ChatMember, InMemoryStorage, Storage, StorageError, SupabaseStorage, probe_key_headers
-from telegram_api import TelegramBot, TelegramError
+from telegram_api import CSV_DOCUMENT_TYPE, TelegramBot, TelegramError
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 logger = logging.getLogger("debt_bot")
@@ -143,24 +143,26 @@ REG_ALIAS_SPLIT_RE = re.compile(r"[,;]+")
 MAX_SKIPPED_SHOWN = 5
 # Сколько последних дней курсов показывать в /rates (и искать для пересчёта).
 RATES_HISTORY_DAYS = 30
-# Сколько строк TXT-отчёта печатать в консоли (--demo): сам файл целиком не нужен.
+# Сколько строк CSV-отчёта печатать в консоли (--demo): сам файл целиком не нужен.
 DEMO_PREVIEW_LINES = 8
-# Команды выгрузки записей файлом TXT: копия строк таблицы debts этого чата.
+# Команды выгрузки записей файлом CSV: копия строк таблицы debts этого чата.
 EXPORT_COMMANDS = ("/export", "/report", "/txt", "/файл")
 
 
 @dataclass(frozen=True)
-class TxtReport:
-    """Готовый TXT-отчёт: такой ответ бот отправляет файлом-документом.
+class CsvReport:
+    """Готовый CSV-отчёт: такой ответ бот отправляет файлом-документом.
 
     handle_text отвечает обычным текстом (строкой), а отчёт — этим объектом: Telegram
     не умеет отправлять файл сообщением, поэтому DebtBot по типу ответа решает, что
-    звать — sendMessage или sendDocument.
+    звать — sendMessage или sendDocument. content_type нужен, чтобы Telegram и человек
+    видели файл таблицей (text/csv), а не текстом.
     """
 
     filename: str
     text: str
     caption: str = ""
+    content_type: str = CSV_DOCUMENT_TYPE
 
     def preview(self, limit: int = DEMO_PREVIEW_LINES) -> str:
         """Отчёт там, где файла нет (демо и логи): имя файла и первые строки содержимого."""
@@ -362,12 +364,14 @@ def settle_report(chat_id: int, storage: Storage, settings: Settings,
     return "\n".join(lines)
 
 
-def debts_txt_report(chat_id: int, storage: Storage) -> str | TxtReport:
-    """Команда /export: TXT-файл со всеми записями чата — копия строк таблицы debts.
+def debts_csv_report(chat_id: int, storage: Storage) -> str | CsvReport:
+    """Команда /export: CSV-файл со всеми записями чата — копия строк таблицы debts.
 
     Берутся только записи этого чата (chat_id из сообщения) и ничего не считается:
-    ни взаимозачёта, ни пересчёта по курсам — строки таблицы как есть. Если записей нет,
-    файл не отправляем: пустой документ в чате только мешает.
+    ни взаимозачёта, ни пересчёта по курсам — строки таблицы как есть. Значения экранирует
+    модуль csv (кавычки, запятые, переносы строк — см. debts.format_debts_dump), поэтому
+    файл открывается таблицей в Excel/Google Sheets и читается скриптом через csv.reader.
+    Если записей нет, файл не отправляем: пустой документ в чате только мешает.
     """
     try:
         debts = storage.list_debts(chat_id)
@@ -378,10 +382,10 @@ def debts_txt_report(chat_id: int, storage: Storage) -> str | TxtReport:
             "📭 Записей нет — выгружать нечего.\n"
             "Запишите долг сообщением: «Леша должен Диме 3 рубля»."
         )
-    return TxtReport(
-        filename=f"debts_{chat_id}_{date.today().isoformat()}.txt",
-        text=format_debts_dump(debts, chat_id),
-        caption=f"📄 Выгрузка таблицы debts: записей {len(debts)} (chat_id {chat_id}).",
+    return CsvReport(
+        filename=f"debts_{chat_id}_{date.today().isoformat()}.csv",
+        text=format_debts_dump(debts),
+        caption=f"📄 Выгрузка таблицы debts (CSV): записей {len(debts)} (chat_id {chat_id}).",
     )
 
 
@@ -597,14 +601,14 @@ def handle_text(
     settings: Settings,
     members: Sequence[ChatMember] | None = None,
     author: ChatMember | None = None,
-) -> str | TxtReport:
+) -> str | CsvReport:
     """Обрабатывает одно сообщение и формирует ответ бота.
 
     Функция не знает про Telegram — это делает её простой для тестов.
     `members` и `author` — состав чата и автор сообщения: по ним ИИ (и локальный
     резолвер) понимают, кто такой «Лешак» из текста, и запись привязывается к user id.
 
-    Обычный ответ — строка; команда выгрузки (/export) отвечает объектом TxtReport:
+    Обычный ответ — строка; команда выгрузки (/export) отвечает объектом CsvReport:
     Telegram не умеет отправлять файл сообщением, поэтому решение «файл или текст»
     принимает вызывающая сторона (DebtBot).
     """
@@ -643,7 +647,7 @@ def handle_text(
     if command in ("/settle", "/offset", "/зачёт", "/зачет"):
         return settle_report(chat_id, storage, settings, members, default_currency)
     if command in EXPORT_COMMANDS:
-        return debts_txt_report(chat_id, storage)
+        return debts_csv_report(chat_id, storage)
     if command == "/debts":
         return format_debts_report(storage.list_debts(chat_id), default_currency, members)
     if command == "/currency":
@@ -827,6 +831,7 @@ def _storage_for(settings: Settings) -> SupabaseStorage:
         rates_table=settings.rates_table,
         timeout=settings.request_timeout,
         key_header=settings.supabase_key_header,
+        retries=settings.supabase_retries,
     )
 
 
@@ -1089,20 +1094,21 @@ class DebtBot:
         except TelegramError as exc:
             logger.error("sendMessage: %s", exc)
 
-    def _send_reply(self, chat_id: Any, reply: str | TxtReport,
+    def _send_reply(self, chat_id: Any, reply: str | CsvReport,
                     message: Mapping[str, Any]) -> None:
-        """Отправляет ответ: обычный текст — сообщением, TXT-отчёт — файлом-документом.
+        """Отправляет ответ: обычный текст — сообщением, CSV-отчёт — файлом-документом.
 
         Если документ не дошёл, честно сообщаем об этом в чат: молчание выглядело бы как
         «бот ничего не нашёл», а причина (лимиты, права в чате) важна для человека.
         """
-        if not isinstance(reply, TxtReport):
+        if not isinstance(reply, CsvReport):
             self._send(chat_id, reply, message)
             return
         try:
             self._telegram.send_document(
                 chat_id, reply.filename, reply.text,
                 caption=reply.caption, reply_to=message.get("message_id"),
+                content_type=reply.content_type,
             )
         except TelegramError as exc:
             logger.error("sendDocument: %s", exc)
@@ -1337,7 +1343,7 @@ DEMO_MESSAGES = (
     "/rates",                                # курсы валют из базы (в демо — без API)
     "/d",                                    # все записи в валюте чата по курсу на дату
     "/settle",                               # взаимозачёт: минимум переводов
-    "/export",                               # TXT-файл с записями чата (копия таблицы debts)
+    "/export",                               # CSV-файл с записями чата (копия таблицы debts)
     "/debts",
     "/undo",                                 # убираем последний счёт или запись
     "/currency BYN",
@@ -1359,9 +1365,9 @@ DEMO_MEMBERS = (
 )
 
 
-def describe_reply(reply: str | TxtReport) -> str:
+def describe_reply(reply: str | CsvReport) -> str:
     """Ответ для консоли (--demo): текст как есть, отчёт — имя файла и первые строки."""
-    return reply.preview() if isinstance(reply, TxtReport) else reply
+    return reply.preview() if isinstance(reply, CsvReport) else reply
 
 
 def run_demo() -> int:

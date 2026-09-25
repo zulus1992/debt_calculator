@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import io
 import json
 import unittest
@@ -20,8 +21,8 @@ from supabase import ClientOptions, create_client
 
 from bot import (
     DebtBot,
+    CsvReport,
     HeuristicParser,
-    TxtReport,
     addressing,
     clean_bot_mention,
     handle_text,
@@ -89,7 +90,13 @@ from storage import (
     scale_rate,
     unscale_rate,
 )
-from telegram_api import MAX_CAPTION_LENGTH, TelegramBot, TelegramError, split_message
+from telegram_api import (
+    CSV_DOCUMENT_TYPE,
+    MAX_CAPTION_LENGTH,
+    TelegramBot,
+    TelegramError,
+    split_message,
+)
 from webhook import SECRET_HEADER, LazyWebhookApp, WebhookApp, build_app
 
 CHAT = 555
@@ -387,6 +394,18 @@ class AccessAndConfigTests(unittest.TestCase):
         self.assertIn("ключ задан", with_key.rates_source)
         self.assertIsNotNone(Settings(rates_open_url="").rates_problem())
 
+    def test_supabase_retries_setting(self) -> None:
+        self.assertEqual(load_settings({}, use_env_file=False).supabase_retries, 2)
+        self.assertEqual(load_settings(
+            {"SUPABASE_RETRIES": "4"}, use_env_file=False).supabase_retries, 4)
+        self.assertEqual(load_settings(
+            {"SUPABASE_RETRIES": "0"}, use_env_file=False).supabase_retries, 0)
+        # мусор и значения вне 0–10 не ломают настройку: берём значение по умолчанию
+        self.assertEqual(load_settings(
+            {"SUPABASE_RETRIES": "много"}, use_env_file=False).supabase_retries, 2)
+        self.assertEqual(load_settings(
+            {"SUPABASE_RETRIES": "99"}, use_env_file=False).supabase_retries, 2)
+
 
 class TelegramHelpersTests(unittest.TestCase):
     """Вспомогательные функции Telegram-клиента."""
@@ -409,6 +428,7 @@ class FakeTelegram:
         self.updates = list(updates)
         self.sent: list[tuple[int, str]] = []
         self.documents: list[tuple[int, str, str]] = []
+        self.document_types: list[str] = []
         self.offsets: list[int | None] = []
 
     def get_me(self) -> dict:
@@ -426,9 +446,11 @@ class FakeTelegram:
         return [{}]
 
     def send_document(self, chat_id, filename: str, content: str, *, caption: str = "",
-                      reply_to=None, silent: bool = False) -> dict:
-        """Запоминает отправленный файл (TXT-отчёт)."""
+                      reply_to=None, silent: bool = False,
+                      content_type: str = "") -> dict:
+        """Запоминает отправленный файл (CSV-отчёт) и его тип."""
         self.documents.append((int(chat_id), filename, content))
+        self.document_types.append(content_type)
         return {}
 
     def send_typing(self, chat_id) -> None:
@@ -725,11 +747,15 @@ class FakeRestApi:
     """
 
     def __init__(self) -> None:
-        self.responses: list[FakeResponse] = []
+        self.responses: list[FakeResponse | Exception] = []
         self.calls: list[dict[str, Any]] = []
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
-        """Запоминает запрос и отдаёт следующий заготовленный ответ."""
+        """Запоминает запрос и отдаёт следующий заготовленный ответ.
+
+        Если в `responses` лежит исключение (например, httpx.ReadTimeout) — транспорт
+        «падает» на этом запросе: так проверяется поведение хранилища при сетевом сбое.
+        """
         self.calls.append({
             "method": request.method,
             "url": str(request.url.copy_with(query=None)),
@@ -738,6 +764,8 @@ class FakeRestApi:
             "headers": {name.lower(): value for name, value in request.headers.items()},
         })
         response = self.responses.pop(0) if self.responses else FakeResponse([])
+        if isinstance(response, Exception):
+            raise response
         return httpx.Response(response.status_code, json=response.json(),
                               headers={"Content-Range": "0-0/1"})
 
@@ -1010,6 +1038,50 @@ class SupabaseStorageTests(unittest.TestCase):
         with self.assertRaises(StorageError) as ctx:
             create_supabase_client("не-урл", "sb_secret_abc")
         self.assertIn("клиент Supabase", str(ctx.exception))
+
+    def build_storage(self, **kwargs: Any) -> SupabaseStorage:
+        """Хранилище поверх подменённого транспорта; паузы между повторами нулевые."""
+        kwargs.setdefault("retries", 2)
+        kwargs.setdefault("retry_delay", 0.0)
+        return SupabaseStorage("https://example.supabase.co", "service-key",
+                               client=self.session.client(), **kwargs)
+
+    def test_timeout_is_retried(self) -> None:
+        # Таймаут ответа — не ошибка данных: запрос повторяем (в логе это выглядело как
+        # «внутренняя ошибка», хотя через секунду база отвечала нормально).
+        storage = self.build_storage()
+        self.session.responses = [httpx.ReadTimeout("The read operation timed out"),
+                                  FakeResponse([])]
+        self.assertEqual(storage.list_debts(7), [])
+        self.assertEqual(len(self.session.calls), 2)
+
+    def test_broken_connection_is_explained(self) -> None:
+        storage = self.build_storage()
+        self.session.responses = [httpx.ConnectError("connection refused")] * 3
+        with self.assertRaises(StorageError) as ctx:
+            storage.list_debts(7)
+        text = str(ctx.exception)
+        self.assertIn("Связь с Supabase оборвалась", text)
+        self.assertIn("повторяли 3 раз", text)
+        self.assertIn("--check", text)
+        self.assertEqual(len(self.session.calls), 3)
+
+    def test_retries_can_be_disabled(self) -> None:
+        storage = self.build_storage(retries=0)
+        self.session.responses = [httpx.ReadTimeout("The read operation timed out")] * 3
+        with self.assertRaises(StorageError) as ctx:
+            storage.list_debts(7)
+        self.assertIn("не ответил вовремя", str(ctx.exception))
+        self.assertEqual(len(self.session.calls), 1)
+
+    def test_insert_is_not_repeated_to_avoid_doubles(self) -> None:
+        # Повтор обычной вставки создал бы второй долг: о сбое честно сообщаем.
+        storage = self.build_storage()
+        self.session.responses = [httpx.ReadTimeout("The read operation timed out")] * 3
+        with self.assertRaises(StorageError) as ctx:
+            storage.add_debt(7, "Леша", "Дима", "BYN", 3)
+        self.assertIn("/debts", str(ctx.exception))
+        self.assertEqual(len(self.session.calls), 1)
 
 
 class SupabaseKeyValidationTests(unittest.TestCase):
@@ -2958,7 +3030,12 @@ class SettleCommandTests(unittest.TestCase):
 
 
 class DebtsDumpTests(unittest.TestCase):
-    """TXT-выгрузка: файл копирует строки таблицы debts этого чата."""
+    """CSV-выгрузка: файл копирует строки таблицы debts этого чата."""
+
+    @staticmethod
+    def rows(dump: str) -> list[list[str]]:
+        """Разбирает отчёт как CSV — так его читают Excel, Google Sheets и скрипты."""
+        return list(csv.reader(io.StringIO(dump)))
 
     def test_dump_has_header_columns_and_row(self) -> None:
         debts = [
@@ -2967,37 +3044,40 @@ class DebtsDumpTests(unittest.TestCase):
                  to_user_id=102, currency="BYN", amount=3.0, kind="debt",
                  raw_text="Леша должен Диме 3 рубля"),
         ]
-        lines = format_debts_dump(debts, CHAT).splitlines()
-        self.assertEqual(lines[0], f"# Выгрузка таблицы debts: chat_id={CHAT}, записей: 1")
-        self.assertEqual(lines[1], "\t".join(DEBTS_DUMP_COLUMNS))
-        cells = lines[2].split("\t")
-        self.assertEqual(cells[:5], ["1", "2026-09-21T10:00:00+00:00", str(CHAT),
-                                     "Леша Козлов", "Дмитрий Болт"])
-        self.assertEqual(cells[5:9], ["101", "102", "BYN", "3.00"])
-        self.assertEqual(cells[11], "Леша должен Диме 3 рубля")
+        rows = self.rows(format_debts_dump(debts))
+        self.assertEqual(rows[0], list(DEBTS_DUMP_COLUMNS))     # первая строка — колонки
+        self.assertEqual(rows[1][:5], ["1", "2026-09-21T10:00:00+00:00", str(CHAT),
+                                       "Леша Козлов", "Дмитрий Болт"])
+        self.assertEqual(rows[1][5:9], ["101", "102", "BYN", "3.00"])
+        self.assertEqual(rows[1][11], "Леша должен Диме 3 рубля")
 
     def test_empty_dump_keeps_columns(self) -> None:
-        dump = format_debts_dump([], CHAT)
-        self.assertIn(f"chat_id={CHAT}, записей: 0", dump)
-        self.assertIn("raw_text", dump)
-        self.assertTrue(dump.endswith("\n"))     # файл заканчивается переводом строки
+        dump = format_debts_dump([])
+        self.assertEqual(self.rows(dump), [list(DEBTS_DUMP_COLUMNS)])
+        self.assertTrue(dump.endswith("\r\n"))     # файл заканчивается переводом строки
 
     def test_missing_fields_stay_empty(self) -> None:
-        cells = format_debts_dump([make_debt("Леша", "Дима", 0.5)], CHAT).splitlines()[2].split("\t")
+        cells = self.rows(format_debts_dump([make_debt("Леша", "Дима", 0.5)]))[1]
         self.assertEqual(cells[0], "")           # id у записи не задан
         self.assertEqual(cells[10], "")          # group_id у обычного долга пустой
         self.assertEqual(cells[8], "0.50")       # сумма как в таблице: два знака
 
-    def test_newlines_in_message_do_not_break_rows(self) -> None:
-        debt = Debt(chat_id=CHAT, from_name="Леша", to_name="Дима", currency="BYN",
-                    amount=3.5, raw_text="Леша должен\nДиме 3,5")
-        dump = format_debts_dump([debt], CHAT)
-        self.assertEqual(len(dump.splitlines()), 3)       # шапка, колонки, одна запись
-        self.assertIn("Леша должен\\nДиме 3,5", dump)      # перенос строки экранирован
+    def test_quotes_commas_and_newlines_are_escaped(self) -> None:
+        # Кавычка, запятая и перенос строки внутри значения не разрывают запись: csv берёт
+        # поле целиком в кавычки, а кавычки внутри удваивает («"» → «""»).
+        debt = Debt(chat_id=CHAT, from_name='Леша "Лёха"', to_name="Дима", currency="BYN",
+                    amount=3.5, raw_text='Леша должен\nДиме 3,5 — сказал "ок"')
+        dump = format_debts_dump([debt])
+        self.assertIn('"Леша ""Лёха"""', dump)
+        self.assertIn('""ок""', dump)
+        rows = self.rows(dump)
+        self.assertEqual(len(rows), 2)                 # запись осталась одной строкой таблицы
+        self.assertEqual(rows[1][3], 'Леша "Лёха"')
+        self.assertEqual(rows[1][11], 'Леша должен\nДиме 3,5 — сказал "ок"')
 
 
 class ExportCommandTests(unittest.TestCase):
-    """/export: бот отдаёт записи чата файлом TXT — и только этого чата."""
+    """/export: бот отдаёт записи чата файлом CSV — и только этого чата."""
 
     def setUp(self) -> None:
         self.settings = Settings(default_currency="BYN")
@@ -3005,28 +3085,38 @@ class ExportCommandTests(unittest.TestCase):
         self.parser = HeuristicParser()
         self.members = seed_chat(self.storage)     # без /reg записи не сохраняются
 
-    def send(self, text: str) -> str | TxtReport:
+    def send(self, text: str) -> str | CsvReport:
         """Отправляет сообщение боту (автор — Леша Козлов)."""
         return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
                            settings=self.settings, members=self.members, author=MEMBER_LEHA)
 
-    def test_export_sends_txt_copy_of_table(self) -> None:
+    @staticmethod
+    def rows(dump: str) -> list[list[str]]:
+        """Разбирает выгрузку как CSV: так её увидит Excel и прочитает скрипт."""
+        return list(csv.reader(io.StringIO(dump)))
+
+    def test_export_sends_csv_copy_of_table(self) -> None:
         self.send("Леша должен Диме 3 рубля")
         reply = self.send("/export")
-        self.assertIsInstance(reply, TxtReport)
-        self.assertEqual(reply.filename, f"debts_{CHAT}_{date.today().isoformat()}.txt")
-        self.assertIn("\t".join(DEBTS_DUMP_COLUMNS), reply.text)
-        self.assertIn("Леша Козлов\tДмитрий Болт\t101\t102\tBYN\t3.00\tdebt", reply.text)
-        self.assertIn("Леша должен Диме 3 рубля", reply.text)
+        self.assertIsInstance(reply, CsvReport)
+        self.assertEqual(reply.filename, f"debts_{CHAT}_{date.today().isoformat()}.csv")
+        self.assertEqual(reply.content_type, CSV_DOCUMENT_TYPE)
+        rows = self.rows(reply.text)
+        self.assertEqual(rows[0], list(DEBTS_DUMP_COLUMNS))
+        self.assertEqual(rows[1][3:9], ["Леша Козлов", "Дмитрий Болт", "101", "102",
+                                       "BYN", "3.00"])
+        self.assertEqual(rows[1][9], "debt")
+        self.assertIn("Леша должен Диме 3 рубля", rows[1][11])
         self.assertIn("записей 1", reply.caption)
 
     def test_export_uses_only_this_chat(self) -> None:
         self.send("Леша должен Диме 3 рубля")
         self.storage.add_debt(777, "Маша", "Оля", "BYN", 5.0, raw_text="Маша должна Оле 5")
         reply = self.send("/export")
-        self.assertIsInstance(reply, TxtReport)
+        self.assertIsInstance(reply, CsvReport)
         self.assertIn("Леша должен Диме 3 рубля", reply.text)
-        self.assertNotIn("\t777\t", reply.text)           # чужие записи в файл не попадают
+        # Колонка chat_id подтверждает: в файле только этот чат.
+        self.assertEqual({row[2] for row in self.rows(reply.text)[1:]}, {str(CHAT)})
         self.assertNotIn("Маша должна Оле", reply.text)
 
     def test_export_without_records_answers_with_message(self) -> None:
@@ -3037,7 +3127,7 @@ class ExportCommandTests(unittest.TestCase):
     def test_export_aliases(self) -> None:
         self.send("Леша должен Диме 3 рубля")
         for text in ("/report", "/txt", "/файл"):
-            self.assertIsInstance(self.send(text), TxtReport)
+            self.assertIsInstance(self.send(text), CsvReport)
 
     def test_help_mentions_export(self) -> None:
         self.assertIn("/export", self.send("/help"))
@@ -3071,9 +3161,13 @@ class ExportThroughBotTests(unittest.TestCase):
         self.assertEqual(len(telegram.documents), 1)
         chat_id, filename, content = telegram.documents[0]
         self.assertEqual(chat_id, 7)
-        self.assertEqual(filename, f"debts_7_{date.today().isoformat()}.txt")
-        self.assertIn("Леша Козлов", content)
-        self.assertIn("Леша должен Диме 3 рубля", content)
+        self.assertEqual(filename, f"debts_7_{date.today().isoformat()}.csv")
+        self.assertEqual(telegram.document_types, [CSV_DOCUMENT_TYPE])   # файл уходит таблицей
+        header, *rows = content.splitlines()
+        self.assertEqual(header, ",".join(DEBTS_DUMP_COLUMNS))   # первая строка — колонки
+        self.assertEqual(len(rows), 1)                           # одна запись
+        self.assertIn("Леша Козлов", rows[0])
+        self.assertIn("Леша должен Диме 3 рубля", rows[0])
 
     def test_nothing_to_export_goes_as_message(self) -> None:
         bot, _, telegram = self.build([make_update(5, "/export")])
@@ -3114,6 +3208,16 @@ class TelegramDocumentTests(unittest.TestCase):
         self.assertEqual(filename, "debts_7.txt")
         self.assertEqual(content.decode("utf-8"), "строка\nвторая")
         self.assertIn("text/plain", content_type)
+
+    def test_csv_document_goes_as_table(self) -> None:
+        # Выгрузка /export должна приезжать таблицей (text/csv), а не текстом.
+        self.session.responses = [FakeResponse({"ok": True, "result": {"message_id": 5}})]
+        self.bot.send_document(7, "debts_7.csv", "id,amount\r\n1,3.00\r\n",
+                               content_type=CSV_DOCUMENT_TYPE)
+        filename, content, content_type = self.session.calls[0]["files"]["document"]
+        self.assertEqual(filename, "debts_7.csv")
+        self.assertEqual(content_type, CSV_DOCUMENT_TYPE)
+        self.assertEqual(content.decode("utf-8"), "id,amount\r\n1,3.00\r\n")
 
     def test_caption_is_trimmed_to_limit(self) -> None:
         self.session.responses = [FakeResponse({"ok": True, "result": {"message_id": 5}})]

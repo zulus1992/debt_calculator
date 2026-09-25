@@ -11,6 +11,7 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 MAX_MESSAGE_LENGTH = 4096
 MAX_CAPTION_LENGTH = 1024   # лимит подписи к документу в Bot API
 TEXT_DOCUMENT_TYPE = "text/plain; charset=utf-8"
+CSV_DOCUMENT_TYPE = "text/csv; charset=utf-8"   # выгрузка /export: копия таблицы debts
 
 
 class TelegramError(RuntimeError):
@@ -166,12 +167,15 @@ class TelegramBot:
         caption: str = "",
         reply_to: int | None = None,
         silent: bool = False,
+        content_type: str = TEXT_DOCUMENT_TYPE,
     ) -> dict[str, Any]:
-        """Отправляет файл документом (multipart/form-data): TXT-отчёты по долгам.
+        """Отправляет файл документом (multipart/form-data): отчёты по долгам.
 
         Telegram не принимает файл JSON-ом, поэтому содержимое уходит полем `document`
         вместе с остальными параметрами запроса. Подпись (caption) обрезается по лимиту
         Bot API — длинный текст запроса всё равно лёг бы ошибкой 400.
+        `content_type` — тип файла для Telegram и принимающей стороны: выгрузка `/export`
+        уходит как `text/csv` (CSV_DOCUMENT_TYPE), чтобы её открывали таблицей, а не текстом.
         """
         payload = content.encode("utf-8") if isinstance(content, str) else bytes(content)
         data: dict[str, Any] = {"chat_id": chat_id}
@@ -182,7 +186,7 @@ class TelegramBot:
             data["allow_sending_without_reply"] = "true"
         if silent:
             data["disable_notification"] = "true"
-        files = {"document": (filename, payload, TEXT_DOCUMENT_TYPE)}
+        files = {"document": (filename, payload, content_type)}
         return dict(self._request("sendDocument", data=data, files=files) or {})
 
     def send_typing(self, chat_id: int | str) -> None:
