@@ -110,6 +110,14 @@ def _api_error_message(exc: Exception) -> str:
             "Таблица не найдена: выполните db/schema.sql в Supabase → SQL Editor "
             f"(ответ PostgREST: {code or message})."
         )
+    if ("permission denied for schema" in blob or "permission denied for table" in blob
+            or "permission denied for relation" in blob):
+        return (
+            "У роли нет прав на данные: ключ принят, но Postgres отказал — "
+            f"{code or 'ошибка'}: {message}. Нужны права (GRANT) для роли service_role, "
+            "которой соответствует secret-ключ: выполните db/grants.sql в Supabase → "
+            "SQL Editor. Проверить: python bot.py --check."
+        )
     if (code in ("401", "403") or code in KEY_PROBLEM_CODES or "jwt" in blob
             or "api key" in blob or "permission denied" in blob or "row-level security" in blob):
         return (

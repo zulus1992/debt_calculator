@@ -23,6 +23,7 @@ Telegram → bot.py ── DeepSeek (chat/completions, JSON) ──► {"from":"
 | `rates.py` | курсы валют ExchangeRate-API: загрузка раз в день в 12:00 по Минску, хранение, пересчёт по дате записи |
 | `config.py` | настройки из `.env` и переменных окружения |
 | `db/schema.sql` | таблицы `debts`, `chat_members`, `currency_rates`, `bot_settings`, `bot_state`, RLS, индексы |
+| `db/grants.sql` | права для роли `service_role` (если база отвечает `permission denied for schema public`) |
 | `tests/test_pipeline.py` | тесты без внешних сервисов (`unittest`) |
 
 Зависимости — `requests` (Telegram Bot API, DeepSeek, курсы валют) и `supabase` (официальный

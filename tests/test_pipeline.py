@@ -975,6 +975,18 @@ class SupabaseStorageTests(unittest.TestCase):
         self.assertFalse(is_new_api_key("eyJhbGciOi.jwt.sig"))
         self.assertFalse(is_new_api_key(""))
 
+    def test_schema_permission_error_points_to_grants(self) -> None:
+        # Ключ принят, но роли не хватает прав на схему: подсказываем db/grants.sql.
+        self.session.responses = [FakeResponse({
+            "message": "permission denied for schema public", "code": "42501",
+            "hint": None, "details": None,
+        }, status=403)]
+        with self.assertRaises(StorageError) as ctx:
+            self.storage.list_debts(7)
+        text = str(ctx.exception)
+        self.assertIn("grants.sql", text)
+        self.assertIn("service_role", text)
+
     def test_write_probe_allows_valid_key(self) -> None:
         self.session.responses = [FakeResponse([])]
         self.assertEqual(self.storage.check_write_access(), "")
