@@ -32,6 +32,7 @@ from bot import (
 from config import (
     ConfigError,
     Settings,
+    describe_supabase_key,
     jwt_role,
     load_settings,
     supabase_key_problem,
@@ -82,6 +83,7 @@ from storage import (
     StorageError,
     SupabaseStorage,
     create_supabase_client,
+    is_new_api_key,
     scale_rate,
     unscale_rate,
 )
@@ -745,6 +747,19 @@ class FakeRestApi:
                 transport=httpx.MockTransport(self._handle), timeout=5.0)),
         )
 
+    def client_via_sdk(self, key: str, url: str = "https://example.supabase.co"):
+        """Клиент, собранный боевым create_supabase_client, но с подменённым транспортом.
+
+        PostgREST-клиент SDK создаёт лениво (при первом обращении к `table()`), поэтому
+        подменить транспорт можно сразу после создания клиента — и проверить в том числе
+        правку заголовков, которую делает наш create_supabase_client.
+        """
+        client = create_supabase_client(url, key, 5.0)
+        client.options.httpx_client = httpx.Client(
+            transport=httpx.MockTransport(self._handle), timeout=5.0,
+        )
+        return client
+
 
 class TelegramClientTests(unittest.TestCase):
     """Сетевой слой Telegram: проверяем содержимое запросов.
@@ -898,25 +913,61 @@ class SupabaseStorageTests(unittest.TestCase):
             self.storage.list_debts(1)
         self.assertIn("schema.sql", str(ctx.exception))
 
-    def test_key_is_sent_to_postgrest(self) -> None:
-        # Ключ подставляет SDK: он сам кладёт его в заголовки запроса к PostgREST.
+    def test_rls_error_shows_postgrest_text(self) -> None:
+        # Текст от PostgREST важен: по нему видно, что именно отклонила база.
+        self.session.responses = [FakeResponse({
+            "message": 'new row violates row-level security policy for table "debts"',
+            "code": "42501", "hint": None, "details": None,
+        }, status=403)]
+        with self.assertRaises(StorageError) as ctx:
+            self.storage.add_debt(7, "Леша", "Дима", "BYN", 3)
+        text = str(ctx.exception)
+        self.assertIn("row-level security", text)
+        self.assertIn("service_role", text)
+        self.assertIn("--check", text)
+
+    def test_new_key_is_not_sent_as_bearer(self) -> None:
+        # supabase-py кладёт ключ ещё и в Authorization, а Supabase принимает ключи нового
+        # формата только в apikey: иначе запрос уходит от роли anon, и запись ловит RLS (42501).
         storage = SupabaseStorage("https://example.supabase.co", "sb_secret_abc",
-                                  client=self.session.client("sb_secret_abc"))
+                                  client=self.session.client_via_sdk("sb_secret_abc"))
         self.session.responses = [FakeResponse([])]
         storage.list_debts(7)
         headers = self.session.calls[0]["headers"]
         self.assertEqual(headers["apikey"], "sb_secret_abc")
-        self.assertEqual(headers["authorization"], "Bearer sb_secret_abc")
+        self.assertNotIn("authorization", headers)
 
-    def test_legacy_jwt_is_sent_the_same_way(self) -> None:
-        # Legacy service_role — тоже ключ: SDK шлёт его так же, роль задаёт значение ключа.
-        storage = SupabaseStorage("https://example.supabase.co", "eyJhbGciOi.legacy.sig",
-                                  client=self.session.client("eyJhbGciOi.legacy.sig"))
+    def test_legacy_key_is_sent_in_both_headers(self) -> None:
+        # Legacy service_role — обычный JWT: роль service_role задаёт именно Authorization.
+        legacy = "eyJhbGciOi.legacy.sig"
+        storage = SupabaseStorage("https://example.supabase.co", legacy,
+                                  client=self.session.client_via_sdk(legacy))
         self.session.responses = [FakeResponse([])]
         storage.list_debts(7)
         headers = self.session.calls[0]["headers"]
-        self.assertEqual(headers["apikey"], "eyJhbGciOi.legacy.sig")
-        self.assertEqual(headers["authorization"], "Bearer eyJhbGciOi.legacy.sig")
+        self.assertEqual(headers["apikey"], legacy)
+        self.assertEqual(headers["authorization"], f"Bearer {legacy}")
+
+    def test_is_new_api_key_detection(self) -> None:
+        self.assertTrue(is_new_api_key("sb_secret_abc"))
+        self.assertTrue(is_new_api_key("  sb_publishable_abc  "))
+        self.assertFalse(is_new_api_key("eyJhbGciOi.jwt.sig"))
+        self.assertFalse(is_new_api_key(""))
+
+    def test_write_probe_allows_valid_key(self) -> None:
+        self.session.responses = [FakeResponse([])]
+        self.assertEqual(self.storage.check_write_access(), "")
+        call = self.session.calls[0]
+        self.assertEqual(call["method"], "PATCH")
+        self.assertTrue(call["params"]["key"].startswith("eq.__check_"))
+        self.assertEqual(call["payload"], {"value": "check"})   # строка не совпадёт ни с одной
+
+    def test_write_probe_reports_denied_key(self) -> None:
+        self.session.responses = [FakeResponse({
+            "message": "permission denied for table bot_state", "code": "42501",
+            "hint": None, "details": None,
+        }, status=403)]
+        self.assertIn("service_role", self.storage.check_write_access())
 
     def test_client_uses_configured_timeout(self) -> None:
         client = create_supabase_client("https://example.supabase.co", "sb_secret_abc", 42.0)
@@ -1029,6 +1080,14 @@ class SupabaseKeyValidationTests(unittest.TestCase):
 
     def test_spaces_and_quotes_around_key_are_tolerated(self) -> None:
         self.assertIsNone(supabase_key_problem("  'sb_secret_abc123'  "))
+
+    def test_key_description(self) -> None:
+        self.assertIn("secret", describe_supabase_key("sb_secret_abc"))
+        self.assertIn("публичный", describe_supabase_key("sb_publishable_abc"))
+        self.assertIn("service_role", describe_supabase_key(self.make_jwt("service_role")))
+        self.assertIn("anon", describe_supabase_key(self.make_jwt("anon")))
+        self.assertIn("не задан", describe_supabase_key(""))
+        self.assertIn("неизвестного", describe_supabase_key("просто-строка"))
 
 
 class LongPollingTests(unittest.TestCase):

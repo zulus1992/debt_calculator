@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -26,19 +27,37 @@ class StorageError(RuntimeError):
 TABLE_MISSING_CODES = ("PGRST205", "42P01")
 KEY_PROBLEM_CODES = ("PGRST301", "42501")
 
+# Ключи нового формата Supabase (sb_publishable_…/sb_secret_…) — не JWT: их передают только
+# в заголовке apikey, а в `Authorization: Bearer` они не аутентифицируют запрос
+# (Supabase → API keys → «Known limitations»; в supabase-js за это отвечает omitApiKeyAsBearer).
+# supabase-py этого не учитывает и подставляет ключ в оба заголовка, поэтому для новых ключей
+# Authorization убираем сами: иначе PostgREST выполняет запрос от роли anon, и запись
+# отклоняет RLS (Postgres 42501 — «new row violates row-level security policy»).
+NEW_API_KEY_PREFIXES = ("sb_publishable_", "sb_secret_")
+
+
+def is_new_api_key(key: str) -> bool:
+    """Ключ нового формата Supabase: он должен уходить только в заголовке apikey."""
+    return str(key or "").strip().lower().startswith(NEW_API_KEY_PREFIXES)
+
 
 def create_supabase_client(url: str, key: str, timeout: float = 30.0) -> Client:
     """Создаёт клиент официального SDK supabase-py.
 
-    Ключ (secret sb_secret_… или legacy service_role) SDK сам подставляет в заголовки
-    запросов — вручную ничего добавлять не нужно. Таймаут задаётся для PostgREST: бот
-    обращается только к нему, а по умолчанию SDK ждёт ответа 120 секунд — для ответа
-    в Telegram это слишком долго.
+    Таймаут задаётся для PostgREST: бот обращается только к нему, а по умолчанию SDK ждёт
+    ответа 120 секунд — для ответа в Telegram это слишком долго. Для ключей нового формата
+    убираем заголовок Authorization (см. NEW_API_KEY_PREFIXES): SDK кладёт ключ и туда,
+    хотя Supabase такие ключи принимает только в apikey.
     """
     try:
-        return create_client(url, key, options=ClientOptions(postgrest_client_timeout=timeout))
+        client = create_client(url, key, options=ClientOptions(postgrest_client_timeout=timeout))
     except SupabaseException as exc:
         raise StorageError(f"Не удалось создать клиент Supabase: {exc}") from exc
+    if is_new_api_key(key):
+        # PostgREST-клиент SDK собирает лениво (при первом table()) из options.headers,
+        # поэтому правку заголовков достаточно сделать сразу после создания клиента.
+        client.options.headers.pop("Authorization", None)
+    return client
 
 
 def _api_error_message(exc: Exception) -> str:
@@ -67,7 +86,9 @@ def _api_error_message(exc: Exception) -> str:
             or "api key" in blob or "permission denied" in blob or "row-level security" in blob):
         return (
             "Supabase отклонил ключ или доступ: нужен secret-ключ базы (sb_secret_…) или "
-            f"legacy service_role — с anon/publishable запись блокирует RLS ({code or message})."
+            "legacy service_role — с publishable/anon запрос уходит от роли anon, и запись "
+            f"блокирует RLS. Ответ PostgREST: {code or 'без кода'} — {message}. "
+            "Какой ключ используется, покажет: python bot.py --check."
         )
     return f"Supabase вернул ошибку {code or 'без кода'}: {message}"
 
@@ -605,6 +626,26 @@ class SupabaseStorage:
             on_conflict="key",
             returning="minimal",
         ))
+
+    def check_write_access(self) -> str:
+        """Проверяет, разрешает ли база запись этим ключом; "" — всё в порядке.
+
+        Делает настоящий PATCH по фильтру, который не совпадёт ни с одной строкой (имя
+        state-записи со случайным суффиксом), — данные не меняются, но видно, пускает ли
+        база запись. Так ловится частая ошибка настройки: в переменных окружения публичный
+        ключ (publishable/anon) вместо secret — PostgREST отвечает 42501, и бот не смог бы
+        записать ни один долг.
+        """
+        probe_key = f"__check_{uuid.uuid4().hex[:8]}"
+        try:
+            self._execute(
+                self._table(self._state_table)
+                .update({"value": "check"})
+                .eq("key", probe_key)
+            )
+        except StorageError as exc:
+            return str(exc)
+        return ""
 
 
 @dataclass

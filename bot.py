@@ -39,6 +39,7 @@ from config import (
     ConfigError,
     DEFAULT_RATES_HOUR,
     Settings,
+    describe_supabase_key,
     load_settings,
     require_settings,
     webhook_secret_problem,
@@ -1266,6 +1267,7 @@ def check_services(settings: Settings) -> bool:
 
     try:
         storage = _storage_for(settings)
+        print(f"• Ключ базы: {describe_supabase_key(settings.supabase_key)}")
         debts = storage.list_debts(0)
         print(f"✓ Supabase: таблица {settings.debts_table} доступна (пробный запрос: {len(debts)} строк)")
         storage.get_default_currency(0, settings.default_currency)
@@ -1275,6 +1277,12 @@ def check_services(settings: Settings) -> bool:
         rate_points = storage.rates_since(settings.rates_base, date.today().isoformat())
         print(f"✓ Supabase: таблица {settings.rates_table} доступна "
               f"(курсов на сегодня: {len(rate_points)})")
+        write_problem = storage.check_write_access()
+        if write_problem:
+            ok = False
+            print("✗ Supabase: запись отклонена —", write_problem)
+        else:
+            print("✓ Supabase: запись разрешена (проба ничего не меняет в базе)")
     except StorageError as exc:
         ok = False
         print("✗ Supabase:", exc)

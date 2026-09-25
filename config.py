@@ -291,6 +291,27 @@ def webhook_secret_problem(secret: str) -> str | None:
     return None
 
 
+def describe_supabase_key(key: str) -> str:
+    """Описывает ключ базы словами — для --check и диагностики «почему база отказывает».
+
+    Важно, какой это ключ: secret-ключ (и legacy service_role) пускают бота писать,
+    а публичный publishable/anon — нет: запрос выполняется от роли anon, и запись
+    отклоняет RLS (Postgres 42501).
+    """
+    value = _clean(key)
+    if not value:
+        return "не задан"
+    lowered = value.lower()
+    if lowered.startswith("sb_secret_"):
+        return "secret-ключ (sb_secret_…) — то, что нужно"
+    if lowered.startswith("sb_publishable_"):
+        return "публичный ключ (sb_publishable_…) — для сервера не годится: RLS не пустит запись"
+    role = jwt_role(value)
+    if role:
+        return f"legacy JWT с ролью «{role}»"
+    return "ключ неизвестного формата"
+
+
 def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = True) -> Settings:
     """Собирает настройки: аргумент -> окружение процесса -> .env -> значения по умолчанию."""
     source: Mapping[str, str] = os.environ if env is None else env
