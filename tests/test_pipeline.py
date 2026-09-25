@@ -31,6 +31,7 @@ from bot import (
 )
 from config import (
     ConfigError,
+    KEY_HEADER_MODES,
     Settings,
     describe_supabase_key,
     jwt_role,
@@ -84,6 +85,7 @@ from storage import (
     SupabaseStorage,
     create_supabase_client,
     is_new_api_key,
+    probe_key_headers,
     scale_rate,
     unscale_rate,
 )
@@ -739,22 +741,14 @@ class FakeRestApi:
         return httpx.Response(response.status_code, json=response.json(),
                               headers={"Content-Range": "0-0/1"})
 
-    def client(self, key: str = "service-key"):
-        """Клиент SDK с подменённым транспортом: реальная логика SDK, но без сети."""
-        return create_client(
-            "https://example.supabase.co", key,
-            options=ClientOptions(httpx_client=httpx.Client(
-                transport=httpx.MockTransport(self._handle), timeout=5.0)),
-        )
-
-    def client_via_sdk(self, key: str, url: str = "https://example.supabase.co"):
-        """Клиент, собранный боевым create_supabase_client, но с подменённым транспортом.
+    def client(self, key: str = "service-key", key_header: str = "apikey"):
+        """Клиент SDK, собранный боевым create_supabase_client, но с подменённым транспортом.
 
         PostgREST-клиент SDK создаёт лениво (при первом обращении к `table()`), поэтому
         подменить транспорт можно сразу после создания клиента — и проверить в том числе
-        правку заголовков, которую делает наш create_supabase_client.
+        правку заголовков, которую делает create_supabase_client.
         """
-        client = create_supabase_client(url, key, 5.0)
+        client = create_supabase_client("https://example.supabase.co", key, 5.0, key_header)
         client.options.httpx_client = httpx.Client(
             transport=httpx.MockTransport(self._handle), timeout=5.0,
         )
@@ -930,18 +924,45 @@ class SupabaseStorageTests(unittest.TestCase):
         # supabase-py кладёт ключ ещё и в Authorization, а Supabase принимает ключи нового
         # формата только в apikey: иначе запрос уходит от роли anon, и запись ловит RLS (42501).
         storage = SupabaseStorage("https://example.supabase.co", "sb_secret_abc",
-                                  client=self.session.client_via_sdk("sb_secret_abc"))
+                                  client=self.session.client("sb_secret_abc", "apikey"))
         self.session.responses = [FakeResponse([])]
         storage.list_debts(7)
         headers = self.session.calls[0]["headers"]
         self.assertEqual(headers["apikey"], "sb_secret_abc")
         self.assertNotIn("authorization", headers)
 
+    def test_key_header_both_keeps_authorization(self) -> None:
+        # Режим "both" (SUPABASE_KEY_HEADER) нужен нестандартным шлюзам: там роль берут
+        # из Authorization, и ключ оставляем в обоих заголовках.
+        storage = SupabaseStorage("https://example.supabase.co", "sb_secret_abc",
+                                  key_header="both",
+                                  client=self.session.client("sb_secret_abc", "both"))
+        self.session.responses = [FakeResponse([])]
+        storage.list_debts(7)
+        headers = self.session.calls[0]["headers"]
+        self.assertEqual(headers["apikey"], "sb_secret_abc")
+        self.assertEqual(headers["authorization"], "Bearer sb_secret_abc")
+
+    def test_probe_tries_both_header_modes(self) -> None:
+        self.session.responses = [
+            FakeResponse([]),
+            FakeResponse({"message": "permission denied for schema public", "code": "42501",
+                          "hint": None, "details": None}, status=403),
+        ]
+        results = probe_key_headers(
+            "https://example.supabase.co", "sb_secret_abc",
+            client_factory=lambda url, key, timeout, key_header: self.session.client(key, key_header),
+        )
+        self.assertEqual([title for title, _ in results], ["только apikey",
+                                                          "apikey + Authorization"])
+        self.assertIn("строк", results[0][1])
+        self.assertIn("permission denied", results[1][1])
+
     def test_legacy_key_is_sent_in_both_headers(self) -> None:
         # Legacy service_role — обычный JWT: роль service_role задаёт именно Authorization.
         legacy = "eyJhbGciOi.legacy.sig"
         storage = SupabaseStorage("https://example.supabase.co", legacy,
-                                  client=self.session.client_via_sdk(legacy))
+                                  client=self.session.client(legacy))
         self.session.responses = [FakeResponse([])]
         storage.list_debts(7)
         headers = self.session.calls[0]["headers"]
@@ -1088,6 +1109,17 @@ class SupabaseKeyValidationTests(unittest.TestCase):
         self.assertIn("anon", describe_supabase_key(self.make_jwt("anon")))
         self.assertIn("не задан", describe_supabase_key(""))
         self.assertIn("неизвестного", describe_supabase_key("просто-строка"))
+
+    def test_key_header_mode_defaults_and_validation(self) -> None:
+        self.assertEqual(load_settings({}, use_env_file=False).supabase_key_header, "apikey")
+        self.assertEqual(
+            load_settings({"SUPABASE_KEY_HEADER": " Both "}, use_env_file=False).supabase_key_header,
+            "both",
+        )
+        self.assertIn("both", KEY_HEADER_MODES)
+        bad = load_settings({"SUPABASE_KEY_HEADER": "bearer"}, use_env_file=False)
+        problems = " ".join(bad.problems())
+        self.assertIn("SUPABASE_KEY_HEADER", problems)
 
 
 class LongPollingTests(unittest.TestCase):

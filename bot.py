@@ -85,7 +85,7 @@ from rates import (
     update_rates,
     update_rates_scheduled,
 )
-from storage import ChatMember, InMemoryStorage, Storage, StorageError, SupabaseStorage
+from storage import ChatMember, InMemoryStorage, Storage, StorageError, SupabaseStorage, probe_key_headers
 from telegram_api import TelegramBot, TelegramError
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -826,6 +826,7 @@ def _storage_for(settings: Settings) -> SupabaseStorage:
         members_table=settings.members_table,
         rates_table=settings.rates_table,
         timeout=settings.request_timeout,
+        key_header=settings.supabase_key_header,
     )
 
 
@@ -1267,7 +1268,8 @@ def check_services(settings: Settings) -> bool:
 
     try:
         storage = _storage_for(settings)
-        print(f"• Ключ базы: {describe_supabase_key(settings.supabase_key)}")
+        print(f"• Ключ базы: {describe_supabase_key(settings.supabase_key)} "
+              f"(заголовки: {settings.supabase_key_header})")
         debts = storage.list_debts(0)
         print(f"✓ Supabase: таблица {settings.debts_table} доступна (пробный запрос: {len(debts)} строк)")
         storage.get_default_currency(0, settings.default_currency)
@@ -1286,6 +1288,15 @@ def check_services(settings: Settings) -> bool:
     except StorageError as exc:
         ok = False
         print("✗ Supabase:", exc)
+
+    # Если база отвечает «permission denied for schema public» (42501), дело в том, какие
+    # заголовки ждёт шлюз: показываем результат для обоих вариантов — видно, что выбрать
+    # в SUPABASE_KEY_HEADER.
+    print("• Проверка заголовков ключа (какой вариант принимает база):")
+    for title, result in probe_key_headers(
+            settings.supabase_url, settings.supabase_key,
+            table=settings.debts_table, timeout=settings.request_timeout):
+        print(f"  • {title} — {result}")
 
     rates_problem = settings.rates_problem()
     if rates_problem:

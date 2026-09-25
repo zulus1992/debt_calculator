@@ -41,23 +41,51 @@ def is_new_api_key(key: str) -> bool:
     return str(key or "").strip().lower().startswith(NEW_API_KEY_PREFIXES)
 
 
-def create_supabase_client(url: str, key: str, timeout: float = 30.0) -> Client:
+def create_supabase_client(url: str, key: str, timeout: float = 30.0,
+                           key_header: str = "apikey") -> Client:
     """Создаёт клиент официального SDK supabase-py.
 
     Таймаут задаётся для PostgREST: бот обращается только к нему, а по умолчанию SDK ждёт
-    ответа 120 секунд — для ответа в Telegram это слишком долго. Для ключей нового формата
-    убираем заголовок Authorization (см. NEW_API_KEY_PREFIXES): SDK кладёт ключ и туда,
-    хотя Supabase такие ключи принимает только в apikey.
+    ответа 120 секунд — для ответа в Telegram это слишком долго.
+
+    `key_header` определяет, в каких заголовках уходит ключ нового формата (sb_secret_…):
+    «apikey» (по умолчанию) — только apikey, как требует Supabase и как делает supabase-js;
+    «both» — оставить и Authorization: Bearer, как по умолчанию делает supabase-py (нужно на
+    нестандартных шлюзах, где роль выбирают по Authorization). Значения те же, что в
+    config.KEY_HEADER_MODES. Legacy-JWT всегда уходит в оба заголовка: роль service_role
+    задаёт именно Authorization.
     """
     try:
         client = create_client(url, key, options=ClientOptions(postgrest_client_timeout=timeout))
     except SupabaseException as exc:
         raise StorageError(f"Не удалось создать клиент Supabase: {exc}") from exc
-    if is_new_api_key(key):
+    if is_new_api_key(key) and str(key_header or "").lower() != "both":
         # PostgREST-клиент SDK собирает лениво (при первом table()) из options.headers,
         # поэтому правку заголовков достаточно сделать сразу после создания клиента.
         client.options.headers.pop("Authorization", None)
     return client
+
+
+def probe_key_headers(url: str, key: str, *, table: str = "debts", timeout: float = 30.0,
+                      client_factory: Any = None) -> list[tuple[str, str]]:
+    """Пробует оба режима заголовков и возвращает (название режима, результат) — для --check.
+
+    Так видно, почему база отвечает «permission denied for schema public» (42501): шлюз либо
+    принимает ключ только в apikey, либо ему нужен ещё и Authorization. Проба читает одну
+    строку из таблицы долгов и ничего не меняет.
+    """
+    make_client = client_factory or create_supabase_client
+    results: list[tuple[str, str]] = []
+    for title, key_header in (("только apikey", "apikey"), ("apikey + Authorization", "both")):
+        try:
+            client = make_client(url, key, timeout, key_header)
+            response = client.table(table).select("id").limit(1).execute()
+            results.append((title, f"база ответила, строк: {len(_rows(response))}"))
+        except PostgrestAPIError as exc:
+            results.append((title, f"{getattr(exc, 'code', '')}: {getattr(exc, 'message', exc)}"))
+        except Exception as exc:  # noqa: BLE001 — диагностика не должна падать целиком
+            results.append((title, f"не удалось: {exc}"))
+    return results
 
 
 def _api_error_message(exc: Exception) -> str:
@@ -308,6 +336,7 @@ class SupabaseStorage:
         members_table: str = "chat_members",
         rates_table: str = "currency_rates",
         timeout: float = 30.0,
+        key_header: str = "apikey",
         client: Client | None = None,
     ) -> None:
         """Готовит клиент SDK; при передаче готового `client` url и ключ не нужны (тесты)."""
@@ -321,7 +350,7 @@ class SupabaseStorage:
                     "Нужны SUPABASE_URL и ключ базы: SUPABASE_SECRET_KEY (sb_secret_…) "
                     "или legacy SUPABASE_SERVICE_KEY (service_role)."
                 )
-            self._client = create_supabase_client(url, key, timeout)
+            self._client = create_supabase_client(url, key, timeout, key_header)
         self._debts_table = debts_table
         self._settings_table = settings_table
         self._state_table = state_table

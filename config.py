@@ -37,6 +37,14 @@ DEFAULT_RATES_CURRENCIES = ("BYN", "RUB", "USD", "EUR", "CNY", "THB")
 # Во сколько по Минску (UTC+3) обновлять курсы: раз в день, без cron. 0–23.
 DEFAULT_RATES_HOUR = 12
 
+# Как передавать ключ базы в запросах к PostgREST:
+#   apikey — только заголовок apikey (так требует Supabase для ключей нового формата
+#            sb_secret_…/sb_publishable_… и так делает supabase-js);
+#   both   — плюс Authorization: Bearer с тем же ключом (поведение supabase-py по умолчанию;
+#            пригодится на нестандартных шлюзах/self-hosted, где роль выбирают по Authorization).
+KEY_HEADER_MODES = ("apikey", "both")
+DEFAULT_KEY_HEADER = "apikey"
+
 # Ключ доступа бота к базе. Новый формат — secret-ключ Supabase (sb_secret_…):
 # Project Settings → API Keys → «Publishable and secret API keys» → Secret keys.
 # Прежние имена (SUPABASE_SERVICE_KEY, SUPABASE_KEY) и legacy-ключи service_role работают.
@@ -76,6 +84,8 @@ class Settings:
     supabase_url: str = ""
     # Ключ базы: SUPABASE_SECRET_KEY (sb_secret_…) или legacy service_role
     supabase_key: str = ""
+    # Как ключ уходит в запросах: apikey (по умолчанию) или apikey + Authorization
+    supabase_key_header: str = DEFAULT_KEY_HEADER
     debts_table: str = DEFAULT_DEBTS_TABLE
     settings_table: str = DEFAULT_SETTINGS_TABLE
     state_table: str = DEFAULT_STATE_TABLE
@@ -153,6 +163,12 @@ class Settings:
             key_problem = supabase_key_problem(self.supabase_key)
             if key_problem:
                 issues.append(key_problem)
+        if self.supabase_key_header not in KEY_HEADER_MODES:
+            issues.append(
+                f"SUPABASE_KEY_HEADER: допустимы только {', '.join(KEY_HEADER_MODES)} "
+                f"(сейчас «{self.supabase_key_header}») — определяет, в каких заголовках "
+                "уходит ключ базы."
+            )
         return issues
 
 
@@ -338,6 +354,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         deepseek_model=get("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
         supabase_url=get("SUPABASE_URL").rstrip("/"),
         supabase_key=_supabase_key(get),
+        supabase_key_header=get("SUPABASE_KEY_HEADER", DEFAULT_KEY_HEADER).lower(),
         debts_table=get("DEBTS_TABLE", DEFAULT_DEBTS_TABLE),
         settings_table=get("SETTINGS_TABLE", DEFAULT_SETTINGS_TABLE),
         state_table=get("BOT_STATE_TABLE", DEFAULT_STATE_TABLE),
