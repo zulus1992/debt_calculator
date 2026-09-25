@@ -28,6 +28,8 @@ from bot import (
     HeuristicParser,
     addressing,
     clean_bot_mention,
+    commands_report,
+    declare_commands,
     demo_rates,
     handle_text,
     is_allowed,
@@ -39,6 +41,7 @@ from bot import (
     PASSWORD_REPLY,
     REGISTER_SELF_HINT,
     set_commands_mode,
+    set_webhook_mode,
     status_report,
 )
 from config import (
@@ -3788,6 +3791,134 @@ class RegisterCommandsTests(unittest.TestCase):
         self.assertIn("Ошибка", logged.getvalue())
 
 
+class RecordingCommandsTelegram:
+    """Подменяет Telegram в проверках списка команд: помнит объявленное и отдаёт своё."""
+
+    def __init__(self, *, declared: Sequence[tuple[str, str]] = (),
+                 error: Exception | None = None) -> None:
+        self.declared = list(declared)
+        self.error = error
+        self.commands: list[tuple[str, str]] = []
+
+    def set_my_commands(self, commands: Sequence[tuple[str, str]]) -> bool:
+        """Запоминает список команд вместо обращения к Bot API (или падает, как задано)."""
+        if self.error is not None:
+            raise self.error
+        self.commands = list(commands)
+        return True
+
+    def get_my_commands(self) -> list[tuple[str, str]]:
+        """То, что «уже лежит» в Telegram для getMyCommands."""
+        return list(self.declared)
+
+
+class WebhookCliTelegram(RecordingCommandsTelegram):
+    """Клиент CLI вебхука: setWebhook, getWebhookInfo и список команд."""
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        super().__init__(error=error)
+        self.url = ""
+
+    def set_webhook(self, url: str, *, secret_token: str | None = None,
+                    drop_pending_updates: bool = False,
+                    allowed_updates: Sequence[str] = ("message",),
+                    max_connections: int | None = None) -> bool:
+        """Запоминает адрес вместо обращения к Bot API."""
+        self.url = url
+        return True
+
+    def get_webhook_info(self) -> dict[str, Any]:
+        """Ответ Telegram на getWebhookInfo для только что установленного адреса."""
+        return {"url": self.url, "pending_update_count": 0}
+
+
+class TelegramWithoutCommands:
+    """Клиент без методов про список команд: чужая обёртка или старые тесты."""
+
+
+class CommandMenuDiagnosticsTests(unittest.TestCase):
+    """--check и --set-commands: видно, что Telegram знает о командах (меню «/»)."""
+
+    def test_declare_commands_sends_the_list(self) -> None:
+        telegram = RecordingCommandsTelegram()
+        self.assertEqual(declare_commands(telegram), "")
+        self.assertEqual(telegram.commands, list(BOT_COMMANDS))
+
+    def test_declare_commands_explains_telegram_error(self) -> None:
+        telegram = RecordingCommandsTelegram(error=TelegramError("Telegram недоступен"))
+        self.assertIn("Telegram недоступен", declare_commands(telegram))
+
+    def test_declare_commands_tolerates_client_without_method(self) -> None:
+        self.assertIn("не умеет", declare_commands(TelegramWithoutCommands()))
+
+    def test_report_confirms_same_list(self) -> None:
+        lines = commands_report(RecordingCommandsTelegram(declared=BOT_COMMANDS))
+        self.assertEqual(len(lines), 1)
+        self.assertIn("как в боте", lines[0])
+        self.assertIn(str(len(BOT_COMMANDS)), lines[0])
+
+
+    def test_report_shows_how_to_fix_empty_list(self) -> None:
+        """Пустой список в Telegram — самая частая причина «не вижу меню «/»»."""
+        report = " ".join(commands_report(RecordingCommandsTelegram()))
+        self.assertIn("список пуст", report)
+        self.assertIn("python bot.py --set-commands", report)
+
+    def test_report_shows_counts_for_stale_list(self) -> None:
+        report = " ".join(commands_report(
+            RecordingCommandsTelegram(declared=[("help", "старое описание")])))
+        self.assertIn("объявлено 1", report)
+        self.assertIn(str(len(BOT_COMMANDS)), report)
+        self.assertIn("python bot.py --set-commands", report)
+
+    def test_report_survives_telegram_error(self) -> None:
+        class Broken(RecordingCommandsTelegram):
+            def get_my_commands(self) -> list[tuple[str, str]]:
+                raise TelegramError("Telegram недоступен")
+
+        self.assertIn("не удалось", " ".join(commands_report(Broken())))
+
+    def test_report_is_silent_without_method(self) -> None:
+        self.assertEqual(commands_report(TelegramWithoutCommands()), [])
+
+    def test_set_commands_mode_prints_the_list(self) -> None:
+        telegram = RecordingCommandsTelegram()
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = set_commands_mode(Settings(), telegram=telegram)
+        self.assertEqual(code, 0)
+        self.assertEqual(telegram.commands, list(BOT_COMMANDS))
+        self.assertIn("объявлены в Telegram", printed.getvalue())
+        self.assertIn("/reg", printed.getvalue())
+
+    def test_set_commands_mode_reports_telegram_error(self) -> None:
+        telegram = RecordingCommandsTelegram(error=TelegramError("Telegram недоступен"))
+        with contextlib.redirect_stderr(io.StringIO()) as logged:
+            code = set_commands_mode(Settings(), telegram=telegram)
+        self.assertEqual(code, 1)
+        self.assertIn("Telegram недоступен", logged.getvalue())
+
+    def test_webhook_switch_declares_commands(self) -> None:
+        """--set-webhook объявляет список команд: в вебхуке запуска бота нет."""
+        telegram = WebhookCliTelegram()
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = set_webhook_mode(Settings(webhook_secret=TEST_SECRET),
+                                    "https://example.test/api/telegram", telegram=telegram)
+        self.assertEqual(code, 0)
+        self.assertEqual(telegram.url, "https://example.test/api/telegram")
+        self.assertEqual(telegram.commands, list(BOT_COMMANDS))
+        self.assertIn("Команды (меню «/»)", printed.getvalue())
+
+    def test_webhook_switch_survives_command_failure(self) -> None:
+        """Список команд — удобство: не объявился, но вебхук всё равно установлен."""
+        telegram = WebhookCliTelegram(error=TelegramError("слишком много запросов"))
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = set_webhook_mode(Settings(webhook_secret=TEST_SECRET),
+                                    "https://example.test/api/telegram", telegram=telegram)
+        self.assertEqual(code, 0)
+        self.assertIn("не удалось объявить", printed.getvalue())
+        self.assertIn("--set-commands", printed.getvalue())
+
+
 class TelegramCommandsApiTests(unittest.TestCase):
     """setMyCommands: список команд уходит одним JSON-запросом с описаниями."""
 
@@ -3809,6 +3940,21 @@ class TelegramCommandsApiTests(unittest.TestCase):
         self.session.responses = [FakeResponse({"ok": False, "description": "bad"}, status=400)]
         with self.assertRaises(TelegramError):
             self.bot.set_my_commands([("settle", "зачёт")])
+
+    def test_get_my_commands_returns_pairs(self) -> None:
+        """getMyCommands: что Telegram знает о командах, — пары «команда — описание»."""
+        self.session.responses = [FakeResponse({"ok": True, "result": [
+            {"command": "help", "description": "что я умею"},
+            {"command": "reg", "description": "регистрация"},
+        ]})]
+        self.assertEqual(self.bot.get_my_commands(),
+                         [("help", "что я умею"), ("reg", "регистрация")])
+        self.assertTrue(self.session.calls[0]["url"].endswith("/getMyCommands"))
+
+    def test_get_my_commands_without_list(self) -> None:
+        """Бот без объявленных команд: пустой список, а не ошибка."""
+        self.session.responses = [FakeResponse({"ok": True, "result": []})]
+        self.assertEqual(self.bot.get_my_commands(), [])
 
 
 if __name__ == "__main__":

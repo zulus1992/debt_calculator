@@ -98,6 +98,19 @@ class TelegramBot:
         self.call("setMyCommands", commands=payload)
         return True
 
+    def get_my_commands(self) -> list[tuple[str, str]]:
+        """Что Telegram знает о командах бота: пары «команда — описание» (getMyCommands).
+
+        Нужно для диагностики (`python bot.py --check`): меню «/» и нажимаемые команды
+        в ответах собираются только из объявленного списка, поэтому важно видеть, что
+        именно Telegram уже принял, а не догадываться по поведению чата.
+        """
+        result = self.call("getMyCommands")
+        return [
+            (str(item.get("command") or ""), str(item.get("description") or ""))
+            for item in result or []
+        ]
+
     def get_updates(
         self,
         offset: int | None = None,

@@ -3,14 +3,15 @@
 
 Режимы:
     python bot.py            # постоянный процесс (long polling), ответы мгновенно — для хостинга
-    python bot.py --check    # проверить настройки и доступность сервисов
+    python bot.py --check    # проверить настройки, сервисы и объявленный список команд
     python bot.py --demo     # демонстрация без Telegram (в памяти, офлайн-разбор)
     python bot.py --rates    # обновить курсы валют вручную (--rates --force — заново за сегодня)
     python bot.py --set-commands  # объявить в Telegram список команд (меню «/»)
 
-Список команд уходит в Telegram при запуске (setMyCommands): команды видны в меню «/»,
-а те, что бот советует в ответах (/reg и /login), нажимаемые — тапнуть, и команда
-встанет в строку ввода. Для режима вебхука список объявляется вручную: --set-commands.
+Список команд уходит в Telegram при запуске (setMyCommands), при --set-webhook и вручную
+(--set-commands): команды видны в меню «/» (в личном чате кнопка у поля ввода, в группе
+список появляется после «/»), а те, что бот советует в ответах (/reg и /login), нажимаемые.
+Что именно Telegram уже знает о командах, показывает --check.
 
 Курсы валют подтягиваются сами раз в день в 12:00 по Минску (RATES_HOUR): постоянный процесс
 проверяет расписание сам, а режим вебхука — при первом апдейте после назначенного часа.
@@ -1062,17 +1063,15 @@ class DebtBot:
         ввода. Делается один раз при запуске и только как удобство: если Telegram
         не ответил, бот всё равно работает, поэтому пишем в лог и продолжаем.
         """
-        try:
-            self._telegram.set_my_commands(BOT_COMMANDS)
-        except TelegramError as exc:
-            logger.warning("Не удалось обновить список команд в Telegram: %s", exc)
-            return
-        except AttributeError:
+        problem = declare_commands(self._telegram)
+        if not problem:
+            logger.info("Список команд обновлён в Telegram: %d", len(BOT_COMMANDS))
+        elif problem == NO_COMMANDS_METHOD:
             # Подменённый клиент (тесты, кастомная обёртка) без setMyCommands:
             # без объявленного списка команд бот отвечает как обычно.
             logger.debug("Клиент Telegram не умеет объявлять команды — пропускаю.")
-            return
-        logger.info("Список команд обновлён в Telegram: %d", len(BOT_COMMANDS))
+        else:
+            logger.warning("Не удалось обновить список команд в Telegram: %s", problem)
 
     def run(self, poll_timeout: int = 25, max_updates: int | None = None) -> int:
         """Постоянный режим (long polling): ответы приходят мгновенно.
@@ -1298,8 +1297,65 @@ def _telegram_for(settings: Settings) -> TelegramBot:
     return TelegramBot(settings.telegram_token, timeout=settings.request_timeout)
 
 
-def set_webhook_mode(settings: Settings, url: str, *, drop_pending: bool = False) -> int:
-    """Команда --set-webhook: Telegram сам присылает апдейты на наш HTTPS-эндпоинт."""
+# Признак «у клиента нет метода setMyCommands» (тесты, чужая обёртка): это не сбой —
+# без объявленного списка бот работает как обычно, просто меню «/» не появится.
+NO_COMMANDS_METHOD = "клиент Telegram не умеет объявлять список команд"
+
+
+def declare_commands(telegram: Any) -> str:
+    """Объявляет в Telegram список команд бота: "" — получилось, иначе текст проблемы.
+
+    Общая часть для запуска (DebtBot._register_commands), --set-commands и --set-webhook:
+    список один (BOT_COMMANDS) — и для меню «/», и для нажимаемых команд в ответах.
+    Исключение наружу не отдаём: список команд — удобство, а не условие работы,
+    поэтому вызывающий сам решает, что делать с текстом проблемы.
+    """
+    try:
+        telegram.set_my_commands(BOT_COMMANDS)
+    except TelegramError as exc:
+        return str(exc)
+    except AttributeError:
+        return NO_COMMANDS_METHOD
+    return ""
+
+
+def commands_report(telegram: Any) -> list[str]:
+    """Что Telegram знает о командах бота: строки для `python bot.py --check`.
+
+    Меню «/» и нажимаемые команды в ответах берутся только из объявленного списка,
+    поэтому проверка показывает и его: «объявлено — как в боте» либо подсказку
+    с командой, которая объявит список заново. Это предупреждение, а не ошибка:
+    сам бот отвечает и без списка команд — теряется лишь удобство.
+    """
+    try:
+        declared = telegram.get_my_commands()
+    except TelegramError as exc:
+        return [f"⚠ Команды (меню «/»): список прочитать не удалось — {exc}"]
+    except AttributeError:
+        return []
+    declared_pairs = [(str(name), str(description)) for name, description in declared]
+    if declared_pairs == [tuple(item) for item in BOT_COMMANDS]:
+        return [f"✓ Команды (меню «/»): объявлено {len(declared_pairs)} — как в боте"]
+    if not declared_pairs:
+        return [
+            "⚠ Команды (меню «/»): в Telegram список пуст — в чате не будет ни меню «/»,",
+            "  ни нажимаемых команд (/reg, /login). Объявить: python bot.py --set-commands",
+        ]
+    return [
+        f"⚠ Команды (меню «/»): в Telegram объявлено {len(declared_pairs)}, "
+        f"а бот предлагает {len(BOT_COMMANDS)}",
+        "  Обновить список: python bot.py --set-commands",
+    ]
+
+
+def set_webhook_mode(settings: Settings, url: str, *, drop_pending: bool = False,
+                     telegram: Any = None) -> int:
+    """Команда --set-webhook: Telegram сам присылает апдейты на наш HTTPS-эндпоинт.
+
+    Заодно объявляет список команд (меню «/» и нажимаемые команды в ответах): в режиме
+    вебхука постоянный процесс не запускается, и объявлять список больше некому.
+    Клиента можно подменить — тесты проверяют это без сети.
+    """
     url = (url or "").strip()
     if not url.startswith("https://"):
         print(
@@ -1314,19 +1370,27 @@ def set_webhook_mode(settings: Settings, url: str, *, drop_pending: bool = False
         print("Ошибка:", secret_problem, file=sys.stderr)
         return 1
     try:
-        telegram = _telegram_for(settings)
-        telegram.set_webhook(
+        client = telegram if telegram is not None else _telegram_for(settings)
+        client.set_webhook(
             url,
             secret_token=settings.webhook_secret,
             drop_pending_updates=drop_pending,
         )
-        info = telegram.get_webhook_info()
+        info = client.get_webhook_info()
     except (ConfigError, TelegramError) as exc:
         print("Ошибка:", exc, file=sys.stderr)
         return 1
 
     print("✓ Вебхук установлен:", info.get("url"))
     print(f"  ожидает апдейтов: {info.get('pending_update_count', 0)}")
+    # В режиме вебхука `python bot.py` не запускается, поэтому список команд объявляем
+    # здесь: иначе в чате не будет ни меню «/», ни нажимаемых /reg и /login.
+    problem = declare_commands(client)
+    if problem:
+        print("⚠ Список команд (меню «/») не удалось объявить:", problem)
+        print("  Повторите: python bot.py --set-commands")
+    else:
+        print(f"✓ Команды (меню «/») объявлены: {len(BOT_COMMANDS)}")
     print("  Теперь напишите боту — ответ придёт за 1–3 секунды (задержка = запрос к DeepSeek).")
     print("  Вернуться на long polling: python bot.py --delete-webhook")
     print("  ⚠ Постоянный процесс (`python bot.py`) должен быть остановлен:")
@@ -1394,24 +1458,29 @@ def show_webhook_info(settings: Settings) -> int:
     return 0
 
 
-def set_commands_mode(settings: Settings) -> int:
+def set_commands_mode(settings: Settings, *, telegram: Any = None) -> int:
     """Команда --set-commands: объявляет в Telegram список команд бота.
 
     Нужна для режима вебхука (там `python bot.py` не запускается) и чтобы обновить
     меню «/» вручную. Из-за объявленного списка Telegram подсвечивает команды
     в ответах бота как нажимаемые — /reg и /login можно тапнуть, и команда
-    встанет в строку ввода.
+    встанет в строку ввода. Клиента можно подменить — тесты проверяют это без сети.
     """
     try:
-        _telegram_for(settings).set_my_commands(BOT_COMMANDS)
+        client = telegram if telegram is not None else _telegram_for(settings)
     except (ConfigError, TelegramError) as exc:
         print("Ошибка:", exc, file=sys.stderr)
         return 1
 
+    problem = declare_commands(client)
+    if problem:
+        print("Ошибка:", problem, file=sys.stderr)
+        return 1
+
     print(f"✓ Команды бота объявлены в Telegram: {len(BOT_COMMANDS)}")
     print("  " + ", ".join(f"/{name}" for name, _ in BOT_COMMANDS))
-    print("  Наберите «/» в поле ввода — список появится в меню,")
-    print("  а команды из ответов бота станут нажимаемыми (например, /reg и /login).")
+    print("  Список виден, когда наберёте «/» в поле ввода (в личном чате с ботом там же")
+    print("  кнопка меню), а команды из ответов бота станут нажимаемыми — /reg и /login.")
     return 0
 
 
@@ -1437,8 +1506,6 @@ def check_services(settings: Settings) -> bool:
                   "«/debts@...» или ответ на моё сообщение")
         else:
             print("• REQUIRE_MENTION=0 — в группах отвечаю на любое сообщение")
-        print("• Список команд (меню «/») объявляется при запуске бота; "
-              "вручную: python bot.py --set-commands")
         info = telegram.get_webhook_info()
         url = str(info.get("url") or "")
         if url:
@@ -1455,6 +1522,9 @@ def check_services(settings: Settings) -> bool:
         else:
             print("• Telegram: вебхук не установлен — режим: python bot.py (long polling)")
             print("  включить вебхук: python bot.py --set-webhook https://<домен>/api/telegram")
+        for line in commands_report(telegram):
+            # Меню «/» и нажимаемые команды в ответах существуют ровно по этому списку.
+            print(line)
     except TelegramError as exc:
         ok = False
         print("✗ Telegram:", exc)
