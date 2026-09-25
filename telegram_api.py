@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import requests
 
@@ -78,6 +78,26 @@ class TelegramBot:
     def get_me(self) -> dict[str, Any]:
         """Данные бота: проверка токена и имени."""
         return dict(self.call("getMe") or {})
+
+    def set_my_commands(self, commands: Sequence[tuple[str, str]]) -> bool:
+        """Объявляет список команд бота (setMyCommands): меню «/» и кликабельные команды.
+
+        Telegram показывает этот список в меню рядом с полем ввода, а команды из него
+        подсвечивает в сообщениях бота как нажимаемые: по подсказке «Итог: /settle»
+        в ответе о записи можно тапнуть — команда встанет в строку ввода, набирать её
+        руками не нужно. Поэтому команда, которую бот советует текстом, должна быть
+        в этом списке.
+
+        Названия команд Telegram принимает только строчными латинскими буквами, цифрами
+        и «_» (до 32 символов), поэтому слэш и регистр снимаем сами: список один —
+        и для меню, и для сообщений.
+        """
+        payload = [
+            {"command": str(name).strip().lstrip("/").lower(), "description": str(description)}
+            for name, description in commands
+        ]
+        self.call("setMyCommands", commands=payload)
+        return True
 
     def get_updates(
         self,

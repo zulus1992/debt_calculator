@@ -6,6 +6,11 @@
     python bot.py --check    # проверить настройки и доступность сервисов
     python bot.py --demo     # демонстрация без Telegram (в памяти, офлайн-разбор)
     python bot.py --rates    # обновить курсы валют вручную (--rates --force — заново за сегодня)
+    python bot.py --set-commands  # объявить в Telegram список команд (меню «/»)
+
+Список команд уходит в Telegram при запуске (setMyCommands): команды видны в меню «/»,
+а в ответах бота они нажимаемые — подсказку «Итог: /settle» можно тапнуть, и команда
+встанет в строку ввода. Для режима вебхука список объявляется вручную: --set-commands.
 
 Курсы валют подтягиваются сами раз в день в 12:00 по Минску (RATES_HOUR): постоянный процесс
 проверяет расписание сам, а режим вебхука — при первом апдейте после назначенного часа.
@@ -54,6 +59,7 @@ from debts import (
     format_expense_saved,
     format_help,
     format_members_report,
+    format_person_report,
     format_registered,
     format_repayment_saved,
     format_transfers,
@@ -82,6 +88,7 @@ from rates import (
     format_used_rates,
     history_start,
     rate_table,
+    rates_day,
     update_rates,
     update_rates_scheduled,
 )
@@ -147,6 +154,32 @@ RATES_HISTORY_DAYS = 30
 DEMO_PREVIEW_LINES = 8
 # Команды выгрузки записей файлом CSV: копия строк таблицы debts этого чата.
 EXPORT_COMMANDS = ("/export", "/report", "/txt", "/файл")
+# Команда личных итогов: «сколько должен я и сколько должны мне» — только про автора.
+MY_DEBTS_COMMANDS = ("/mydebts", "/me", "/мои")
+# Команда диагностики: сервисы, курсы и настройки чата — ответ приходит в чат.
+STATUS_COMMANDS = ("/status", "/статус", "/диагностика")
+
+# Список команд для меню Telegram (setMyCommands): то же, что в /help, только коротко.
+# Из-за этого списка команды видны в меню «/», а в ответах бота Telegram подсвечивает
+# их как нажимаемые: подсказку «Итог: /settle» можно тапнуть, и команда встанет
+# в строку ввода — вручную набирать не нужно. Регистрация — при запуске бота
+# и вручную: python bot.py --set-commands.
+BOT_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("help", "что я умею и как записывать долги"),
+    ("reg", "регистрация участника: /reg Имя, кличка"),
+    ("who", "кто в чате и кто уже зарегистрирован"),
+    ("mydebts", "мои долги: сколько должен я и сколько должны мне"),
+    ("debts", "все долги чата с взаимозачётом"),
+    ("settle", "минимум переводов, чтобы все долги закрылись"),
+    ("d", "все записи в валюте чата по курсу на дату записи"),
+    ("rates", "курсы валют и дата обновления"),
+    ("export", "выгрузить записи чата файлом CSV"),
+    ("currency", "валюта по умолчанию: /currency BYN"),
+    ("undo", "удалить последнюю запись"),
+    ("reset", "удалить все записи этого чата"),
+    ("status", "статус: база, курсы, ключ ИИ и настройки чата"),
+    ("password", "прислать пароль чата, если он задан"),
+)
 
 
 @dataclass(frozen=True)
@@ -361,6 +394,84 @@ def settle_report(chat_id: int, storage: Storage, settings: Settings,
         lines.append("• Без курса оставил: " + ", ".join(sorted(set(converted.skipped))))
     if update.problems:
         lines.append("⚠️ " + "; ".join(update.problems[:2]))
+    return "\n".join(lines)
+
+
+def my_debts_report(chat_id: int, storage: Storage, members: Sequence[ChatMember],
+                    author: ChatMember | None, chat_currency: str) -> str:
+    """Команда /mydebts: личные итоги автора — сколько он должен и сколько должны ему.
+
+    В отличие от /debts это не отчёт по всему чату: считаем только записи самого
+    человека (по его user id) и показываем, в какую сторону он должен и сколько.
+    """
+    try:
+        debts = storage.list_debts(chat_id)
+    except StorageError as exc:
+        return f"⚠️ Проблема с базой данных: {exc}"
+    return format_person_report(debts, members, author, chat_currency)
+
+
+def status_report(chat_id: int, storage: Storage, settings: Settings,
+                  chat_currency: str = "BYN") -> str:
+    """Команда /status: что настроено и отвечают ли сервисы — диагностика прямо в чате.
+
+    Проверяем то, из-за чего чат обычно «не работает»: доступна ли база (по ней же
+    считаем записи и участников), есть ли курсы на сегодня, задан ли ключ DeepSeek
+    и какие правила действуют в этом чате. Секреты не показываем — только «задан/нет»:
+    ответ приходит в общий чат, а не в консоль. Онлайн-проверки ИИ здесь нет —
+    для неё есть `python bot.py --check` (она тратит запрос к платному API).
+    """
+    lines = ["🩺 Статус бота", "", "📦 База данных:"]
+    debts: list[Any] = []
+    try:
+        debts = storage.list_debts(chat_id)
+        found = storage.list_members(chat_id)
+        registered = [member for member in found if member.is_registered]
+        lines.append(f"• ✅ отвечает: записей в этом чате {len(debts)}, "
+                     f"участников {len(found)} (зарегистрировано {len(registered)})")
+    except StorageError as exc:
+        lines.append(f"• ❌ не отвечает: {exc}")
+        lines.append("  Пока база недоступна, записи и отчёты работать не будут.")
+    if debts:
+        repayments = [debt for debt in debts if debt.is_repayment]
+        expenses = [debt for debt in debts if debt.is_expense]
+        # Общий счёт — это одна операция: доли объединяем по group_id (как /debts и /undo).
+        bills = {(debt.group_id or str(debt.id)) for debt in expenses}
+        lines.append(f"• в записях: возвратов {len(repayments)}, "
+                     f"общих счетов {len(bills)}")
+
+    base = str(settings.rates_base or "BYN").upper()
+    today = rates_day()
+    lines.append("")
+    lines.append("💱 Курсы валют:")
+    lines.append(f"• база: {base}, источник: {settings.rates_source}")
+    rates_problem = settings.rates_problem()
+    if rates_problem:
+        lines.append(f"• ⚠️ {rates_problem}")
+    try:
+        if storage.has_rates(today, base):
+            lines.append(f"• ✅ курсы на {today} в базе есть")
+        else:
+            lines.append(f"• ⚠️ курсов на {today} нет — обновить: /rates")
+    except StorageError as exc:
+        lines.append(f"• ❌ проверить не удалось: {exc}")
+
+    lines.append("")
+    lines.append("🤖 Разбор сообщений:")
+    if str(settings.deepseek_key or "").strip():
+        lines.append(f"• ✅ ключ DeepSeek задан, модель {settings.deepseek_model}")
+    else:
+        lines.append("• ⚠️ ключ DeepSeek не задан — разбираю офлайн-эвристиками")
+
+    lines.append("")
+    lines.append("⚙️ Этот чат:")
+    lines.append(f"• валюта записей: {chat_currency.upper()}")
+    lines.append("• в группах: отвечаю только на обращение" if settings.require_mention
+                 else "• в группах: отвечаю на любое сообщение")
+    lines.append("• пароль чата: задан — этот чат его подтвердил" if settings.password_required
+                 else "• пароль чата: не задан")
+    lines.append("")
+    lines.append("Проверить все сервисы из консоли: python bot.py --check")
     return "\n".join(lines)
 
 
@@ -640,12 +751,16 @@ def handle_text(
         return register_command(argument, storage, members, author)
     if command in ("/who", "/members"):
         return format_members_report(members)
+    if command in STATUS_COMMANDS:
+        return status_report(chat_id, storage, settings, default_currency)
     if command in ("/rates", "/rate"):
         return rates_report(storage, settings, default_currency)
     if command in ("/d", "/convert"):
         return converted_report(chat_id, storage, settings, members, default_currency)
     if command in ("/settle", "/offset", "/зачёт", "/зачет"):
         return settle_report(chat_id, storage, settings, members, default_currency)
+    if command in MY_DEBTS_COMMANDS:
+        return my_debts_report(chat_id, storage, members, author, default_currency)
     if command in EXPORT_COMMANDS:
         return debts_csv_report(chat_id, storage)
     if command == "/debts":
@@ -900,6 +1015,26 @@ class DebtBot:
         for problem in result.problems:
             logger.warning("Курсы: %s", problem)
 
+    def _register_commands(self) -> None:
+        """Объявляет список команд в Telegram: меню «/» и нажимаемые команды в ответах.
+
+        Благодаря этому списку Telegram подсвечивает команды в сообщениях бота как
+        ссылки — подсказку «Итог: /settle» можно тапнуть, и команда встанет в строку
+        ввода. Делается один раз при запуске и только как удобство: если Telegram
+        не ответил, бот всё равно работает, поэтому пишем в лог и продолжаем.
+        """
+        try:
+            self._telegram.set_my_commands(BOT_COMMANDS)
+        except TelegramError as exc:
+            logger.warning("Не удалось обновить список команд в Telegram: %s", exc)
+            return
+        except AttributeError:
+            # Подменённый клиент (тесты, кастомная обёртка) без setMyCommands:
+            # без объявленного списка команд бот отвечает как обычно.
+            logger.debug("Клиент Telegram не умеет объявлять команды — пропускаю.")
+            return
+        logger.info("Список команд обновлён в Telegram: %d", len(BOT_COMMANDS))
+
     def run(self, poll_timeout: int = 25, max_updates: int | None = None) -> int:
         """Постоянный режим (long polling): ответы приходят мгновенно.
 
@@ -915,6 +1050,7 @@ class DebtBot:
             me.get("username"), me.get("id"), offset,
         )
         self._install_signal_handlers()
+        self._register_commands()                 # меню «/» и нажимаемые команды в ответах
         processed = 0
         try:
             while not self._stop:
@@ -1219,6 +1355,27 @@ def show_webhook_info(settings: Settings) -> int:
     return 0
 
 
+def set_commands_mode(settings: Settings) -> int:
+    """Команда --set-commands: объявляет в Telegram список команд бота.
+
+    Нужна для режима вебхука (там `python bot.py` не запускается) и чтобы обновить
+    меню «/» вручную. Из-за объявленного списка Telegram подсвечивает команды
+    в ответах бота как нажимаемые — подсказку «Итог: /settle» можно тапнуть,
+    и команда встанет в строку ввода.
+    """
+    try:
+        _telegram_for(settings).set_my_commands(BOT_COMMANDS)
+    except (ConfigError, TelegramError) as exc:
+        print("Ошибка:", exc, file=sys.stderr)
+        return 1
+
+    print(f"✓ Команды бота объявлены в Telegram: {len(BOT_COMMANDS)}")
+    print("  " + ", ".join(f"/{name}" for name, _ in BOT_COMMANDS))
+    print("  Наберите «/» в поле ввода — список появится в меню,")
+    print("  а команды из ответов бота станут нажимаемыми (например, «Итог: /settle»).")
+    return 0
+
+
 def check_services(settings: Settings) -> bool:
     """Проверяет настройки и доступность Telegram, DeepSeek и Supabase."""
     print("Проверка настроек и сервисов")
@@ -1241,6 +1398,8 @@ def check_services(settings: Settings) -> bool:
                   "«/debts@...» или ответ на моё сообщение")
         else:
             print("• REQUIRE_MENTION=0 — в группах отвечаю на любое сообщение")
+        print("• Список команд (меню «/») объявляется при запуске бота; "
+              "вручную: python bot.py --set-commands")
         info = telegram.get_webhook_info()
         url = str(info.get("url") or "")
         if url:
@@ -1344,6 +1503,8 @@ DEMO_MESSAGES = (
     "/d",                                    # все записи в валюте чата по курсу на дату
     "/settle",                               # взаимозачёт: минимум переводов
     "/export",                               # CSV-файл с записями чата (копия таблицы debts)
+    "/mydebts",                              # личные итоги: сколько должен я и должны мне
+    "/status",                               # диагностика: база, курсы, ключ ИИ, настройки
     "/debts",
     "/undo",                                 # убираем последний счёт или запись
     "/currency BYN",
@@ -1462,6 +1623,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="показать, как Telegram доставляет апдейты (вебхук или getUpdates)",
     )
     parser.add_argument(
+        "--set-commands",
+        action="store_true",
+        help="объявить в Telegram список команд бота (меню «/» и нажимаемые команды)",
+    )
+    parser.add_argument(
         "--drop-pending",
         action="store_true",
         help="вместе с --set-webhook/--delete-webhook: выбросить накопившиеся апдейты",
@@ -1488,6 +1654,8 @@ def main(argv: list[str] | None = None) -> int:
         return delete_webhook_mode(settings, drop_pending=args.drop_pending)
     if args.webhook_info:
         return show_webhook_info(settings)
+    if args.set_commands:
+        return set_commands_mode(settings)
 
     try:
         require_settings(settings)

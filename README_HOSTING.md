@@ -48,6 +48,7 @@ HTTPS-запросом на наш эндпоинт (`webhook.py`, WSGI). Не �
    ```powershell
    python bot.py --set-webhook https://<проект>.vercel.app/api/telegram
    python bot.py --webhook-info                     # должно быть: url, pending 0, без ошибок
+   python bot.py --set-commands                     # команды бота в меню «/» (один раз)
    ```
 5. Написать боту «Леша должен Диме 3 рубля» — ответ за 1–3 секунды.
 
@@ -303,7 +304,7 @@ python bot.py                             # постоянный процесс 
 
 Локально перед загрузкой полезно прогнать проверки:
 ```powershell
-python -m unittest tests.test_pipeline   # 263 теста, без внешних сервисов
+python -m unittest tests.test_pipeline   # 338 тестов, без внешних сервисов
 python bot.py --check                    # проверка ключей и сервисов
 ```
 

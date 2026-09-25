@@ -225,9 +225,99 @@ def totals_by_person(
     )
 
 
-def _money_by_currency(values: dict[str, float]) -> str:
+def _money_by_currency(values: Mapping[str, float]) -> str:
     """«3.00 BYN, 10.00 USD» из словаря валют."""
     return ", ".join(f"{amount:.2f} {code}" for code, amount in sorted(values.items()))
+
+
+def person_balances(
+    debts: Sequence[Debt], members: Sequence[ChatMember] = (),
+    *, user_id: int | None = None, name: str = "",
+) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
+    """Личные итоги человека: (сколько он должен, сколько должны ему) — по людям и валютам.
+
+    Как и в отчёте чата, записи сворачиваются, но только вокруг одного человека:
+    «Леша должен Диме 3» и «Дима вернул Леше 1» → Леша должен Диме 2.00. Считаем по
+    парам «человек ↔ другой» и по валютам, поэтому человек, которому должны в одной
+    валюте и который должен в другой, попадёт в оба блока — в отличие от /settle,
+    где валюты всё равно сводятся к валюте чата.
+
+    Ключи результата — подписи людей («Дмитрий Болт (@bdzmity)»), значения — суммы
+    по валютам. Человек определяется по user id, а без него — по имени (`identity_of`).
+    """
+    labels = person_labels(debts, members)
+    person = identity_of(user_id, name)
+    # Ключ (человек, валюта) -> сумма в пользу этого человека: плюс — ему должны.
+    net: dict[tuple[str, str], float] = defaultdict(float)
+    for debt in debts:
+        debtor = identity_of(debt.from_user_id, debt.from_name)
+        creditor = identity_of(debt.to_user_id, debt.to_name)
+        if not person or not debtor or not creditor or debtor == creditor:
+            continue
+        currency = (debt.currency or "BYN").upper()
+        amount = float(debt.amount) * (-1.0 if debt.is_repayment else 1.0)
+        if creditor == person:
+            net[(debtor, currency)] += amount
+        elif debtor == person:
+            net[(creditor, currency)] -= amount
+
+    owes: dict[str, dict[str, float]] = {}
+    owed: dict[str, dict[str, float]] = {}
+    for (other, currency), amount in net.items():
+        if amount < -0.005:
+            owes.setdefault(_label(labels, other), {})[currency] = round(-amount, 2)
+        elif amount > 0.005:
+            owed.setdefault(_label(labels, other), {})[currency] = round(amount, 2)
+    return owes, owed
+
+
+def _total_by_currency(values: Mapping[str, Mapping[str, float]]) -> str:
+    """«4.00 BYN, 10.00 USD» — итог по людям из словаря {подпись: {валюта: сумма}}."""
+    totals: dict[str, float] = defaultdict(float)
+    for per_currency in values.values():
+        for code, amount in per_currency.items():
+            totals[code] += amount
+    return _money_by_currency(dict(totals))
+
+
+def format_person_report(debts: Sequence[Debt], members: Sequence[ChatMember] = (),
+                         person: ChatMember | None = None,
+                         default_currency: str = "BYN") -> str:
+    """Ответ /mydebts: «сколько я должен и сколько должны мне» — лично про одного человека.
+
+    Два блока — «вы должны» и «вам должны» — с итогом по каждому: в чате сразу видно,
+    в какую сторону человек должен и сколько именно, без разбора общего отчёта.
+    """
+    if person is None:
+        return (
+            "🤔 Не вижу, кто вы: у сообщения нет автора.\n"
+            "Напишите что-нибудь в чат от себя и повторите /mydebts."
+        )
+    if not debts:
+        return (f"📭 Записей нет — вы никому не должны и вам никто не должен "
+                f"(валюта по умолчанию: {default_currency}).")
+
+    owes, owed = person_balances(debts, members, user_id=person.user_id,
+                                 name=person.display_name)
+    lines = [f"👤 Мои долги — {person.label}", ""]
+    if not owes and not owed:
+        lines.append("🎉 Чисто: вы никому не должны и вам никто не должен.")
+        return "\n".join(lines)
+    if owes:
+        lines.append("🔴 Вы должны:")
+        lines.extend(f"• {label}: {_money_by_currency(values)}"
+                     for label, values in sorted(owes.items()))
+        lines.append(f"Всего должны: {_total_by_currency(owes)}")
+    if owed:
+        if owes:
+            lines.append("")
+        lines.append("🟢 Вам должны:")
+        lines.extend(f"• {label}: {_money_by_currency(values)}"
+                     for label, values in sorted(owed.items()))
+        lines.append(f"Всего должны вам: {_total_by_currency(owed)}")
+    lines.append("")
+    lines.append("Весь чат и зачёт: /settle")
+    return "\n".join(lines)
 
 
 def format_debt_saved(debt: Debt, members: Sequence[ChatMember] = ()) -> str:
@@ -529,10 +619,13 @@ def format_help(default_currency: str = "BYN") -> str:
         "   Оригинал сообщения сохраняю в записи, а /undo убирает весь счёт целиком.",
         "",
         "4. Показать и посчитать долги (с взаимозачётом):",
-        "   /debts или «покажи долги»",
+        "   /debts или «покажи долги» — весь чат",
+        "   /mydebts — только про вас: сколько должны вы и сколько должны вам",
         "",
         "5. Взаимозачёт: кто кому сколько переводит, чтобы всё закрылось:",
         "   /settle — минимум переводов (если A→B и B→C, то A платит C)",
+        "   Подсказку «Итог: /settle» в ответе о записи можно нажать — команда",
+        "   подставится в строку ввода.",
         "",
         "6. Привести всё к валюте чата по курсу на дату записи:",
         "   /d — все долги в одной валюте по курсу того дня, когда их записали",
@@ -547,6 +640,10 @@ def format_help(default_currency: str = "BYN") -> str:
         "10. Выгрузить записи чата файлом CSV (копия таблицы debts):",
         "   /export — бот пришлёт документ debts_<id чата>_<дата>.csv со всеми записями",
         "   (внутри файла кавычки, запятые и переносы строк в значениях экранированы)",
+        "",
+        "11. Проверить, всё ли в порядке — /status:",
+        "   отвечает ли база, есть ли курсы на сегодня, задан ли ключ ИИ,",
+        "   валюта и режим обращения в этом чате.",
         "",
         "Если чат защищён паролем, пришлите его один раз: /password ваш-пароль.",
         "Данные хранятся в Supabase, отдельно по каждому чату.",

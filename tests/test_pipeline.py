@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import csv
 import io
 import json
+import re
 import unittest
 from dataclasses import replace
 from datetime import date, datetime, timedelta
@@ -20,15 +22,19 @@ import httpx
 from supabase import ClientOptions, create_client
 
 from bot import (
+    BOT_COMMANDS,
     DebtBot,
     CsvReport,
     HeuristicParser,
     addressing,
     clean_bot_mention,
+    demo_rates,
     handle_text,
     is_allowed,
     is_command_for_bot,
     mentions_bot,
+    set_commands_mode,
+    status_report,
 )
 from config import (
     ConfigError,
@@ -45,10 +51,13 @@ from debts import (
     SETTLE_HINT,
     format_debts_dump,
     format_debts_report,
+    format_help,
+    format_person_report,
     minimal_transfers,
     name_key,
     net_balances,
     normalize_name,
+    person_balances,
     split_amount,
     totals_by_person,
 )
@@ -3234,6 +3243,276 @@ class TelegramDocumentTests(unittest.TestCase):
         self.session.responses = [FakeResponse({"ok": False, "description": "bad"}, status=400)]
         with self.assertRaises(TelegramError):
             self.bot.send_document(7, "debts.txt", "строка")
+
+
+class PersonBalanceTests(unittest.TestCase):
+    """Личные итоги человека: взаимозачёт идёт только вокруг него самого."""
+
+    def test_owes_and_is_owed_are_separate_blocks(self) -> None:
+        debts = [make_debt("Леша", "Дима", 3), make_debt("Маша", "Леша", 5)]
+        owes, owed = person_balances(debts, name="Леша")
+        self.assertEqual(owes, {"Дима": {"BYN": 3.0}})
+        self.assertEqual(owed, {"Маша": {"BYN": 5.0}})
+
+    def test_repayment_nets_out(self) -> None:
+        debts = [make_debt("Леша", "Дима", 3), make_debt("Леша", "Дима", 1, kind="repayment")]
+        owes, owed = person_balances(debts, name="Леша")
+        self.assertEqual(owes, {"Дима": {"BYN": 2.0}})
+        self.assertEqual(owed, {})
+
+    def test_full_repayment_leaves_nothing(self) -> None:
+        debts = [make_debt("Леша", "Дима", 3), make_debt("Леша", "Дима", 3, kind="repayment")]
+        self.assertEqual(person_balances(debts, name="Леша"), ({}, {}))
+
+    def test_records_of_other_people_are_ignored(self) -> None:
+        self.assertEqual(person_balances([make_debt("Дима", "Маша", 5)], name="Леша"), ({}, {}))
+
+    def test_currencies_are_kept_separate(self) -> None:
+        debts = [make_debt("Леша", "Дима", 3, "BYN"), make_debt("Леша", "Дима", 10, "USD")]
+        owes, _ = person_balances(debts, name="Леша")
+        self.assertEqual(owes, {"Дима": {"BYN": 3.0, "USD": 10.0}})
+
+    def test_report_without_records(self) -> None:
+        self.assertIn("📭 Записей нет", format_person_report([], person=MEMBER_LEHA))
+
+    def test_report_without_author(self) -> None:
+        self.assertIn("Не вижу, кто вы",
+                      format_person_report([make_debt("Леша", "Дима", 3)]))
+
+
+class MyDebtsCommandTests(unittest.TestCase):
+    """Команда /mydebts: «сколько должен я и сколько должны мне» — только про автора."""
+
+    def setUp(self) -> None:
+        self.settings = Settings(default_currency="BYN")
+        self.storage = InMemoryStorage(default_currency="BYN")
+        self.parser = HeuristicParser()
+        self.members = seed_chat(self.storage)
+
+    def send(self, text: str, author: ChatMember | None = MEMBER_LEHA) -> str:
+        """Отправляет сообщение боту (по умолчанию пишет Леша Козлов) и отдаёт ответ."""
+        return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
+                           settings=self.settings, members=self.members, author=author)
+
+    def test_shows_what_i_owe(self) -> None:
+        self.send("Леша должен Диме 3 рубля")
+        reply = self.send("/mydebts")
+        self.assertIn("👤 Мои долги — Леша Козлов (@kozlovAlex)", reply)
+        self.assertIn("🔴 Вы должны:", reply)
+        self.assertIn("• Дмитрий Болт (@bdzmity): 3.00 BYN", reply)
+        self.assertIn("Всего должны: 3.00 BYN", reply)
+        self.assertNotIn("Вам должны", reply)
+
+    def test_shows_who_owes_me(self) -> None:
+        self.send("Дима должен Леше 5 рублей")
+        reply = self.send("/mydebts")
+        self.assertIn("🟢 Вам должны:", reply)
+        self.assertIn("• Дмитрий Болт (@bdzmity): 5.00 BYN", reply)
+        self.assertIn("Всего должны вам: 5.00 BYN", reply)
+        self.assertNotIn("🔴 Вы должны", reply)
+
+    def test_repayment_reduces_what_i_owe(self) -> None:
+        self.send("Леша должен Диме 3 рубля")
+        self.send("Леша вернул Диме 1 рубль")
+        self.assertIn("• Дмитрий Болт (@bdzmity): 2.00 BYN", self.send("/mydebts"))
+
+    def test_full_repayment_is_clean(self) -> None:
+        self.send("Леша должен Диме 3 рубля")
+        self.send("Леша вернул Диме 3 рубля")
+        self.assertIn("🎉 Чисто", self.send("/mydebts"))
+
+    def test_records_of_others_are_not_shown(self) -> None:
+        self.send("Дима должен Маше 5 рублей")            # Леша в записи не участвует
+        reply = self.send("/mydebts")
+        self.assertIn("🎉 Чисто", reply)
+        self.assertNotIn("Маша", reply)
+
+    def test_my_share_of_expense(self) -> None:
+        self.send("Дима заплатил 10 за всех")             # 10 делится на 5 зарегистрированных
+        self.assertIn("• Дмитрий Болт (@bdzmity): 2.00 BYN", self.send("/mydebts"))
+
+    def test_nothing_recorded(self) -> None:
+        self.assertIn("📭 Записей нет", self.send("/mydebts"))
+
+    def test_alias_me(self) -> None:
+        self.send("Леша должен Диме 3 рубля")
+        self.assertIn("Всего должны: 3.00 BYN", self.send("/me"))
+
+    def test_without_author_explains_itself(self) -> None:
+        self.assertIn("Не вижу, кто вы", self.send("/mydebts", author=None))
+
+    def test_help_mentions_mydebts(self) -> None:
+        self.assertIn("/mydebts", self.send("/help"))
+
+
+class BrokenStorage(InMemoryStorage):
+    """Хранилище, которое не отвечает: проверяем текст статуса при сбое базы."""
+
+    def list_debts(self, chat_id: int) -> list[Debt]:
+        """Имитация недоступной базы."""
+        raise StorageError("Supabase не ответил вовремя")
+
+
+class StatusCommandTests(unittest.TestCase):
+    """Команда /status: база, курсы, ключ ИИ и настройки чата — ответом в чат."""
+
+    def setUp(self) -> None:
+        self.storage = InMemoryStorage(default_currency="BYN")
+        self.members = seed_chat(self.storage)
+        self.parser = HeuristicParser()
+
+    def settings(self, **kwargs: Any) -> Settings:
+        """Настройки как в бою: курсы берутся из открытого эндпоинта (в сеть не ходим)."""
+        return Settings(default_currency="BYN",
+                        rates_open_url="https://open.er-api.com/v6", **kwargs)
+
+    def send(self, text: str, settings: Settings | None = None) -> str:
+        """Отправляет сообщение боту (автор — Леша Козлов) и отдаёт ответ."""
+        return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
+                           settings=settings or self.settings(), members=self.members,
+                           author=MEMBER_LEHA)
+
+    def test_reports_database_records_and_members(self) -> None:
+        self.send("Леша должен Диме 3 рубля")
+        reply = self.send("/status")
+        self.assertIn("🩺 Статус бота", reply)
+        self.assertIn("✅ отвечает: записей в этом чате 1", reply)
+        self.assertIn("участников 5 (зарегистрировано 5)", reply)
+
+    def test_counts_repayments_and_expenses(self) -> None:
+        self.send("Леша должен Диме 3 рубля")
+        self.send("Леша вернул Диме 1 рубль")
+        self.send("Дима заплатил 10 за всех")
+        reply = self.send("/status")
+        self.assertIn("возвратов 1", reply)
+        self.assertIn("общих счетов 1", reply)
+
+    def test_missing_rates_suggest_update(self) -> None:
+        self.assertIn(f"курсов на {rates_day()} нет — обновить: /rates", self.send("/status"))
+
+    def test_saved_rates_are_reported(self) -> None:
+        demo_rates(self.storage, rates_day())
+        self.assertIn(f"✅ курсы на {rates_day()} в базе есть", self.send("/status"))
+
+    def test_rates_source_problem_is_reported(self) -> None:
+        """Без ключа и без открытого эндпоинта курсы брать негде — это видно в статусе."""
+        reply = status_report(CHAT, self.storage, Settings(default_currency="BYN"), "BYN")
+        self.assertIn("⚠️ Не задан ни RATES_API_KEY", reply)
+
+    def test_deepseek_key_state(self) -> None:
+        self.assertIn("⚠️ ключ DeepSeek не задан", self.send("/status"))
+        reply = self.send("/status", settings=self.settings(deepseek_key="sk-test"))
+        self.assertIn("✅ ключ DeepSeek задан, модель deepseek-chat", reply)
+
+    def test_chat_settings_are_shown(self) -> None:
+        reply = self.send("/status")
+        self.assertIn("• валюта записей: BYN", reply)
+        self.assertIn("• в группах: отвечаю только на обращение", reply)
+        self.assertIn("• пароль чата: не задан", reply)
+        free = self.send("/status", settings=self.settings(require_mention=False))
+        self.assertIn("• в группах: отвечаю на любое сообщение", free)
+
+    def test_password_and_chat_currency_are_shown(self) -> None:
+        reply = status_report(CHAT, self.storage,
+                              Settings(default_currency="BYN", chat_password="сезам"), "USD")
+        self.assertIn("• пароль чата: задан — этот чат его подтвердил", reply)
+        self.assertIn("• валюта записей: USD", reply)
+
+    def test_database_failure_is_explained(self) -> None:
+        reply = status_report(CHAT, BrokenStorage(), self.settings(), "BYN")
+        self.assertIn("❌ не отвечает: Supabase не ответил вовремя", reply)
+        self.assertIn("записи и отчёты работать не будут", reply)
+
+    def test_alias_and_help(self) -> None:
+        self.assertIn("🩺 Статус бота", self.send("/статус"))
+        self.assertIn("/status", self.send("/help"))
+
+
+class CommandTelegram(FakeTelegram):
+    """FakeTelegram, который запоминает объявленный список команд (как Telegram)."""
+
+    def __init__(self, updates: list[dict]) -> None:
+        super().__init__(updates)
+        self.commands: list[tuple[str, str]] = []
+
+    def set_my_commands(self, commands: Sequence[tuple[str, str]]) -> bool:
+        """Запоминает список команд вместо обращения к Bot API."""
+        self.commands = list(commands)
+        return True
+
+
+class RegisterCommandsTests(unittest.TestCase):
+    """Список команд объявляется при запуске: меню «/» и нажимаемые команды в ответах."""
+
+    def build(self, telegram_class: type = CommandTelegram):
+        """Собирает бота с хранилищем в памяти и подменённым Telegram."""
+        settings = Settings(default_currency="BYN")
+        storage = InMemoryStorage(default_currency="BYN")
+        seed_chat(storage, chat=7)
+        telegram = telegram_class([make_update(5, "/debts")])
+        return DebtBot(settings, storage, HeuristicParser(), telegram), telegram
+
+    def test_commands_are_declared_on_start(self) -> None:
+        bot, telegram = self.build()
+        bot.run(poll_timeout=0, max_updates=1)
+        self.assertEqual(telegram.commands, list(BOT_COMMANDS))
+        self.assertIn("Долгов нет", telegram.sent[0][1])      # ответ чату не изменился
+
+    def test_client_without_command_list_does_not_break_start(self) -> None:
+        """Подменённый клиент без setMyCommands: бот работает как обычно."""
+        bot, telegram = self.build(telegram_class=FakeTelegram)
+        bot.run(poll_timeout=0, max_updates=1)
+        self.assertIn("Долгов нет", telegram.sent[0][1])
+
+    def test_settle_mydebts_and_status_are_declared(self) -> None:
+        """Подсказка «Итог: /settle» нажимаема потому, что команда объявлена в Telegram."""
+        names = [name for name, _ in BOT_COMMANDS]
+        for expected in ("settle", "mydebts", "status"):
+            self.assertIn(expected, names)
+        self.assertEqual(len(names), len(set(names)))          # повторов в списке нет
+
+    def test_command_names_fit_telegram_rules(self) -> None:
+        """Telegram принимает только строчные латинские буквы, цифры и «_» (до 32)."""
+        for name, description in BOT_COMMANDS:
+            self.assertRegex(name, re.compile(r"^[a-z0-9_]{1,32}$"))
+            self.assertTrue(3 <= len(description) <= 256, name)
+
+    def test_every_command_advised_in_help_is_declared(self) -> None:
+        """Всё, что бот советует в справке, должно быть в списке команд Telegram."""
+        declared = {name for name, _ in BOT_COMMANDS}
+        advised = set(re.findall(r"/([a-z]{2,10})\b", format_help("BYN")))
+        self.assertTrue(advised)
+        self.assertEqual(advised - declared, set())
+
+    def test_set_commands_without_settings_explains_problem(self) -> None:
+        """--set-commands без ключей сообщает об ошибке и не падает."""
+        with contextlib.redirect_stderr(io.StringIO()) as logged:
+            code = set_commands_mode(Settings())
+        self.assertEqual(code, 1)
+        self.assertIn("Ошибка", logged.getvalue())
+
+
+class TelegramCommandsApiTests(unittest.TestCase):
+    """setMyCommands: список команд уходит одним JSON-запросом с описаниями."""
+
+    def setUp(self) -> None:
+        self.session = FakeSession()
+        self.bot = TelegramBot("123:abc", session=self.session)
+
+    def test_payload_trims_slash_and_case(self) -> None:
+        self.session.responses = [FakeResponse({"ok": True, "result": True})]
+        self.bot.set_my_commands([("/settle", "взаимозачёт"), ("MyDebts", "мои долги")])
+        call = self.session.calls[0]
+        self.assertTrue(call["url"].endswith("/setMyCommands"))
+        self.assertEqual(call["payload"], {"commands": [
+            {"command": "settle", "description": "взаимозачёт"},
+            {"command": "mydebts", "description": "мои долги"},
+        ]})
+
+    def test_error_is_reported(self) -> None:
+        self.session.responses = [FakeResponse({"ok": False, "description": "bad"}, status=400)]
+        with self.assertRaises(TelegramError):
+            self.bot.set_my_commands([("settle", "зачёт")])
 
 
 if __name__ == "__main__":
