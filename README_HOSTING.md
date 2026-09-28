@@ -1,10 +1,16 @@
-# 🚀 Ветка `hosting` — бот работает постоянно (мгновенные ответы)
+# 🚀 Хостинг: бот работает постоянно (мгновенные ответы)
 
-Ветка `hosting` — для любого хостинга с постоянным процессом (HidenCloud, Pterodactyl-панели,
+Раздел — для любого хостинга с постоянным процессом (HidenCloud, Pterodactyl-панели,
 VPS, Termux): бот висит на long polling и отвечает **сразу**. Никаких запусков «по расписанию»
 не нужно: один постоянный процесс — и всё.
 
-## Что важно в этой ветке
+> ℹ️ В репозитории **одна ветка — `main`**: в ней и код бота, и постоянный режим
+> (`start.sh`, `Procfile`), и режим вебхука (`webhook.py`, `api/telegram.py`, `vercel.json`).
+> Ветки `hosting` больше нет. Если где-то (в панели хостинга, в Vercel, в закладке) остался
+> `hosting` — переключите на `main`: команда `git pull origin hosting` теперь отвечает
+> `couldn't find remote ref hosting`, а деплой из несуществующей ветки не соберётся.
+
+## Что важно для постоянного режима
 
 | Файл | Что делает |
 |---|---|
@@ -36,7 +42,9 @@ HTTPS-запросом на наш эндпоинт (`webhook.py`, WSGI). Не �
 
 ### Вариант 2.1. Vercel (5 минут)
 
-1. В Vercel → *Add New… → Project* → импортировать этот репозиторий, ветку **`hosting`**.
+1. В Vercel → *Add New… → Project* → импортировать этот репозиторий, ветка — **`main`**
+   (она основная и подставляется сама; если выбрана другая, поменяйте её в
+   *Settings → Git → Production Branch*).
    Framework Preset — **Other**, Root Directory — корень (в `vercel.json` уже настроено, что
    функция `api/telegram.py` может работать до 60 секунд).
 2. *Settings → Environment Variables* — добавить:
@@ -72,15 +80,15 @@ HTTPS-запросом на наш эндпоинт (`webhook.py`, WSGI). Не �
 
 **1. Консоль.** Зарегистрироваться → *Consoles → Bash*.
 
-**2. Забрать код** (ветку `hosting`):
+**2. Забрать код** (ветка `main` — основная, подставляется сама):
 
 ```bash
 cd ~
-git clone -b hosting https://github.com/USER/REPO.git debt_calculator
+git clone https://github.com/USER/REPO.git debt_calculator
 cd debt_calculator
 ```
 
-Приватный репозиторий: `git clone -b hosting https://<TOKEN>@github.com/USER/REPO.git`
+Приватный репозиторий: `git clone https://<TOKEN>@github.com/USER/REPO.git`
 (fine-grained token только на этот репозиторий) либо загрузить ZIP через *Files → Upload*.
 
 **3. Зависимости** (в виртуальном окружении — обе зависимости из `requirements.txt`):
@@ -161,7 +169,7 @@ python bot.py --webhook-info        # url, pending 0, без last error
 
 **10. Проверка:** написать боту «Леша должен Диме 3 рубля» — ответ за 1–3 секунды, затем `/debts`.
 
-**11. Обновление кода:** `cd ~/debt_calculator && git pull origin hosting`,
+**11. Обновление кода:** `cd ~/debt_calculator && git pull origin main`,
 затем **обязательно обновите зависимости** (у вебхука нет `start.sh`, который делает это сам):
 
 ```bash
@@ -244,7 +252,7 @@ python bot.py                             # постоянный процесс 
 1. **Создать сервер.** Обычно: категория «Bot» / «Python», egg «Python» (или Generic),
    RAM ≥ 512 МБ, диск ≥ 1 ГБ, ближайший регион. Проверьте, что панель показывает Python 3.10+
    (в bash-консоли: `python3 --version`).
-2. **Скопировать файлы** из ветки `hosting` в панель — через встроенный **File Manager** или **SFTP**:
+2. **Скопировать файлы** из репозитория (ветка `main`) в панель — через встроенный **File Manager** или **SFTP**:
    ```
    bot.py  config.py  debts.py  deepseek.py  storage.py  telegram_api.py
    requirements.txt  start.sh  Procfile
@@ -292,10 +300,10 @@ python bot.py                             # постоянный процесс 
 
 ## Обновление кода на хостинге
 
-1. Скачайте изменённые файлы из ветки `hosting` и загрузите их в панель (File Manager/SFTP),
+1. Скачайте изменённые файлы из ветки `main` и загрузите их в панель (File Manager/SFTP),
    либо, если на сервере есть git:
    ```bash
-   git pull origin hosting
+   git pull origin main
    ```
 2. **Restart** сервера в панели. Зависимости переустановятся сами — это делает `start.sh`.
    Если бот работает не через `start.sh`, а вебхуком (PythonAnywhere, Vercel), зависимости

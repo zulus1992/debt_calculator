@@ -373,8 +373,8 @@ ExchangeRate-API, автообновление курсов по расписа�
   ```powershell
   python bot.py --set-webhook https://<проект>.vercel.app/api/telegram
   ```
-* **ветка `hosting`** — постоянный процесс (long polling) на панели хостинга/VPS; в этой ветке
-  добавлены `start.sh` и `Procfile`.
+* **постоянный процесс** (long polling) на панели хостинга/VPS — файлы `start.sh` и `Procfile`
+  уже лежат в репозитории, отдельная ветка не нужна: всё в `main`.
 
 ## Пароль чата: бот работает только там, где его знают
 
