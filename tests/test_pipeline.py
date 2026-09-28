@@ -3420,11 +3420,20 @@ class ExportCommandTests(unittest.TestCase):
 
     def test_export_aliases(self) -> None:
         self.send("Леша должен Диме 3 рубля")
-        for text in ("/report", "/txt", "/файл"):
+        for text in ("/report", "/csv", "/файл"):
             self.assertIsInstance(self.send(text), CsvReport)
 
+    def test_txt_alias_is_gone(self) -> None:
+        """Отчёт всегда CSV: команды /txt нет — имя не должно обещать другой формат."""
+        self.send("Леша должен Диме 3 рубля")
+        reply = self.send("/txt")
+        self.assertIsInstance(reply, str)
+        self.assertIn("Не понял", reply)
+
     def test_help_mentions_export(self) -> None:
-        self.assertIn("/export", self.send("/help"))
+        help_text = self.send("/help")
+        self.assertIn("/export", help_text)
+        self.assertIn("файлом CSV", help_text)   # формат выгрузки назван в самой справке
 
 
 class BrokenDocumentTelegram(FakeTelegram):
