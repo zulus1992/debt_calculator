@@ -225,6 +225,9 @@ CHAT_BUTTONS: tuple[tuple[str, str], ...] = (
 )
 BUTTONS_PER_ROW = 2
 CALLBACK_PREFIX = "cmd:"
+# Что показать всплывающей подсказкой, если нажата «наша» кнопка со старого сообщения
+# (набор кнопок с тех пор поменялся): молчать нельзя — человек решит, что бот сломался.
+STALE_BUTTON_REPLY = "Кнопка устарела — напишите команду текстом"
 
 # Список команд для меню Telegram (setMyCommands): то же, что в /help, только коротко.
 # Из-за этого списка команды видны в меню «/», а в ответах бота Telegram подсвечивает
@@ -1326,7 +1329,14 @@ class DebtBot:
         text = message.get("text")
         chat_id = (message.get("chat") or {}).get("id")
         user_id = (message.get("from") or {}).get("id")
+        if not message:
+            # Апдейт, который бот не обрабатывает (правка сообщения, опрос, реакция и т.п.).
+            # Пишем об этом в лог: по нему видно, что именно присылает Telegram.
+            logger.info("Апдейт %s пропускаю: в нём нет сообщения (%s).",
+                        update.get("update_id"), ", ".join(sorted(update)))
+            return
         if not text or chat_id is None:
+            logger.debug("Апдейт %s: сообщение без текста — пропускаю.", update.get("update_id"))
             return
 
         # В группе отвечаем только на обращение («@бот …», «/команда@бот», ответ на наше
@@ -1407,13 +1417,22 @@ class DebtBot:
         message = callback.get("message") or {}
         chat_id = (message.get("chat") or {}).get("id")
         user = callback.get("from") or {}
-        command = button_command(callback.get("data") or "")
+        raw_data = str(callback.get("data") or "")
+        command = button_command(raw_data)
+        # Пишем в лог каждое нажатие: по нему видно, дошёл ли callback_query до бота вообще
+        # (если в логе пусто — Telegram апдейт не присылает: см. --webhook-info).
+        logger.info("Нажата кнопка %r в чате %s (пользователь %s): команда %r.",
+                    raw_data, chat_id, user.get("id"), command or "не распознана")
         if chat_id is None:
+            self._answer_callback(query_id)
             return
         if not command:
-            # Чужая кнопка или сообщение без наших команд: молчим, но «часики» гасим.
-            self._answer_callback(query_id)
-            logger.info("Нажата незнакомая кнопка в чате %s — пропускаю.", chat_id)
+            # Данные не наши (чужая кнопка) или кнопка из старого сообщения: молча не оставляем
+            # только во втором случае — просим написать команду текстом.
+            stale = raw_data.startswith(CALLBACK_PREFIX)
+            self._answer_callback(query_id, STALE_BUTTON_REPLY if stale else "")
+            if stale:
+                logger.warning("Кнопка %r не распознана — прошу команду текстом.", raw_data)
             return
         if not is_allowed(user.get("id"), self._settings):
             logger.warning("Кнопка от недопущенного пользователя id=%s", user.get("id"))

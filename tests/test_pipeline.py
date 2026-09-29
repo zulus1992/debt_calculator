@@ -51,6 +51,7 @@ from bot import (
     set_commands_mode,
     set_webhook_mode,
     show_webhook_info,
+    STALE_BUTTON_REPLY,
     status_report,
     updates_report,
     with_buttons,
@@ -4666,14 +4667,37 @@ class ChatButtonsTests(unittest.TestCase):
         self.assertIn("(@kozlovAlex)", telegram.sent[0][1])   # подпись нажавшего
         self.assertIn("🎉 Чисто", telegram.sent[0][1])         # Маша должна Диме, не Леше
 
-    def test_foreign_button_is_ignored(self) -> None:
-        """Незнакомый callback_data: ничего не отвечаем, но кнопку «отпускаем»."""
+    def test_stale_button_asks_for_command(self) -> None:
+        """Кнопка из старого сообщения не молчит: подсказка «напишите команду текстом»."""
         settings, storage, telegram = self.build()
-        telegram.updates = [self.callback_update("cmd:/rm-rf"),
-                            self.callback_update("чужое", update_id=10)]
-        DebtBot(settings, storage, HeuristicParser(), telegram).run(poll_timeout=0, max_updates=2)
+        telegram.updates = [self.callback_update("cmd:/rm-rf")]
+        self.run_bot(settings, storage, telegram)
         self.assertEqual(telegram.sent, [])
-        self.assertEqual(telegram.callbacks, [("cb-1", ""), ("cb-1", "")])
+        self.assertEqual(telegram.callbacks, [("cb-1", STALE_BUTTON_REPLY)])
+
+    def test_foreign_button_is_ignored(self) -> None:
+        """Чужой callback_data: ничего не отвечаем, но кнопку «отпускаем»."""
+        settings, storage, telegram = self.build()
+        telegram.updates = [self.callback_update("чужое")]
+        self.run_bot(settings, storage, telegram)
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(telegram.callbacks, [("cb-1", "")])
+
+    def test_button_press_is_logged(self) -> None:
+        """Нажатие попадает в лог: по нему видно, дошёл ли callback_query до бота вообще."""
+        settings, storage, telegram = self.build()
+        telegram.updates = [self.callback_update("cmd:/debts")]
+        with self.assertLogs("debt_bot", level="INFO") as logged:
+            self.run_bot(settings, storage, telegram)
+        self.assertIn("Нажата кнопка", "\n".join(logged.output))
+
+    def test_unhandled_update_is_logged(self) -> None:
+        """Прочие апдейты Telegram тоже видны в логе — иначе непонятно, что он присылает."""
+        settings, storage, telegram = self.build()
+        telegram.updates = [{"update_id": 9, "edited_message": {"message_id": 5}}]
+        with self.assertLogs("debt_bot", level="INFO") as logged:
+            self.run_bot(settings, storage, telegram)
+        self.assertIn("edited_message", "\n".join(logged.output))
 
     def test_button_from_denied_user_is_refused(self) -> None:
         """Доступ проверяется и при нажатии кнопки, а не только на сообщениях."""
