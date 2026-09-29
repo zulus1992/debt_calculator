@@ -213,6 +213,21 @@ EXPORT_COMMANDS = ("/export", "/report", "/csv", "/файл")
 MY_DEBTS_COMMANDS = ("/mydebts", "/me", "/мои")
 # Команда «кому перевести лично мне»: тот же зачёт, что /settle, но только строки автора.
 OPEN_COMMANDS = ("/open", "/кому")
+# Запись долга командой: строгая форма «кто кому сколько [валюта]» и фраза как обычным сообщением.
+ADD_COMMANDS = ("/add", "/добавить")
+# Строгая форма /add: «кто кому сколько [валюта]». Сумма ищется отдельным токеном, поэтому
+# подходят «3», «3,5», «3.50»; если шаблон не совпал — аргумент разбирается как обычная фраза.
+ADD_AMOUNT_RE = re.compile(r"^\d+(?:[.,]\d{1,2})?$")
+# Символы валют, которые можно писать слитно с суммой: «3$», «10€».
+ADD_CURRENCY_SYMBOLS = "$€₽£¥₴₸"
+ADD_HELP = (
+    "📝 Как записать долг командой:\n"
+    "• /add Леша Дима 3 BYN — кто, кому, сколько и (необязательно) валюта\n"
+    "• /add Леша должен Диме 3 рубля — можно и фразой, как обычным сообщением:\n"
+    "  так же работают возвраты («Леша вернул Диме 3») и общие счета («Дима заплатил 10 за всех»).\n"
+    "Записи ведутся только на зарегистрированных — отметьтесь: /reg Женя, ЖеняШ, кличка.\n"
+    "Кто уже есть в чате: /who. Справка: /help"
+)
 # Команда диагностики: сервисы, курсы и настройки чата — ответ приходит в чат.
 STATUS_COMMANDS = ("/status", "/статус", "/диагностика")
 
@@ -244,6 +259,7 @@ BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("mydebts", "мои долги: сколько должен я и сколько должны мне"),
     ("open", "кому перевести лично мне и кто переведёт мне"),
     ("debts", "все долги чата с взаимозачётом"),
+    ("add", "записать долг командой: /add Леша Дима 3 BYN"),
     ("settle", "минимум переводов, чтобы все долги закрылись"),
     ("d", "все записи в валюте чата по курсу на дату записи"),
     ("rates", "курсы валют и дата обновления"),
@@ -873,6 +889,113 @@ def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage
     ))
 
 
+def save_parsed_record(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage,
+                       members: Sequence[ChatMember], author: ChatMember | None,
+                       default_currency: str,
+                       explicit_currency: str | None = None) -> str | ChatReply:
+    """Сохраняет долг или возврат по разобранному тексту — общее для фразы и команды /add.
+
+    Тип операции берётся из `parsed.intent` («должен» — долг, «вернул» — возврат), имя каждой
+    стороны сопоставляется с участником чата (по id от ИИ, по имени из текста, «я» — автор),
+    а записи ведутся только на зарегистрированных: иначе возвращаем подсказку про /reg.
+    """
+    is_repayment = parsed.intent == "repayment"
+    if not (parsed.is_repayment if is_repayment else parsed.is_debt):
+        return NOT_A_REPAYMENT_REPLY if is_repayment else NOT_A_DEBT_REPLY
+    member_from = resolve_side(parsed.from_name, parsed.from_user_id, members, author)
+    member_to = resolve_side(parsed.to_name, parsed.to_user_id, members, author)
+    problem = _not_registered_reply([
+        (member_from, parsed.from_name),
+        (member_to, parsed.to_name),
+    ])
+    if problem:
+        return problem
+    currency = (parsed.currency or explicit_currency or default_currency).upper()
+    record = storage.add_debt(
+        chat_id=chat_id,
+        from_name=_member_name(member_from, str(parsed.from_name or "")),
+        to_name=_member_name(member_to, str(parsed.to_name or "")),
+        currency=currency,
+        amount=float(parsed.amount or 0),
+        raw_text=raw,
+        kind="repayment" if is_repayment else "debt",
+        from_user_id=member_from.user_id if member_from else None,
+        to_user_id=member_to.user_id if member_to else None,
+    )
+    formatter = format_repayment_saved if is_repayment else format_debt_saved
+    return with_buttons(formatter(record, members))
+
+
+def parse_add_arguments(argument: str, default_currency: str) -> tuple[str, str, float, str] | None:
+    """Разбирает строгую форму /add: (кто, кому, сумма, валюта) или None, если это фраза.
+
+    Шаблон — два имени, сумма и (необязательно) валюта: «Леша Дима 3 BYN». Разделитель-стрелка
+    тоже понимается («Леша → Дима 3,5»), валюта может стоять слитно с суммой («3$»). Всё, что
+    не совпало с шаблоном, уходит на обычный разбор фразой (см. add_command).
+    """
+    tokens = [token for token in
+              re.split(r"\s*(?:->|→|=>)\s*|\s+", str(argument or "").strip()) if token]
+    amount_index: int | None = None
+    amount = 0.0
+    symbols = ""
+    for index, token in enumerate(tokens):
+        bare = token.strip(ADD_CURRENCY_SYMBOLS)
+        if not ADD_AMOUNT_RE.match(bare):
+            continue
+        amount_index = index
+        amount = float(bare.replace(",", "."))
+        head = len(token) - len(token.lstrip(ADD_CURRENCY_SYMBOLS))
+        tail = len(token) - len(token.rstrip(ADD_CURRENCY_SYMBOLS))
+        symbols = token[:head] + (token[len(token) - tail:] if tail else "")
+        break
+    if amount_index is None or amount <= 0:
+        return None
+    names = tokens[:amount_index]
+    if len(names) != 2:
+        return None                       # не «кто кому сколько» — пусть разбирает фраза
+    tail = tokens[amount_index + 1:]
+    if len(tail) > 1:
+        return None
+    currency = default_currency
+    if tail:
+        code = detect_currency(tail[0]) or (tail[0].upper()
+                                            if len(tail[0]) == 3 and tail[0].isalpha() else "")
+        if not code:
+            return None                   # после суммы не код валюты — значит шаблон не наш
+        currency = code
+    elif symbols:
+        currency = detect_currency(symbols) or default_currency
+    return names[0], names[1], amount, currency
+
+
+def add_command(argument: str, chat_id: int, storage: Storage, parser: Any, settings: Settings,
+                members: Sequence[ChatMember], author: ChatMember | None,
+                default_currency: str) -> str | ChatReply:
+    """Команда /add: записать долг (или возврат, общий счёт) — то же, что сообщением.
+
+    Две формы:
+      • `/add Леша Дима 3 BYN` — строгая, «кто кому сколько [валюта]»: разбираем сами, без ИИ;
+      • `/add Леша должен Диме 3 рубля` — фраза, уходит в обычный разбор (DeepSeek или
+        офлайн-эвристики), поэтому так же работают возвраты и общие счета.
+
+    Пустой аргумент (и аргумент-команда вроде `/add /undo`) — подсказка, как записывать.
+    """
+    raw = (argument or "").strip()
+    if not raw or raw.startswith("/"):
+        return ADD_HELP
+    strict = parse_add_arguments(raw, default_currency)
+    if strict is not None:
+        from_name, to_name, amount, currency = strict
+        return save_parsed_record(
+            ParsedMessage(intent="debt", from_name=from_name, to_name=to_name,
+                          amount=amount, currency=currency, source="command"),
+            raw, chat_id, storage, members, author, default_currency,
+        )
+    # Не строгая форма: отдаём фразу обычному разбору — так работают и «вернул», и «за всех».
+    return handle_text(raw, chat_id, storage=storage, parser=parser, settings=settings,
+                       members=members, author=author)
+
+
 def handle_text(
     text: str,
     chat_id: int,
@@ -945,6 +1068,9 @@ def handle_text(
         return with_buttons(
             format_debts_report(storage.list_debts(chat_id), default_currency, members)
         )
+    if command in ADD_COMMANDS:
+        return add_command(argument, chat_id, storage, parser, settings, members, author,
+                           default_currency)
     if command == "/currency":
         return set_default_currency(argument or raw, chat_id, storage, default_currency)
     if command == "/reset":
@@ -966,31 +1092,8 @@ def handle_text(
 
     if parsed.intent in ("debt", "repayment"):
         # Тип операции определяет ИИ по смыслу: «должен» — долг, «вернул» — возврат.
-        is_repayment = parsed.intent == "repayment"
-        if not (parsed.is_repayment if is_repayment else parsed.is_debt):
-            return NOT_A_REPAYMENT_REPLY if is_repayment else NOT_A_DEBT_REPLY
-        member_from = resolve_side(parsed.from_name, parsed.from_user_id, members, author)
-        member_to = resolve_side(parsed.to_name, parsed.to_user_id, members, author)
-        problem = _not_registered_reply([
-            (member_from, parsed.from_name),
-            (member_to, parsed.to_name),
-        ])
-        if problem:
-            return problem
-        currency = (parsed.currency or explicit_currency or default_currency).upper()
-        record = storage.add_debt(
-            chat_id=chat_id,
-            from_name=_member_name(member_from, str(parsed.from_name or "")),
-            to_name=_member_name(member_to, str(parsed.to_name or "")),
-            currency=currency,
-            amount=float(parsed.amount or 0),
-            raw_text=raw,
-            kind="repayment" if is_repayment else "debt",
-            from_user_id=member_from.user_id if member_from else None,
-            to_user_id=member_to.user_id if member_to else None,
-        )
-        formatter = format_repayment_saved if is_repayment else format_debt_saved
-        return with_buttons(formatter(record, members))
+        return save_parsed_record(parsed, raw, chat_id, storage, members, author,
+                                  default_currency, explicit_currency)
 
     if parsed.intent == "expense":
         return with_buttons(save_expense(

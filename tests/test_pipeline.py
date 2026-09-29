@@ -24,6 +24,7 @@ import httpx
 from supabase import ClientOptions, create_client
 
 from bot import (
+    ADD_HELP,
     BOT_COMMANDS,
     BUTTONS_PER_ROW,
     CHAT_BUTTONS,
@@ -46,6 +47,7 @@ from bot import (
     LOGIN_DONE_REPLY,
     LOGIN_FREE_REPLY,
     mentions_bot,
+    parse_add_arguments,
     PASSWORD_REPLY,
     REGISTER_SELF_HINT,
     repair_webhook_mode,
@@ -4775,6 +4777,117 @@ class ChatButtonsTests(unittest.TestCase):
         self.assertTrue(bot.process_update(self.callback_update("cmd:/open")))
         self.assertIn("Долги лично вам", telegram.sent[0][1])
         self.assertEqual(telegram.callbacks, [("cb-1", "")])
+
+
+class AddCommandTests(unittest.TestCase):
+    """Команда /add: запись долга без фразы — строгая форма и фраза после команды."""
+
+    def setUp(self) -> None:
+        self.storage = InMemoryStorage(default_currency="BYN")
+        self.members = seed_chat(self.storage, chat=CHAT)
+
+    def send(self, text: str, author: ChatMember | None = MEMBER_LEHA) -> str:
+        """Проводит команду через handle_text (в сеть не ходит: парсер — офлайн-эвристики)."""
+        return handle_text(text, CHAT, storage=self.storage, parser=HeuristicParser(),
+                           settings=Settings(default_currency="BYN"),
+                           members=self.members, author=author)
+
+    def records(self) -> list[Debt]:
+        """Записи чата — что реально легло в базу."""
+        return self.storage.list_debts(CHAT)
+
+    def test_strict_form_saves_debt(self) -> None:
+        """«/add кто кому сколько [валюта]» — без ИИ, стороны привязываются к участникам."""
+        reply = self.send("/add Леша Дима 3 BYN")
+        assert_saved_debt(self, reply)
+        self.assertIsInstance(reply, ChatReply)               # ответ приходит с кнопками
+        self.assertEqual(len(self.records()), 1)
+        record = self.records()[0]
+        self.assertEqual((record.from_user_id, record.to_user_id),
+                         (MEMBER_LEHA.user_id, MEMBER_DIMA.user_id))
+        self.assertEqual((record.currency, record.amount), ("BYN", 3.0))
+        self.assertEqual(record.raw_text, "Леша Дима 3 BYN")  # как ввели: видно в /export
+        self.assertEqual(record.kind, "debt")
+
+    def test_strict_form_without_currency_uses_chat_currency(self) -> None:
+        self.storage.set_default_currency(CHAT, "USD")
+        self.send("/add Леша Дима 3")
+        self.assertEqual(self.records()[0].currency, "USD")
+
+    def test_strict_form_understands_arrow_comma_and_symbol(self) -> None:
+        """«Леша → Дима 3,5$» — стрелка вместо имён, запятая в сумме и валюта символом."""
+        self.send("/add Леша → Дима 3,5$")
+        record = self.records()[0]
+        self.assertEqual((record.currency, record.amount), ("USD", 3.5))
+
+    def test_strict_form_keeps_explicit_currency_code(self) -> None:
+        """Код валюты после суммы сохраняется даже без курса (EUR в списке поддержан)."""
+        self.send("/add Леша Дима 10 EUR")
+        self.assertEqual(self.records()[0].currency, "EUR")
+
+    def test_phrase_form_after_command(self) -> None:
+        """Фраза после /add разбирается как обычное сообщение (DeepSeek или эвристики)."""
+        assert_saved_debt(self, self.send("/add Леша должен Диме 3 рубля"))
+        record = self.records()[0]
+        self.assertEqual((record.currency, record.amount), ("BYN", 3.0))
+
+    def test_phrase_form_works_for_repayment_and_expense(self) -> None:
+        """В фразовой форме работают и возвраты, и общие счета — как у обычных сообщений."""
+        assert_saved_repayment(self, self.send("/add Леша вернул Диме 1 рубль"))
+        assert_saved_expense(self, self.send("/add Дима заплатил 10 за всех"))
+        kinds = [record.kind for record in self.records()]
+        self.assertEqual(kinds.count("repayment"), 1)
+        self.assertEqual(kinds.count("expense"), 4)   # доли: зарегистрированные, кроме платившего
+
+    def test_russian_alias_works(self) -> None:
+        assert_saved_debt(self, self.send("/добавить Леша Дима 3"))
+        self.assertEqual(len(self.records()), 1)
+
+    def test_empty_argument_shows_help(self) -> None:
+        reply = self.send("/add")
+        self.assertIn("Как записать долг командой", reply)
+        self.assertIn("/add Леша Дима 3 BYN", reply)
+        self.assertIn("/reg", reply)
+        self.assertEqual(self.records(), [])
+
+    def test_command_argument_shows_help(self) -> None:
+        """/add /undo — не запись, а путаница: показываем подсказку, а не «не понял»."""
+        self.assertIn("Как записать долг", self.send("/add /undo"))
+        self.assertEqual(self.records(), [])
+
+    def test_extra_words_are_not_saved(self) -> None:
+        """Лишнее после валюты — не наша строгая форма: запись молча не создаётся."""
+        reply = self.send("/add Леша Дима 3 BYN лишнее")
+        self.assertEqual(self.records(), [])
+        self.assertFalse(SAVED_DEBT_RE.search(reply))
+
+    def test_unregistered_side_asks_for_registration(self) -> None:
+        """Без /reg записи не ведутся — команда отвечает тем же, чем обычная запись."""
+        storage = InMemoryStorage(default_currency="BYN")
+        # Гоша — участник без отметки /reg (остальные в этом тесте тоже без неё).
+        members = seed_chat(storage, members=(MEMBER_LEHA, MEMBER_GOSHA), register=False)
+        reply = handle_text("/add Леша Гоша 3", CHAT, storage=storage, parser=HeuristicParser(),
+                            settings=Settings(default_currency="BYN"),
+                            members=members, author=MEMBER_LEHA)
+        self.assertIn("/reg", reply)
+        self.assertEqual(storage.list_debts(CHAT), [])
+
+    def test_strict_parser_shapes(self) -> None:
+        """Разбор строгой формы: что считается командой, а что уходит на разбор фразой."""
+        self.assertEqual(parse_add_arguments("Леша Дима 3 BYN", "BYN"),
+                         ("Леша", "Дима", 3.0, "BYN"))
+        self.assertEqual(parse_add_arguments("Леша Дима 3", "USD"), ("Леша", "Дима", 3.0, "USD"))
+        self.assertIsNone(parse_add_arguments("Леша должен Диме 3 рубля", "BYN"))
+        self.assertIsNone(parse_add_arguments("Леша Дима 3 BYN лишнее", "BYN"))
+        self.assertIsNone(parse_add_arguments("Леша 3 BYN", "BYN"))     # одно имя
+        self.assertIsNone(parse_add_arguments("Леша Дима 0", "BYN"))    # нулевая сумма
+        self.assertIsNone(parse_add_arguments("", "BYN"))
+
+    def test_add_is_declared_and_advised(self) -> None:
+        """/add есть и в меню Telegram, и в справке — иначе его не нажать."""
+        self.assertIn("add", [name for name, _ in BOT_COMMANDS])
+        self.assertIn("/add", format_help("BYN"))
+        self.assertIn("/add", ADD_HELP)
 
 
 if __name__ == "__main__":
