@@ -252,6 +252,8 @@ python bot.py                             # постоянный процесс 
 * необязательно: `REPORT_EMAIL` и доступы Gmail API (`GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`,
   `GMAIL_REFRESH_TOKEN`) — ежемесячный отчёт на почту. Пишет его отдельный скрипт `reports.py`,
   поэтому ему нужен **cron** хостинга (см. раздел «Отчёт на почту по cron» ниже).
+* необязательно: `CRON_SECRET` — секрет эндпоинта `/api/report`, который дёргает внешний
+  планировщик (cron-job.org) для недельного отчёта; если не задан, берётся `WEBHOOK_SECRET`.
 
 ## Шаги на HidenCloud (панель в стиле Pterodactyl)
 
@@ -263,7 +265,7 @@ python bot.py                             # постоянный процесс 
    bot.py  config.py  debts.py  deepseek.py  storage.py  telegram_api.py
    reports.py  gmail_api.py           (нужны только для ежемесячного отчёта на почту)
    requirements.txt  start.sh  Procfile
-   webhook.py  api/telegram.py  vercel.json   (нужны только для режима вебхука)
+   webhook.py  api/telegram.py  api/report.py  vercel.json   (вебхук и отчёт по HTTP)
    tests/            (необязательно, но удобно для самопроверки)
    .env              (создать на месте, в git его нет — см. .gitignore)
    ```
@@ -434,6 +436,28 @@ refresh-токен перестаёт работать через 7 дней, и
 * Один месяц — одно письмо: месяц последней отправки лежит в `bot_state` (`reports_sent`).
   Повторный запуск cron или ручной запуск за тот же месяц письма не продублирует; заново
   отправить — `python reports.py --force` (досрочно: `--period 2026-09 --force`).
+
+### Отчёт за неделю через cron-job.org (без cron на хостинге)
+
+Если своего cron нет (Vercel, бесплатный PythonAnywhere, панели в стиле Pterodactyl), недельный
+отчёт вызывается по HTTP — внешним планировщиком:
+
+```
+GET https://<домен>/api/report?token=<CRON_SECRET>          # неделя по Минску
+GET https://<домен>/api/report?token=<секрет>&force=1       # отправить, даже если уже уходил
+GET https://<домен>/api/report?token=<секрет>&dry=1         # показать письмо, не отправляя
+```
+
+* В [console.cron-job.org](https://console.cron-job.org): *Create cronjob* → URL выше →
+  расписание «по понедельникам, 10:00» → *TEST RUN*: в ответе JSON, `"sent": [...]` — письмо
+  ушло, `"reason": "… уже отправлен"` — за эту неделю уже отправляли.
+* Секрет — `CRON_SECRET` (либо уже заданный `WEBHOOK_SECRET`), в адресе `?token=…` или
+  заголовком `X-Report-Token`; без верного секрета ответ `403`.
+* Заодно параметр `kind=month` отдаёт месячное письмо — можно повесить на cron-job.org и его,
+  если cron на хостинге недоступен.
+* Эндпоинту нужны только доступы Gmail и база (Telegram/DeepSeek не требуются); нужный для него
+  код — `api/report.py` (Vercel) или `webhook.py` (PythonAnywhere/gunicorn, маршрут `/api/report`).
+* Подробнее — в `README.md`, раздел «Отчёт за неделю и эндпоинт для внешнего планировщика».
 
 ## Быстрый переезд между режимами
 

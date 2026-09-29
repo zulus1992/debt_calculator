@@ -123,6 +123,9 @@ class Settings:
     request_timeout: float = 30.0
     log_level: str = "INFO"
     webhook_secret: str = ""
+    # Секрет эндпоинта отчёта (/api/report) для внешнего планировщика вроде cron-job.org.
+    # Пусто — берётся webhook_secret: на хостинге он уже задан, второй секрет не обязателен.
+    cron_secret: str = ""
     require_mention: bool = True
     bot_username: str = ""
     # Ежемесячный отчёт на почту (Gmail API): кому отправлять и доступы OAuth-приложения.
@@ -169,6 +172,15 @@ class Settings:
         if str(self.rates_api_key or "").strip():
             return "аккаунт exchangerate-api.com (ключ задан)"
         return "открытый эндпоинт open.er-api.com (без ключа)"
+
+    @property
+    def report_secret(self) -> str:
+        """Секрет эндпоинта отчёта: CRON_SECRET, а если он не задан — WEBHOOK_SECRET.
+
+        Второй секрет заводить не обязательно: эндпоинт живёт на том же хостинге, где уже
+        настроен вебхук, и ссылку с токеном всё равно стоит держать так же закрыто.
+        """
+        return str(self.cron_secret or "").strip() or str(self.webhook_secret or "").strip()
 
     @property
     def report_recipients(self) -> tuple[str, ...]:
@@ -401,6 +413,28 @@ def webhook_secret_problem(secret: str) -> str | None:
     return None
 
 
+def report_secret_problem(secret: str) -> str | None:
+    """Проверяет секрет эндпоинта отчёта и возвращает текст проблемы (None — подходит).
+
+    Эндпоинт отчёта виден в интернете, поэтому без секрета он, как и вебхук, ничего не
+    обрабатывает: иначе любой желающий мог бы слать письма из вашего Gmail.
+    """
+    value = _clean(secret)
+    if not value:
+        return (
+            "Не задан CRON_SECRET (и нет WEBHOOK_SECRET) — эндпоинт отчёта ничего не обработает. "
+            "Пришлите секрет запросом ?token=… или заголовком X-Report-Token. "
+            "Значение CRON_SECRET: любое, из A-Z, a-z, 0-9, «_», «-» (до 256 символов)."
+        )
+    if not WEBHOOK_SECRET_RE.match(value):
+        return (
+            "Секрет эндпоинта отчёта содержит недопустимые символы: допустимы A-Z, a-z, 0-9, "
+            "«_», «-» (до 256 символов) — секрет удобно передавать в адресе, поэтому он должен "
+            "быть URL-безопасным."
+        )
+    return None
+
+
 def describe_supabase_key(key: str) -> str:
     """Описывает ключ базы словами — для --check и диагностики «почему база отказывает».
 
@@ -467,6 +501,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         request_timeout=timeout,
         log_level=get("LOG_LEVEL", "INFO").upper(),
         webhook_secret=get("WEBHOOK_SECRET"),
+        cron_secret=get("CRON_SECRET"),
         require_mention=_parse_bool(get("REQUIRE_MENTION"), True),
         bot_username=get("BOT_USERNAME").lstrip("@"),
         report_email=get("REPORT_EMAIL"),

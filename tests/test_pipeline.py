@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import contextlib
 import csv
@@ -120,11 +121,19 @@ from rates import (
 )
 from reports import (
     REPORT_STATE_KEY,
+    WEEK_STATE_KEY,
     build_monthly_letter,
+    build_weekly_letter,
+    period_from_arguments,
     period_title,
     report_period,
     reports_check_lines,
     send_monthly_reports,
+    send_weekly_reports,
+    week_days,
+    week_period,
+    week_period_key,
+    week_title,
 )
 from storage import (
     ChatMember,
@@ -149,7 +158,16 @@ from telegram_api import (
     TelegramError,
     split_message,
 )
-from webhook import SECRET_HEADER, LazyWebhookApp, WebhookApp, build_app
+from webhook import (
+    REPORT_TOKEN_HEADER,
+    ReportApp,
+    RoutesApp,
+    SECRET_HEADER,
+    LazyWebhookApp,
+    WebhookApp,
+    build_app,
+    report_path,
+)
 
 CHAT = 555
 
@@ -4498,9 +4516,12 @@ class MonthlyReportTests(unittest.TestCase):
 
     def test_check_lines_show_recipient_and_sender(self) -> None:
         lines = reports_check_lines(self.settings(gmail_sender="bot@example.com"))
+        text = "\n".join(lines)
         self.assertIn("boss@example.com", lines[0])
         self.assertIn("cron", lines[0])
-        self.assertIn("bot@example.com", lines[1])
+        self.assertIn("bot@example.com", text)
+        self.assertIn("--week", text)          # подсказка про недельный отчёт
+        self.assertIn("/api/report", text)     # и про эндпоинт для внешнего планировщика
 
     def test_period_helpers(self) -> None:
         self.assertEqual(period_title("2026-09"), "сентябрь 2026")
@@ -4990,6 +5011,307 @@ class RegistrationStateTests(unittest.TestCase):
         bot.process_update(self.message(1, "привет", user_id=999, username="gosha_p",
                                         first="Гоша"))
         self.assertIn(REGISTER_SELF_HINT, self.texts(telegram)[0])
+
+
+class WeeklyReportTests(unittest.TestCase):
+    """Недельный отчёт: период по ISO-неделе, записи только этой недели, своя отметка."""
+
+    def settings(self, **kwargs: Any) -> Settings:
+        """Настройки с заполненными доступами Gmail (почта подменяется в тестах)."""
+        base: dict[str, Any] = {
+            "supabase_url": "https://example.supabase.co",
+            "supabase_key": "sb_secret_test",
+            "report_email": "boss@example.com",
+            "gmail_client_id": "client-id",
+            "gmail_client_secret": "client-secret",
+            "gmail_refresh_token": "refresh-token",
+        }
+        base.update(kwargs)
+        return Settings(**base)
+
+    def storage(self) -> InMemoryStorage:
+        """Чат: свежая запись (попадает в текущую неделю) и старая (только в месячный отчёт)."""
+        storage = InMemoryStorage(default_currency="BYN")
+        storage.set_default_currency(CHAT, "BYN")
+        storage.add_debt(CHAT, "Леша Козлов", "Дмитрий Болт", "BYN", 3.0,
+                         from_user_id=101, to_user_id=102,
+                         created_at=f"{minsk_now().date().isoformat()}T10:00:00+00:00")
+        storage.add_debt(CHAT, "Маша Петрова", "Дмитрий Болт", "BYN", 10.0,
+                         from_user_id=103, to_user_id=102,
+                         created_at="2020-01-01T10:00:00+00:00")
+        return storage
+
+    def test_week_key_days_and_title(self) -> None:
+        """Неделя считается по ISO: ключ, границы и заголовок с датами."""
+        self.assertEqual(week_days("2026-W40"), ("2026-09-28", "2026-10-04"))
+        self.assertEqual(week_title("2026-W40"), "28.09–04.10.2026")
+        # Неделя на стыке годов (2026-я заканчивается 53-й неделей): два года в заголовке,
+        # иначе дата читается двусмысленно.
+        self.assertEqual(week_title("2026-W53"), "28.12.2026–03.01.2027")
+        self.assertEqual(week_days("2026-W53"), ("2026-12-28", "2027-01-03"))
+
+    def test_week_period_uses_minsk_now(self) -> None:
+        """Ключ недели берётся по Минску — как и всё остальное расписание бота."""
+        moment = minsk_now()
+        key = week_period_key(moment)
+        period = week_period(key=key)
+        self.assertEqual(period.key, key)
+        self.assertEqual(period.state_key, WEEK_STATE_KEY)
+        self.assertEqual((period.since, period.until), week_days(key))
+        self.assertEqual(period.noun, "эту неделю")
+
+    def test_week_letter_has_only_this_week(self) -> None:
+        """В недельном письме — записи этой недели, чужие (старые) в него не попадают."""
+        weekly = build_weekly_letter(self.storage(), week_period_key())
+        self.assertIn("Леша Козлов", weekly.body)
+        self.assertNotIn("Маша", weekly.body)
+        self.assertIn(f"debts_{CHAT}_{week_period_key()}.csv", weekly.files)
+
+        monthly = build_monthly_letter(self.storage())
+        self.assertIn("Маша", monthly.body)              # месячный отчёт — вся история
+
+    def test_week_send_marks_its_own_state(self) -> None:
+        """Отметка недели отдельная: недельное и месячное расписания не мешают друг другу."""
+        storage = self.storage()
+        mailer = FakeMailer()
+        run = send_weekly_reports(self.settings(), storage, sender=mailer)
+        self.assertTrue(run.delivered)
+        self.assertEqual(storage.get_state(WEEK_STATE_KEY), run.period)
+        self.assertIsNone(storage.get_state(REPORT_STATE_KEY))
+
+        again = send_weekly_reports(self.settings(), storage, sender=mailer)
+        self.assertFalse(again.delivered)
+        self.assertIn("уже отправлен", again.reason)
+        self.assertEqual(len(mailer.letters), 1)
+
+        forced = send_weekly_reports(self.settings(), storage, force=True, sender=mailer)
+        self.assertTrue(forced.delivered)
+        self.assertEqual(len(mailer.letters), 2)
+
+    def test_week_without_records_is_not_sent(self) -> None:
+        """За неделю записей нет — письмо не отправляется, и это видно в причине."""
+        storage = InMemoryStorage(default_currency="BYN")
+        storage.set_default_currency(CHAT, "BYN")
+        storage.add_debt(CHAT, "Леша", "Дима", "BYN", 3.0, created_at="2020-01-01T10:00:00+00:00")
+        run = send_weekly_reports(self.settings(), storage, sender=FakeMailer())
+        self.assertFalse(run.delivered)
+        self.assertIn("за эту неделю записей нет", run.reason)
+
+    def test_period_from_arguments(self) -> None:
+        """CLI: --week или ключ вида 2026-W40 включают недельный отчёт, иначе — месячный."""
+        week = period_from_arguments(argparse.Namespace(period="", week=True))
+        self.assertEqual(week.state_key, WEEK_STATE_KEY)
+        by_key = period_from_arguments(argparse.Namespace(period="2026-W40", week=False))
+        self.assertEqual((by_key.key, by_key.title), ("2026-W40", "28.09–04.10.2026"))
+        month = period_from_arguments(argparse.Namespace(period="2026-09", week=False))
+        self.assertEqual((month.key, month.title), ("2026-09", "сентябрь 2026"))
+        with self.assertRaises(ValueError):
+            period_from_arguments(argparse.Namespace(period="мусор", week=True))
+
+
+def wsgi_call(app: Any, path: str, query: str = "", *, method: str = "GET",
+              header: str = "") -> tuple[str, str]:
+    """Прогоняет WSGI-запрос и отдаёт статус и тело ответа (как это увидит планировщик)."""
+    environ: dict[str, Any] = {
+        "REQUEST_METHOD": method,
+        "PATH_INFO": path,
+        "QUERY_STRING": query,
+    }
+    if header:
+        environ[REPORT_TOKEN_HEADER] = header
+    captured: dict[str, Any] = {}
+
+    def start_response(status: str, headers: list) -> None:
+        captured["status"] = status
+        captured["headers"] = headers
+
+    body = b"".join(app(environ, start_response))
+    return captured["status"], body.decode("utf-8")
+
+
+class ReportEndpointTests(unittest.TestCase):
+    """Эндпоинт отчёта (/api/report): секрет, период, отправка и ответы планировщику."""
+
+    SECRET = "cron-secret-1"
+
+    def setUp(self) -> None:
+        self.mailer = FakeMailer()
+        self.storage = self.build_storage()
+        self.settings = self.build_settings()
+        self.app = ReportApp(self.settings, storage=self.storage, sender=self.mailer)
+
+    def build_settings(self, **kwargs: Any) -> Settings:
+        """Настройки как в бою: секрет эндпоинта, получатель и доступы Gmail."""
+        base: dict[str, Any] = {
+            "supabase_url": "https://example.supabase.co",
+            "supabase_key": "sb_secret_test",
+            "cron_secret": self.SECRET,
+            "report_email": "boss@example.com",
+            "gmail_client_id": "client-id",
+            "gmail_client_secret": "client-secret",
+            "gmail_refresh_token": "refresh-token",
+        }
+        base.update(kwargs)
+        return Settings(**base)
+
+    def build_storage(self) -> InMemoryStorage:
+        """Чат со свежей записью (текущая неделя) и со старой (в неделю не попадёт)."""
+        storage = InMemoryStorage(default_currency="BYN")
+        storage.set_default_currency(CHAT, "BYN")
+        storage.add_debt(CHAT, "Леша Козлов", "Дмитрий Болт", "BYN", 3.0,
+                         from_user_id=101, to_user_id=102,
+                         created_at=f"{minsk_now().date().isoformat()}T10:00:00+00:00")
+        storage.add_debt(CHAT, "Маша Петрова", "Дмитрий Болт", "BYN", 10.0,
+                         from_user_id=103, to_user_id=102,
+                         created_at="2020-01-01T10:00:00+00:00")
+        return storage
+
+    def call(self, query: str = "", **kwargs: Any) -> tuple[str, dict]:
+        """Запрос к эндпоинту: статус и разобранный JSON."""
+        return self.call_with(self.app, query, **kwargs)
+
+    def call_with(self, app: Any, query: str, **kwargs: Any) -> tuple[str, dict]:
+        """Запрос к произвольному приложению: статус и разобранный JSON."""
+        status, body = wsgi_call(app, "/api/report", query, **kwargs)
+        return status, json.loads(body)
+
+    def test_week_report_is_sent_and_marked(self) -> None:
+        """Вызов планировщика: недельное письмо уходит, отметка — отдельная (не месячная)."""
+        status, payload = self.call(f"token={self.SECRET}")
+        self.assertEqual(status, "200 OK")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["kind"], "week")
+        self.assertTrue(payload["period"].startswith("20") and "-W" in payload["period"])
+        self.assertEqual(payload["sent"], ["boss@example.com"])
+        self.assertEqual(payload["chats"], [CHAT])
+        self.assertEqual(payload["message_id"], "msg-1")
+        self.assertEqual(len(self.mailer.letters), 1)
+        self.assertEqual(self.mailer.letters[0]["to"], "boss@example.com")
+        self.assertEqual(self.storage.get_state(WEEK_STATE_KEY), payload["period"])
+        self.assertIsNone(self.storage.get_state(REPORT_STATE_KEY))   # месяц не тронут
+
+    def test_second_call_in_same_week_does_not_send(self) -> None:
+        """Планировщик может сработать дважды — второго письма не будет."""
+        self.call(f"token={self.SECRET}")
+        status, payload = self.call(f"token={self.SECRET}")
+        self.assertEqual(status, "200 OK")             # для планировщика это успех
+        self.assertEqual(payload["sent"], [])
+        self.assertIn("уже отправлен", payload["reason"])
+        self.assertEqual(len(self.mailer.letters), 1)
+
+    def test_force_and_to_parameters(self) -> None:
+        """force=1 пересылает, to=адрес меняет получателя (для разовой проверки)."""
+        self.call(f"token={self.SECRET}")
+        status, payload = self.call(f"token={self.SECRET}&force=1&to=me@example.com")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(payload["sent"], ["me@example.com"])
+        self.assertEqual(len(self.mailer.letters), 2)
+
+    def test_wrong_or_missing_secret_is_rejected(self) -> None:
+        """Без верного секрета эндпоинт не отправляет письма."""
+        for query in ("", "token=не-тот", "token="):
+            status, payload = self.call(query)
+            self.assertEqual(status, "403 Forbidden", query)
+            self.assertFalse(payload["ok"])
+        self.assertEqual(self.mailer.letters, [])
+
+    def test_secret_may_come_in_header(self) -> None:
+        """cron-job.org умеет заголовки: X-Report-Token работает так же, как ?token=."""
+        status, payload = self.call("", header=self.SECRET)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(payload["sent"], ["boss@example.com"])
+
+    def test_webhook_secret_is_used_when_cron_secret_missing(self) -> None:
+        """Отдельный CRON_SECRET не обязателен: подойдёт уже настроенный WEBHOOK_SECRET."""
+        app = ReportApp(self.build_settings(cron_secret="", webhook_secret=self.SECRET),
+                        storage=self.build_storage(), sender=self.mailer)
+        status, body = wsgi_call(app, "/report", f"token={self.SECRET}")
+        self.assertEqual(status, "200 OK")
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_missing_secret_configuration_is_reported(self) -> None:
+        """Секретов нет вовсе — эндпоинт не работает и объясняет, что задать."""
+        app = ReportApp(self.build_settings(cron_secret=""), storage=self.storage,
+                        sender=self.mailer)
+        status, payload = self.call_with(app, f"token={self.SECRET}")
+        self.assertEqual(status, "500 Internal Server Error")
+        self.assertIn("CRON_SECRET", payload["error"])
+        self.assertEqual(self.mailer.letters, [])
+
+    def test_bad_kind_and_bad_period_are_rejected(self) -> None:
+        status, payload = self.call(f"token={self.SECRET}&kind=day")
+        self.assertEqual(status, "400 Bad Request")
+        self.assertIn("week", payload["error"])
+        status, payload = self.call(f"token={self.SECRET}&kind=week&period=мусор")
+        self.assertEqual(status, "400 Bad Request")
+        self.assertIn("2026-W40", payload["error"])
+        self.assertEqual(self.mailer.letters, [])
+
+    def test_dry_run_shows_letter_without_sending(self) -> None:
+        """dry=1 удобно для проверки из cron-job.org: письмо видно в ответе, но не уходит."""
+        status, payload = self.call(f"token={self.SECRET}&dry=1")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(payload["sent"], [])
+        self.assertEqual(self.mailer.letters, [])
+        self.assertIn("Леша Козлов", payload["body"])
+        self.assertNotIn("Маша", payload["body"])        # неделя: старые записи не попадают
+
+    def test_month_kind_includes_all_history(self) -> None:
+        """kind=month — месячное письмо (вся история чата), период можно задать явно."""
+        status, payload = self.call(f"token={self.SECRET}&kind=month&period=2026-09&dry=1")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(payload["period"], "2026-09")
+        self.assertIn("Маша", payload["body"])
+
+    def test_post_works_and_other_methods_are_rejected(self) -> None:
+        """cron-job.org может дёргать и POST-ом; остальные методы — отказ."""
+        status, payload = self.call(f"token={self.SECRET}&dry=1", method="POST")
+        self.assertEqual(status, "200 OK")
+        self.assertTrue(payload["ok"])
+        status, _ = self.call(f"token={self.SECRET}", method="PUT")
+        self.assertEqual(status, "405 Method Not Allowed")
+
+    def test_storage_failure_is_reported(self) -> None:
+        """Сбой базы — 500 с текстом: в cron-job.org это будет видно как ошибка."""
+        class BrokenStorage(InMemoryStorage):
+            def list_chat_ids(self) -> list[int]:
+                raise StorageError("база недоступна")
+
+        app = ReportApp(self.build_settings(), storage=BrokenStorage(), sender=self.mailer)
+        status, payload = self.call_with(app, f"token={self.SECRET}")
+        self.assertEqual(status, "500 Internal Server Error")
+        self.assertIn("база недоступна", payload["error"])
+
+
+class RoutesAppTests(unittest.TestCase):
+    """Маршрутизация: отчёт на почту и вебхук Telegram живут по разным путям."""
+
+    def app(self, name: str, calls: list[str]) -> Any:
+        """Простое WSGI-приложение, которое только отмечается в списке вызовов."""
+        def call(environ: dict, start_response: Any) -> list[bytes]:
+            calls.append(name)
+            start_response("200 OK", [("Content-Type", "text/plain")])
+            return [b"ok"]
+        return call
+
+    def test_report_paths_go_to_reports_app(self) -> None:
+        calls: list[str] = []
+        routes = RoutesApp(webhook=self.app("webhook", calls), reports=self.app("reports", calls))
+        for path in ("/api/report", "/report", "/api/report/"):
+            calls.clear()
+            self.assertEqual(wsgi_call(routes, path)[0], "200 OK")
+            self.assertEqual(calls, ["reports"], path)
+        for path in ("/api/telegram", "/", "/report2"):
+            calls.clear()
+            self.assertEqual(wsgi_call(routes, path)[0], "200 OK")
+            self.assertEqual(calls, ["webhook"], path)
+
+    def test_report_path_matching(self) -> None:
+        """Путь эндпоинта узнаётся независимо от хвостового «/» и регистра."""
+        self.assertTrue(report_path({"PATH_INFO": "/api/report"}))
+        self.assertTrue(report_path({"PATH_INFO": "/Report/"}))
+        self.assertFalse(report_path({"PATH_INFO": "/api/telegram"}))
+        self.assertFalse(report_path({}))
 
 
 if __name__ == "__main__":

@@ -6,6 +6,13 @@
 сообщение приходит отдельным HTTP-запросом, бот разбирает его через DeepSeek и отвечает —
 ответ приходит за 1–3 секунды, «усыпление» контейнера не мешает.
 
+Адреса:
+    /api/telegram   апдейты Telegram (секрет — WEBHOOK_SECRET, заголовок от Telegram);
+    /api/report     отчёт на почту по внешнему расписанию: GET/POST с секретом в адресе
+                    (?token=…) или заголовке X-Report-Token (cron-job.org и подобные);
+    /report         то же, что /api/report (короткий адрес для планировщика);
+    /               проверка живости (GET) — отвечает «ok» и обновляет курсы по расписанию.
+
 Запуск и переключение режимов:
     python webhook.py --serve                                   # локальная проверка (wsgiref)
     python bot.py --set-webhook https://<домен>/api/telegram    # Telegram шлёт апдейты сюда
@@ -33,9 +40,20 @@ import sys
 import threading
 from typing import Any, Callable
 
+from urllib.parse import parse_qs
+
 from bot import DebtBot, build_runtime, configure_logging, configure_stdout
-from config import ConfigError, Settings, load_settings, require_settings, webhook_secret_problem
-from storage import StorageError
+from config import (
+    ConfigError,
+    Settings,
+    load_settings,
+    report_secret_problem,
+    require_settings,
+    webhook_secret_problem,
+)
+from gmail_api import MailError
+from reports import month_period, send_report, week_period
+from storage import StorageError, storage_from_settings
 from telegram_api import TelegramError
 
 logger = logging.getLogger("debt_bot.webhook")
@@ -162,6 +180,192 @@ def _respond(start_response: Callable, status: str, body: str, content_type: str
     return [payload]
 
 
+def _json(start_response: Callable, status: str, **payload: Any) -> list[bytes]:
+    """JSON-ответ эндпоинта: кириллица как есть, без кеширования."""
+    return _respond(start_response, status, json.dumps(payload, ensure_ascii=False))
+
+
+# Эндпоинт отчёта на почту: путь, заголовок с секретом и допустимые периоды письма.
+REPORT_PATHS = ("/report", "/api/report")
+REPORT_TOKEN_HEADER = "HTTP_X_REPORT_TOKEN"
+REPORT_TOKEN_HEADER_NAME = "X-Report-Token"
+REPORT_KINDS = ("week", "month")
+
+
+def _query_params(environ: dict[str, Any]) -> dict[str, str]:
+    """Параметры строки запроса: имя → первое значение."""
+    raw = str(environ.get("QUERY_STRING") or "")
+    if not raw:
+        return {}
+    return {name: values[0] for name, values in parse_qs(raw, keep_blank_values=True).items()}
+
+
+def _flag(params: dict[str, str], name: str) -> bool:
+    """Флаг из параметра запроса: ?force=1, ?dry=true, ?dry=да — все «правдивые» значения."""
+    return str(params.get(name) or "").strip().lower() in ("1", "true", "yes", "on", "y", "да")
+
+
+def report_path(environ: dict[str, Any]) -> bool:
+    """Это запрос к эндпоинту отчёта? Путь сравниваем без хвостового «/» и без регистра."""
+    path = str(environ.get("PATH_INFO") or "/").strip().lower()
+    return (path.rstrip("/") or "/") in REPORT_PATHS
+
+
+class ReportApp:
+    """WSGI-эндпоинт отчёта на почту: его вызывает внешний планировщик (cron-job.org).
+
+    Адрес: GET/POST `/api/report` (он же `/report`). Секрет — `CRON_SECRET`, а если он
+    не задан, `WEBHOOK_SECRET`; передаётся в адресе (`?token=…`) или заголовком
+    `X-Report-Token`. Без верного секрета эндпоинт отвечает 403 и ничего не отправляет.
+
+    Необязательные параметры:
+        kind=week|month   период письма: неделя (по умолчанию) или месяц;
+        period=2026-W40   конкретная неделя (или `2026-09` — месяц);
+        force=1           отправить, даже если за этот период отчёт уже уходил;
+        to=адрес          отправить на этот адрес вместо REPORT_EMAIL (разовая проверка);
+        dry=1             собрать письмо и вернуть его текст, ничего не отправляя.
+
+    Ответ — JSON: период, чаты, файлы, кому отправлено и причина, если не отправляли.
+    Код 200 — запрос обработан (в том числе «за этот период записей нет» и «уже отправляли»:
+    для планировщика это успех, а не сбой), 403 — неверный секрет, 400 — плохие параметры,
+    500 — сломаны настройки почты/базы или отправка не удалась.
+    """
+
+    def __init__(self, settings: Settings, *, storage: Any = None, sender: Any = None,
+                 session: Any = None) -> None:
+        self._settings = settings
+        self._storage = storage
+        self._sender = sender
+        self._session = session
+
+    def __call__(self, environ: dict[str, Any], start_response: Callable) -> list[bytes]:
+        """Обрабатывает один вызов планировщика: секрет, период, отправка, отчёт в JSON."""
+        method = str(environ.get("REQUEST_METHOD") or "GET").upper()
+        if method not in ("GET", "POST"):
+            return _json(start_response, "405 Method Not Allowed",
+                         ok=False, error="поддерживаются GET и POST")
+        params = _query_params(environ)
+        problem = report_secret_problem(self._settings.report_secret)
+        if problem:
+            logger.error("Эндпоинт отчёта не настроен: %s", problem)
+            return _json(start_response, "500 Internal Server Error", ok=False, error=problem)
+        if not self._secret_ok(environ, params):
+            logger.warning("Отклонён запрос к эндпоинту отчёта: неверный секрет")
+            return _json(start_response, "403 Forbidden", ok=False,
+                         error="неверный секрет: пришлите ?token=… или заголовок "
+                               f"{REPORT_TOKEN_HEADER_NAME}")
+        kind = str(params.get("kind") or "").strip().lower() or "week"
+        if kind not in REPORT_KINDS:
+            return _json(start_response, "400 Bad Request", ok=False,
+                         error=f"kind должен быть {' или '.join(REPORT_KINDS)}, а не «{kind}»")
+        try:
+            period = (week_period if kind == "week" else month_period)(params.get("period") or None)
+        except ValueError as exc:
+            return _json(start_response, "400 Bad Request", ok=False, error=str(exc))
+
+        dry_run = _flag(params, "dry") or _flag(params, "dry_run")
+        try:
+            storage = self._storage or storage_from_settings(self._settings)
+            run = send_report(self._settings, storage, period,
+                              force=_flag(params, "force"), to=params.get("to", ""),
+                              dry_run=dry_run, sender=self._sender, session=self._session)
+        except (StorageError, MailError) as exc:
+            logger.error("Отчёт не отправлен: %s", exc)
+            return _json(start_response, "500 Internal Server Error", ok=False, error=str(exc))
+
+        payload: dict[str, Any] = {
+            "ok": not run.problems,
+            "kind": kind,
+            "period": period.key,
+            "title": period.title,
+            "sent": list(run.sent),
+            "chats": list(run.chats),
+            "files": list(run.files),
+            "message_id": run.message_id,
+            "reason": run.reason,
+        }
+        if run.problems:
+            payload["problems"] = list(run.problems)
+        if dry_run:
+            payload["body"] = run.body
+        logger.info("Эндпоинт отчёта: %s за %s — %s", kind, period.key,
+                    ", ".join(run.sent) or (run.reason or "не отправлено"))
+        return _json(start_response, "500 Internal Server Error" if run.problems else "200 OK",
+                     **payload)
+
+    def _secret_ok(self, environ: dict[str, Any], params: dict[str, str]) -> bool:
+        """Сверяет секрет из адреса или заголовка X-Report-Token с настройками."""
+        provided = str(params.get("token") or environ.get(REPORT_TOKEN_HEADER) or "")
+        expected = self._settings.report_secret
+        return bool(provided) and hmac.compare_digest(provided.encode("utf-8", "replace"),
+                                                      expected.encode("utf-8", "replace"))
+
+
+def report_app_from_settings() -> ReportApp:
+    """Боевая сборка эндпоинта отчёта: нужны только доступы Gmail и база, Telegram — нет."""
+    settings = load_settings()
+    configure_logging(settings.log_level)
+    problem = report_secret_problem(settings.report_secret)
+    if problem:
+        raise ConfigError(problem)
+    problems = [item for item in (settings.reports_problem(), settings.database_problem()) if item]
+    if problems:
+        raise ConfigError("Проверьте настройки отчёта:\n- " + "\n- ".join(problems))
+    logger.info("Эндпоинт отчёта готов: письма на %s", ", ".join(settings.report_recipients))
+    return ReportApp(settings)
+
+
+class LazyReportApp:
+    """Собирает эндпоинт отчёта при первом запросе (важно для serverless).
+
+    Ошибка сборки кешируется и отдаётся текстом в JSON: причина видна прямо в ответе
+    планировщику, а не только в логе хостинга.
+    """
+
+    def __init__(self, factory: Callable[[], ReportApp] | None = None) -> None:
+        self._factory = factory or report_app_from_settings
+        self._app: ReportApp | None = None
+        self._error: str | None = None
+        self._lock = threading.Lock()
+
+    def __call__(self, environ: dict[str, Any], start_response: Callable) -> list[bytes]:
+        """Отдаёт запрос готовому эндпоинту (создавая его при необходимости)."""
+        built = self._get()
+        if built is None:
+            return _json(start_response, "500 Internal Server Error",
+                         ok=False, error=self._error or "приложение не собралось")
+        return built(environ, start_response)
+
+    def _get(self) -> ReportApp | None:
+        """Создаёт (один раз) эндпоинт из настроек; ошибку кеширует для ответов."""
+        with self._lock:
+            if self._app is None and self._error is None:
+                try:
+                    self._app = self._factory()
+                except (ConfigError, StorageError, TelegramError) as exc:
+                    self._error = str(exc)
+                    logger.error("Не удалось запустить эндпоинт отчёта: %s", exc)
+            return self._app
+
+
+class RoutesApp:
+    """Маршрутизация: `/api/report` — отчёт на почту, всё остальное — вебхук Telegram.
+
+    Обе части собираются лениво и независимо: отчёту не нужны Telegram и DeepSeek, а вебхуку —
+    доступы Gmail, поэтому сломанные настройки одной части не ломают другую.
+    """
+
+    def __init__(self, *, webhook: Any = None, reports: Any = None) -> None:
+        self._webhook = webhook if webhook is not None else LazyWebhookApp()
+        self._reports = reports if reports is not None else LazyReportApp()
+
+    def __call__(self, environ: dict[str, Any], start_response: Callable) -> list[bytes]:
+        """Отдаёт запрос той части, к которой он относится по пути."""
+        if report_path(environ):
+            return self._reports(environ, start_response)
+        return self._webhook(environ, start_response)
+
+
 def build_app(settings: Settings, *, storage: Any = None, parser: Any = None,
               telegram: Any = None) -> WebhookApp:
     """Собирает приложение вебхука. Компоненты можно подменить (тесты без сети)."""
@@ -233,8 +437,11 @@ class LazyWebhookApp:
 
 
 # Vercel, gunicorn и PythonAnywhere ищут либо `app`, либо `application`.
-app = LazyWebhookApp()
+# Маршрутизация: /api/report — отчёт на почту, всё остальное — вебхук Telegram.
+app = RoutesApp()
 application = app
+# Отдельная точка входа для Vercel: api/report.py отдаёт эндпоинт отчёта по своему пути.
+reports_app = LazyReportApp()
 
 
 def serve(host: str = "127.0.0.1", port: int = 8080) -> int:
@@ -252,10 +459,13 @@ def serve(host: str = "127.0.0.1", port: int = 8080) -> int:
         return 1
 
     configure_logging(settings.log_level)
-    local_app = LazyWebhookApp(app_from_settings)
+    # Маршрутизация та же, что в бою: /api/report — отчёт на почту, остальное — вебхук.
+    local_app = RoutesApp()
     with make_server(host, port, local_app) as server:
-        print(f"Локальный вебхук: http://{host}:{port}  (проверка живости — GET /)")
-        print(f"Апдейты: POST /api/telegram, заголовок {SECRET_HEADER_NAME}")
+        print(f"Локально: http://{host}:{port}  (проверка живости — GET /)")
+        print(f"Апдейты Telegram: POST /api/telegram, заголовок {SECRET_HEADER_NAME}")
+        print(f"Отчёт на почту: GET /api/report?token=<секрет> "
+              f"(kind=week|month, force=1, dry=1, to=адрес, period=2026-W40)")
         print("Telegram требует HTTPS, доступный из интернета:",
               "ngrok http 8080 / cloudflared tunnel --url http://127.0.0.1:8080")
         print("Затем: python bot.py --set-webhook https://<адрес туннеля>/api/telegram")

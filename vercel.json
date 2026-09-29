@@ -3,6 +3,9 @@
   "functions": {
     "api/telegram.py": {
       "maxDuration": 60
+    },
+    "api/report.py": {
+      "maxDuration": 60
     }
   }
 }
