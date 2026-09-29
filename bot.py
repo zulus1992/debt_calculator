@@ -23,6 +23,7 @@ REPORT_EMAIL, месяц последней отправки хранится в
 
 Вебхук (мгновенные ответы на serverless-хостингах — Vercel, PythonAnywhere, WSGI):
     python bot.py --set-webhook https://<домен>/api/telegram   # Telegram шлёт апдейты нам
+    python bot.py --repair-webhook                             # переставить на тот же адрес (кнопки)
     python bot.py --webhook-info                               # что сейчас настроено
     python bot.py --delete-webhook                             # вернуться на long polling
 
@@ -1712,6 +1713,54 @@ def show_webhook_info(settings: Settings, *, telegram: Any = None) -> int:
     return 0
 
 
+def repair_webhook_mode(settings: Settings, *, telegram: Any = None) -> int:
+    """Команда --repair-webhook: переставить вебхук на тот же адрес, добавив типы апдейтов.
+
+    Зачем: вебхук, поставленный прежней версией бота, просил у Telegram только сообщения —
+    поэтому нажатия кнопок (callback_query) и изменения состава чата (my_chat_member) просто
+    не приходили, и кнопки «молчали». Адрес берём из getWebhookInfo: вводить его руками не
+    нужно, адрес и секрет остаются теми же, меняется только список типов апдейтов.
+    """
+    secret_problem = webhook_secret_problem(settings.webhook_secret)
+    if secret_problem:
+        print("Ошибка:", secret_problem, file=sys.stderr)
+        return 1
+    try:
+        # Нужны только токен и секрет вебхука: база и ключ ИИ здесь не требуются, поэтому
+        # команду можно запустить и с ПК, где полного .env нет (важно лишь то, что секрет
+        # совпадает с тем, что настроен у вебхука на хостинге).
+        client = telegram if telegram is not None else TelegramBot(
+            settings.telegram_token, timeout=settings.request_timeout)
+        info = client.get_webhook_info()
+    except (ConfigError, TelegramError) as exc:
+        print("Ошибка:", exc, file=sys.stderr)
+        return 1
+
+    url = str(info.get("url") or "")
+    if not url:
+        print("Вебхук сейчас не установлен — переставлять нечего.", file=sys.stderr)
+        print("  Включите его с адресом: python bot.py --set-webhook https://<домен>/api/telegram",
+              file=sys.stderr)
+        return 1
+    try:
+        client.set_webhook(url, secret_token=settings.webhook_secret)
+        updated = client.get_webhook_info()
+    except TelegramError as exc:
+        print("Ошибка:", exc, file=sys.stderr)
+        return 1
+
+    print("✓ Вебхук переустановлен на тот же адрес:", updated.get("url") or url)
+    for line in updates_report(updated):
+        print(line)
+    problem = declare_commands(client)
+    if problem:
+        print("⚠ Список команд (меню «/») не удалось объявить:", problem)
+        print("  Повторите: python bot.py --set-commands")
+    else:
+        print(f"✓ Команды (меню «/») объявлены: {len(BOT_COMMANDS)}")
+    return 0
+
+
 def set_commands_mode(settings: Settings, *, telegram: Any = None) -> int:
     """Команда --set-commands: объявляет в Telegram список команд бота.
 
@@ -2015,6 +2064,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="объявить в Telegram список команд бота (меню «/» и нажимаемые команды)",
     )
     parser.add_argument(
+        "--repair-webhook",
+        action="store_true",
+        help="переставить вебхук на тот же адрес с полным списком типов апдейтов "
+             "(нажатия кнопок и просьба пароля при добавлении в чат)",
+    )
+    parser.add_argument(
         "--drop-pending",
         action="store_true",
         help="вместе с --set-webhook/--delete-webhook: выбросить накопившиеся апдейты",
@@ -2037,6 +2092,8 @@ def main(argv: list[str] | None = None) -> int:
         return update_rates_mode(settings, force=args.force)
     if args.set_webhook:
         return set_webhook_mode(settings, args.set_webhook, drop_pending=args.drop_pending)
+    if args.repair_webhook:
+        return repair_webhook_mode(settings)
     if args.delete_webhook:
         return delete_webhook_mode(settings, drop_pending=args.drop_pending)
     if args.webhook_info:

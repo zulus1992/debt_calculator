@@ -48,6 +48,7 @@ from bot import (
     mentions_bot,
     PASSWORD_REPLY,
     REGISTER_SELF_HINT,
+    repair_webhook_mode,
     set_commands_mode,
     set_webhook_mode,
     show_webhook_info,
@@ -3909,13 +3910,17 @@ class WebhookCliTelegram(RecordingCommandsTelegram):
         self.url = ""
         # Что Telegram сообщает о типах апдейтов; None — как будто поля нет (без ограничений).
         self.allowed_updates = allowed_updates
+        # Что бот попросил при установке вебхука.
+        self.requested_updates: tuple[str, ...] = ()
 
     def set_webhook(self, url: str, *, secret_token: str | None = None,
                     drop_pending_updates: bool = False,
                     allowed_updates: Sequence[str] = DEFAULT_ALLOWED_UPDATES,
                     max_connections: int | None = None) -> bool:
-        """Запоминает адрес вместо обращения к Bot API."""
+        """Запоминает адрес и типы апдейтов вместо обращения к Bot API."""
         self.url = url
+        self.requested_updates = tuple(allowed_updates)
+        self.allowed_updates = list(allowed_updates)
         return True
 
     def get_webhook_info(self) -> dict[str, Any]:
@@ -4019,6 +4024,50 @@ class CommandMenuDiagnosticsTests(unittest.TestCase):
             set_webhook_mode(Settings(webhook_secret=TEST_SECRET),
                              "https://example.test/api/telegram", telegram=telegram)
         self.assertIn("callback_query", printed.getvalue())
+
+
+class RepairWebhookModeTests(unittest.TestCase):
+    """--repair-webhook: вебхук переставляется на тот же адрес, и кнопки начинают работать."""
+
+    def test_repair_uses_same_url_and_new_update_types(self) -> None:
+        """Адрес берётся из Telegram: вводить его руками не нужно."""
+        telegram = WebhookCliTelegram(allowed_updates=["message"])
+        telegram.url = "https://example.test/api/telegram"
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = repair_webhook_mode(Settings(telegram_token="t", webhook_secret=TEST_SECRET),
+                                       telegram=telegram)
+        self.assertEqual(code, 0)
+        self.assertEqual(telegram.url, "https://example.test/api/telegram")   # адрес не менялся
+        self.assertEqual(telegram.requested_updates, DEFAULT_ALLOWED_UPDATES)
+        self.assertIn("Вебхук переустановлен на тот же адрес", printed.getvalue())
+        self.assertIn("callback_query", printed.getvalue())
+        self.assertIn("Команды (меню «/»)", printed.getvalue())
+
+    def test_repair_needs_only_token_and_secret(self) -> None:
+        """Полного .env не требуем: команду можно запустить с ПК, где нет базы и ключа ИИ."""
+        telegram = WebhookCliTelegram()
+        telegram.url = "https://example.test/api/telegram"
+        settings = Settings(telegram_token="t", webhook_secret=TEST_SECRET)
+        self.assertTrue(settings.problems())                  # база и DeepSeek не заданы
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = repair_webhook_mode(settings, telegram=telegram)
+        self.assertEqual(code, 0)
+
+    def test_repair_without_webhook_asks_for_address(self) -> None:
+        telegram = WebhookCliTelegram()                       # url пустой — вебхук не установлен
+        with contextlib.redirect_stderr(io.StringIO()) as logged:
+            code = repair_webhook_mode(Settings(telegram_token="t", webhook_secret=TEST_SECRET),
+                                       telegram=telegram)
+        self.assertEqual(code, 1)
+        self.assertIn("--set-webhook", logged.getvalue())
+
+    def test_repair_without_secret_is_refused(self) -> None:
+        """Без WEBHOOK_SECRET переставлять нельзя: Telegram не сможет подписывать запросы."""
+        with contextlib.redirect_stderr(io.StringIO()) as logged:
+            code = repair_webhook_mode(Settings(telegram_token="t"),
+                                       telegram=WebhookCliTelegram())
+        self.assertEqual(code, 1)
+        self.assertIn("WEBHOOK_SECRET", logged.getvalue())
 
 
 class WebhookUpdatesReportTests(unittest.TestCase):
