@@ -543,16 +543,23 @@ API Key. Ключ пишется в `RATES_API_KEY`.
      Google проходят только публичные приложения для чужих пользователей.
    * Аккаунт Google Workspace: проще выбрать тип **Internal** — тогда проверка не нужна вовсе.
 3. **OAuth-клиент.** *Credentials → Create credentials → OAuth client ID* → тип
-   **Desktop app** → `Client ID` и `Client secret` положить в `GMAIL_CLIENT_ID` и
-   `GMAIL_CLIENT_SECRET`.
+   **Web application**, а в *Authorized redirect URIs* добавить
+   `https://developers.google.com/oauthplayground` (этого требует сам Playground из шага 4;
+   с типом *Desktop app* он ответит ошибкой `redirect_uri_mismatch`). Полученные
+   `Client ID` и `Client secret` положить в `GMAIL_CLIENT_ID` и `GMAIL_CLIENT_SECRET`.
 4. **Refresh-токен.** Проще всего через
    [OAuth 2.0 Playground](https://developers.google.com/oauthplayground):
-   * шестерёнка (⚙, справа) → **Use your own OAuth credentials** → вставить Client ID и secret;
+   * шестерёнка (⚙, справа) → **Use your own OAuth credentials** → вставить `Client ID` и
+     `Client secret` из шага 3; там же проверьте **Access type = Offline** и
+     **Force prompt = Consent** — иначе Playground не вернёт `refresh_token`;
    * в шаге 1 включить право `https://www.googleapis.com/auth/gmail.send` (левое дерево,
      *Gmail API v1*) и нажать **Authorize APIs**;
-   * войти **тем аккаунтом, с которого будут уходить письма**;
+   * войти **тем аккаунтом, с которого будут уходить письма**; при статусе «In production»
+     Google покажет предупреждение — *Дополнительно* → *Перейти к «…» (небезопасно)*;
    * в шаге 2 нажать **Exchange authorization code for tokens** → скопировать
      `refresh_token` в `GMAIL_REFRESH_TOKEN`.
+   * Со своими credentials токен остаётся рабочим (Playground отзывает за 24 часа только
+     токены, выданные его собственным клиентом), поэтому ежемесячная рассылка будет работать.
 5. **Адрес отправителя.** `GMAIL_SENDER` — адрес, который будет стоять в «From» (обычно тот
    же аккаунт). Пусто — его подставит сам Gmail по выданному токену.
 6. **Расписание.** Строка в cron (см. ниже): без неё письма никто не отправит — бот сам
