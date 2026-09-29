@@ -4027,12 +4027,15 @@ class WebhookUpdatesReportTests(unittest.TestCase):
     def test_warns_when_webhook_has_old_update_types(self) -> None:
         """Вебхук, поставленный без callback_query: кнопки молчат — говорим об этом прямо."""
         telegram = WebhookCliTelegram(allowed_updates=["message"])
+        telegram.url = "https://example.test/api/telegram"
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             code = show_webhook_info(Settings(telegram_token="t"), telegram=telegram)
         self.assertEqual(code, 0)
         self.assertIn("callback_query", printed.getvalue())
         self.assertIn("my_chat_member", printed.getvalue())
-        self.assertIn("--set-webhook", printed.getvalue())
+        # Подсказка готова к копированию: тот же адрес уже подставлен.
+        self.assertIn("python bot.py --set-webhook https://example.test/api/telegram",
+                      printed.getvalue())
 
     def test_silent_when_all_types_requested(self) -> None:
         telegram = WebhookCliTelegram(allowed_updates=list(DEFAULT_ALLOWED_UPDATES))

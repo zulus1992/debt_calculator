@@ -1680,7 +1680,11 @@ def updates_report(info: Mapping[str, Any]) -> list[str]:
     if missing:
         lines.append(f"  ⚠ не приходят: {', '.join(missing)} — кнопки и просьба пароля при "
                      "добавлении в чат работать не будут")
-        lines.append("  переустановите вебхук: python bot.py --set-webhook <адрес>")
+        url = str(info.get("url") or "")
+        command = (f"python bot.py --set-webhook {url}" if url
+                   else "python bot.py --set-webhook <адрес>")
+        lines.append("  переустановите вебхук (адрес тот же, что сейчас):")
+        lines.append("  " + command)
     return lines
 
 
