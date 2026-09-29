@@ -34,6 +34,7 @@ from bot import (
     DENIED_REPLY,
     HeuristicParser,
     addressing,
+    author_from_members,
     button_command,
     clean_bot_mention,
     commands_report,
@@ -2321,10 +2322,24 @@ class RegistrationHintTests(unittest.TestCase):
         self.assertNotIn(REGISTER_SELF_HINT, reply)
         self.assertIn("Записей нет", reply)
 
-    def test_author_without_records_still_gets_hint(self) -> None:
-        """Даже без записей новичок видит, что сначала нужно отметиться."""
-        reply = self.send("/mydebts", author=replace(MEMBER_GOSHA, is_registered=True))
+    def test_author_registered_in_chat_gets_no_hint(self) -> None:
+        """Отметка /reg берётся из состава чата, а не из «сырого» автора апдейта.
+
+        Регрессия: автор приходит из Telegram без отметки /reg, из-за чего бот просил
+        регистрацию даже после неё. Теперь состав чата — источник истины.
+        """
+        self.storage.register_member(replace(MEMBER_GOSHA, chat_id=CHAT))
+        reply = self.send("/mydebts", author=replace(MEMBER_GOSHA, is_registered=False))
         self.assertNotIn(REGISTER_SELF_HINT, reply)
+
+    def test_author_from_members_prefers_stored_state(self) -> None:
+        """Проверка самой подмены: зарегистрированный участник из состава, чужой — как есть."""
+        registered = replace(MEMBER_LEHA, is_registered=True)
+        raw = replace(MEMBER_LEHA, is_registered=False)
+        self.assertIs(author_from_members(raw, [registered]), registered)
+        self.assertIs(author_from_members(None, [registered]), None)
+        stranger = replace(MEMBER_GOSHA, user_id=999)
+        self.assertIs(author_from_members(stranger, [registered]), stranger)
 
     def test_tapped_reg_registers_author_and_shows_names(self) -> None:
         """Нажали /reg без имён — бот регистрирует по нику и показывает, что дописать."""
@@ -4888,6 +4903,93 @@ class AddCommandTests(unittest.TestCase):
         self.assertIn("add", [name for name, _ in BOT_COMMANDS])
         self.assertIn("/add", format_help("BYN"))
         self.assertIn("/add", ADD_HELP)
+
+
+class RegistrationStateTests(unittest.TestCase):
+    """Отметка /reg берётся из состава чата: после регистрации бот её больше не просит.
+
+    Проверяем через настоящий путь бота (апдейты с полем `from`, как от Telegram), а не через
+    handle_text напрямую: именно там автор собирался из апдейта без отметки /reg, из-за чего
+    бот просил регистрацию даже после неё и не записывал «я должен Диме 2».
+    """
+
+    def build(self) -> tuple[DebtBot, InMemoryStorage, FakeTelegram]:
+        """Бот с подменённым Telegram; в чате уже зарегистрирован Дима."""
+        storage = InMemoryStorage(default_currency="BYN")
+        storage.register_member(replace(MEMBER_DIMA, chat_id=CHAT))
+        telegram = FakeTelegram([])
+        bot = DebtBot(Settings(default_currency="BYN"), storage, HeuristicParser(), telegram)
+        return bot, storage, telegram
+
+    def message(self, update_id: int, text: str, *, user_id: int = 101,
+                username: str = "kozlovAlex", first: str = "Леша") -> dict:
+        """Апдейт сообщения с полем `from` — как их присылает Telegram (личный чат)."""
+        return {
+            "update_id": update_id,
+            "message": {
+                "message_id": update_id,
+                "chat": {"id": CHAT, "type": "private"},
+                "from": {"id": user_id, "username": username, "first_name": first},
+                "text": text,
+            },
+        }
+
+    def callback(self, data: str, *, update_id: int = 20, user_id: int = 101) -> dict:
+        """Апдейт нажатия кнопки — от того же человека."""
+        return {
+            "update_id": update_id,
+            "callback_query": {
+                "id": "cb-1",
+                "from": {"id": user_id, "username": "kozlovAlex", "first_name": "Леша"},
+                "message": {"message_id": 5, "chat": {"id": CHAT, "type": "private"}},
+                "data": data,
+            },
+        }
+
+    @staticmethod
+    def texts(telegram: FakeTelegram) -> list[str]:
+        """Тексты ответов бота: подменённый Telegram хранит пары «чат — текст»."""
+        return [text for _, text in telegram.sent]
+
+    def test_registration_is_remembered_for_later_commands(self) -> None:
+        """Регрессия: после /reg ни одна команда не просит отметиться снова."""
+        bot, _, telegram = self.build()
+        for update_id, text in enumerate(("/reg Леша, Лёха", "/debts", "/mydebts", "/open"), start=1):
+            bot.process_update(self.message(update_id, text))
+        replies = self.texts(telegram)
+        self.assertEqual(len(replies), 4)
+        self.assertIn("Долгов нет", replies[1])                   # на /debts отвечает отчётом
+        for reply in replies[1:]:
+            self.assertNotIn(REGISTER_SELF_HINT, reply)
+
+    def test_i_owe_is_recorded_after_registration(self) -> None:
+        """«я должен Диме 2 рубля» после /reg записывается (раньше: «Ещё не зарегистрирован»)."""
+        bot, storage, telegram = self.build()
+        bot.process_update(self.message(1, "/reg Леша, Лёха"))
+        bot.process_update(self.message(2, "я должен Диме 2 рубля"))
+        reply = self.texts(telegram)[1]
+        assert_saved_debt(self, reply)
+        self.assertNotIn(REGISTER_SELF_HINT, reply)
+        records = storage.list_debts(CHAT)
+        self.assertEqual(len(records), 1)
+        self.assertEqual((records[0].from_user_id, records[0].to_user_id), (101, 102))
+
+    def test_button_press_uses_stored_registration(self) -> None:
+        """Кнопка после /reg тоже отвечает по делу, а не подсказкой про регистрацию."""
+        bot, storage, telegram = self.build()
+        bot.process_update(self.message(1, "/reg Леша, Лёха"))
+        storage.add_debt(CHAT, "Леша", "Дима", "BYN", 3.0, from_user_id=101, to_user_id=102)
+        bot.process_update(self.callback("cmd:/open"))
+        reply = self.texts(telegram)[1]
+        self.assertIn("Долги лично вам", reply)
+        self.assertNotIn(REGISTER_SELF_HINT, reply)
+
+    def test_stranger_still_gets_the_hint(self) -> None:
+        """Наоборот: незнакомому участнику подсказка про /reg по-прежнему нужна."""
+        bot, _, telegram = self.build()
+        bot.process_update(self.message(1, "привет", user_id=999, username="gosha_p",
+                                        first="Гоша"))
+        self.assertIn(REGISTER_SELF_HINT, self.texts(telegram)[0])
 
 
 if __name__ == "__main__":

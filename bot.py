@@ -889,6 +889,24 @@ def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage
     ))
 
 
+def author_from_members(author: ChatMember | None,
+                        members: Sequence[ChatMember]) -> ChatMember | None:
+    """Автор, каким его знает чат: отметка /reg и алиасы берутся из состава, а не из апдейта.
+
+    Апдейт Telegram приносит только user id, имя и @ник — про `/reg` он ничего не знает,
+    поэтому «сырой» автор из `member_from_telegram` всегда выглядит незарегистрированным.
+    Из-за этого бот просил регистрацию даже после неё (и отказывался записывать «я должен
+    Диме 2», где одна из сторон — сам автор). Если участника в составе нет, возвращаем
+    автора как есть: в этом и смысл подсказки про /reg.
+    """
+    if author is None:
+        return None
+    for member in members:
+        if member.user_id == author.user_id:
+            return member
+    return author
+
+
 def save_parsed_record(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage,
                        members: Sequence[ChatMember], author: ChatMember | None,
                        default_currency: str,
@@ -1020,6 +1038,9 @@ def handle_text(
     raw = (text or "").strip()
     if members is None:
         members = _load_members(storage, chat_id)
+    # Автор из апдейта не знает про /reg: отметку и алиасы берём из состава чата — иначе бот
+    # просил бы регистрацию даже после неё и отказывался писать «я должен Диме 2».
+    author = author_from_members(author, members)
     if not raw:
         return format_help(settings.default_currency)
 
