@@ -595,6 +595,78 @@ def format_transfers(transfers: Sequence[Balance], target: str = "") -> str:
                       "Перевели — и записи можно свести зачётом: /debts"])
 
 
+def person_label(debts: Sequence[Debt], members: Sequence[ChatMember] = (),
+                 person: ChatMember | None = None) -> str:
+    """Подпись человека в отчётах: «Леша Козлов (@kozlovAlex)» — как в переводах и итогах.
+
+    Нужна там, где переводы из minimal_transfers надо отнести к конкретному человеку:
+    список переводов говорит подписями, и без этой функции непонятно, какие строки про кого.
+    Если человек не упомянут ни в одной записи (в подписях его нет), показываем его так,
+    как участника чата: иначе в заголовке оказался бы голый user id.
+    """
+    if person is None:
+        return ""
+    labels = person_labels(debts, members)
+    key = identity_of(person.user_id, person.display_name)
+    if key and key in labels:
+        return labels[key]
+    return person.label
+
+
+def person_transfers(transfers: Sequence[Balance],
+                     label: str) -> tuple[list[Balance], list[Balance]]:
+    """Делит переводы на «человек переводит» и «человеку переводят» по его подписи."""
+    if not label:
+        return [], []
+    outgoing = [item for item in transfers if item.debtor == label]
+    incoming = [item for item in transfers if item.creditor == label]
+    return outgoing, incoming
+
+
+def _sum_by_currency(items: Sequence[Balance]) -> str:
+    """Итог переводов по валютам: «3.00 BYN, 10.00 USD»."""
+    totals: dict[str, float] = defaultdict(float)
+    for item in items:
+        totals[item.currency] += float(item.amount)
+    return _money_by_currency(dict(totals))
+
+
+def format_open_report(label: str, outgoing: Sequence[Balance], incoming: Sequence[Balance],
+                       target: str = "") -> str:
+    """Ответ /open: кому перевести и от кого получить лично мне — адресаты, а не весь чат.
+
+    Берём те же минимальные переводы, что и /settle, и оставляем строки с автором: человек
+    видит конкретные адресаты и суммы, а не общий котёл из пар долгов всего чата.
+    """
+    if not label:
+        return ("🤔 Не вижу, кто вы: у сообщения нет автора.\n"
+                "Напишите что-нибудь в чат от себя и повторите /open.")
+    title = f"🧭 Долги лично вам — {label}"
+    if target:
+        title += f" (валюта: {target.upper()})"
+    lines = [title, ""]
+    if not outgoing and not incoming:
+        lines.append("🎉 Чисто: переводить никому не нужно и вам никто не должен.")
+        lines.append("")
+        lines.append("Весь чат и зачёт: /settle, ваши итоги по парам: /mydebts")
+        return "\n".join(lines)
+    if outgoing:
+        lines.append("🔴 Переведите:")
+        lines.extend(f"• {item.creditor} — {_money(item.amount, item.currency)}"
+                     for item in sorted(outgoing, key=lambda item: (-item.amount, item.creditor)))
+        lines.append(f"Итого перевести: {_sum_by_currency(outgoing)}")
+    if incoming:
+        if outgoing:
+            lines.append("")
+        lines.append("🟢 Вам переведут:")
+        lines.extend(f"• {item.debtor} — {_money(item.amount, item.currency)}"
+                     for item in sorted(incoming, key=lambda item: (-item.amount, item.debtor)))
+        lines.append(f"Итого получить: {_sum_by_currency(incoming)}")
+    lines.append("")
+    lines.append("Весь чат и зачёт: /settle, ваши итоги по парам: /mydebts")
+    return "\n".join(lines)
+
+
 def format_help(default_currency: str = "BYN") -> str:
     """Справка по возможностям бота."""
     return "\n".join([
@@ -625,6 +697,7 @@ def format_help(default_currency: str = "BYN") -> str:
         "",
         "5. Взаимозачёт: кто кому сколько переводит, чтобы всё закрылось:",
         "   /settle — минимум переводов (если A→B и B→C, то A платит C)",
+        "   /open — только про вас: кому перевести и кто переведёт вам",
         "   Итоги в ответе о записи не показываю — считаю их тут, по команде.",
         "",
         "6. Привести всё к валюте чата по курсу на дату записи:",

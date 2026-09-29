@@ -25,15 +25,21 @@ from supabase import ClientOptions, create_client
 
 from bot import (
     BOT_COMMANDS,
+    BUTTONS_PER_ROW,
+    CHAT_BUTTONS,
+    ChatReply,
     DebtBot,
     CsvReport,
+    DENIED_REPLY,
     HeuristicParser,
     addressing,
+    button_command,
     clean_bot_mention,
     commands_report,
     declare_commands,
     demo_rates,
     handle_text,
+    inline_commands,
     is_allowed,
     is_command_for_bot,
     LOGIN_COMMANDS,
@@ -44,7 +50,10 @@ from bot import (
     REGISTER_SELF_HINT,
     set_commands_mode,
     set_webhook_mode,
+    show_webhook_info,
     status_report,
+    updates_report,
+    with_buttons,
 )
 from config import (
     ConfigError,
@@ -57,16 +66,19 @@ from config import (
     webhook_secret_problem,
 )
 from debts import (
+    Balance,
     DEBTS_DUMP_COLUMNS,
     format_debts_dump,
     format_debts_report,
     format_help,
+    format_open_report,
     format_person_report,
     minimal_transfers,
     name_key,
     net_balances,
     normalize_name,
     person_balances,
+    person_transfers,
     split_amount,
     totals_by_person,
 )
@@ -126,6 +138,7 @@ from storage import (
 )
 from telegram_api import (
     CSV_DOCUMENT_TYPE,
+    DEFAULT_ALLOWED_UPDATES,
     MAX_CAPTION_LENGTH,
     TelegramBot,
     TelegramError,
@@ -486,6 +499,8 @@ class FakeTelegram:
         self.documents: list[tuple[int, str, str]] = []
         self.document_types: list[str] = []
         self.offsets: list[int | None] = []
+        self.markups: list[Any] = []                 # клавиатуры отправленных сообщений
+        self.callbacks: list[tuple[str, str]] = []   # ответы на нажатия кнопок
 
     def get_me(self) -> dict:
         """Имя бота для логов."""
@@ -496,10 +511,18 @@ class FakeTelegram:
         self.offsets.append(offset)
         return self.updates
 
-    def send_message(self, chat_id, text: str, *, reply_to=None, silent: bool = False) -> list[dict]:
-        """Запоминает отправленный ответ."""
+    def send_message(self, chat_id, text: str, *, reply_to=None, silent: bool = False,
+                     reply_markup: Any = None) -> list[dict]:
+        """Запоминает отправленный ответ и его кнопки."""
         self.sent.append((int(chat_id), text))
+        self.markups.append(reply_markup)
         return [{}]
+
+    def answer_callback_query(self, callback_query_id: str, *, text: str = "",
+                              show_alert: bool = False) -> bool:
+        """Запоминает, что «часики» на нажатой кнопке погашены."""
+        self.callbacks.append((callback_query_id, text))
+        return True
 
     def send_document(self, chat_id, filename: str, content: str, *, caption: str = "",
                       reply_to=None, silent: bool = False,
@@ -908,8 +931,19 @@ class TelegramWebhookApiTests(unittest.TestCase):
         self.assertTrue(call["url"].endswith("/setWebhook"))
         self.assertEqual(call["payload"]["url"], "https://example.vercel.app/api/telegram")
         self.assertEqual(call["payload"]["secret_token"], "s3cret")
-        self.assertEqual(call["payload"]["allowed_updates"], ["message"])
+        # Кнопки и состав чата Telegram присылает только по запросу: без callback_query
+        # нажатия кнопок не приходят, без my_chat_member — приветствие с просьбой о пароле.
+        self.assertEqual(call["payload"]["allowed_updates"], list(DEFAULT_ALLOWED_UPDATES))
         self.assertFalse(call["payload"]["drop_pending_updates"])
+
+    def test_get_updates_asks_for_buttons_and_membership(self) -> None:
+        """Long polling просит те же типы апдейтов, что и вебхук."""
+        self.session.responses = [FakeResponse({"ok": True, "result": []})]
+        self.bot.get_updates(0, poll_timeout=1)
+        self.assertEqual(self.session.calls[0]["payload"]["allowed_updates"],
+                         list(DEFAULT_ALLOWED_UPDATES))
+        self.assertIn("callback_query", DEFAULT_ALLOWED_UPDATES)
+        self.assertIn("my_chat_member", DEFAULT_ALLOWED_UPDATES)
 
     def test_set_webhook_drop_pending_and_connections(self) -> None:
         self.session.responses = [FakeResponse({"ok": True, "result": True})]
@@ -919,6 +953,36 @@ class TelegramWebhookApiTests(unittest.TestCase):
         self.assertTrue(payload["drop_pending_updates"])
         self.assertEqual(payload["max_connections"], 10)
         self.assertNotIn("secret_token", payload)      # без секрета поле не отправляем
+
+    def test_send_message_without_buttons_has_no_markup(self) -> None:
+        """Обычный ответ уходит без клавиатуры: кнопки приходят только с отчётами."""
+        self.bot.send_message(1, "привет")
+        self.assertNotIn("reply_markup", self.session.calls[0]["payload"])
+
+    def test_send_message_attaches_buttons(self) -> None:
+        """Inline-кнопки уходят полем reply_markup."""
+        markup = {"inline_keyboard": [[{"text": "🧮 Взаимозачёт", "callback_data": "cmd:/settle"}]]}
+        self.bot.send_message(1, "текст", reply_markup=markup)
+        self.assertEqual(self.session.calls[0]["payload"]["reply_markup"], markup)
+
+    def test_send_message_puts_buttons_under_last_chunk(self) -> None:
+        """Длинный ответ режется: клавиатура крепится к последней части, а не к первой."""
+        markup = {"inline_keyboard": [[{"text": "кнопка", "callback_data": "cmd:/open"}]]}
+        self.bot.send_message(1, "строка сообщения\n" * 500, reply_markup=markup)
+        calls = self.session.calls
+        self.assertGreater(len(calls), 1)
+        self.assertNotIn("reply_markup", calls[0]["payload"])
+        self.assertEqual(calls[-1]["payload"]["reply_markup"], markup)
+
+    def test_answer_callback_query_payload(self) -> None:
+        """Нажатие кнопки обязательно подтверждаем, иначе Telegram будет повторять апдейт."""
+        self.session.responses = [FakeResponse({"ok": True, "result": True})]
+        self.assertTrue(self.bot.answer_callback_query("cb-1", text="х" * 500))
+        call = self.session.calls[0]
+        self.assertTrue(call["url"].endswith("/answerCallbackQuery"))
+        self.assertEqual(call["payload"]["callback_query_id"], "cb-1")
+        self.assertEqual(len(call["payload"]["text"]), 200)      # лимит Bot API
+        self.assertNotIn("show_alert", call["payload"])
 
     def test_delete_webhook(self) -> None:
         self.session.responses = [FakeResponse({"ok": True, "result": True})]
@@ -3838,13 +3902,16 @@ class RecordingCommandsTelegram:
 class WebhookCliTelegram(RecordingCommandsTelegram):
     """Клиент CLI вебхука: setWebhook, getWebhookInfo и список команд."""
 
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(self, *, error: Exception | None = None,
+                 allowed_updates: Sequence[str] | None = None) -> None:
         super().__init__(error=error)
         self.url = ""
+        # Что Telegram сообщает о типах апдейтов; None — как будто поля нет (без ограничений).
+        self.allowed_updates = allowed_updates
 
     def set_webhook(self, url: str, *, secret_token: str | None = None,
                     drop_pending_updates: bool = False,
-                    allowed_updates: Sequence[str] = ("message",),
+                    allowed_updates: Sequence[str] = DEFAULT_ALLOWED_UPDATES,
                     max_connections: int | None = None) -> bool:
         """Запоминает адрес вместо обращения к Bot API."""
         self.url = url
@@ -3852,7 +3919,10 @@ class WebhookCliTelegram(RecordingCommandsTelegram):
 
     def get_webhook_info(self) -> dict[str, Any]:
         """Ответ Telegram на getWebhookInfo для только что установленного адреса."""
-        return {"url": self.url, "pending_update_count": 0}
+        info: dict[str, Any] = {"url": self.url, "pending_update_count": 0}
+        if self.allowed_updates is not None:
+            info["allowed_updates"] = list(self.allowed_updates)
+        return info
 
 
 class TelegramWithoutCommands:
@@ -3940,6 +4010,49 @@ class CommandMenuDiagnosticsTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("не удалось объявить", printed.getvalue())
         self.assertIn("--set-commands", printed.getvalue())
+
+    def test_webhook_switch_reports_update_types(self) -> None:
+        """Сразу видно, что вебхук просит и нажатия кнопок."""
+        telegram = WebhookCliTelegram()
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            set_webhook_mode(Settings(webhook_secret=TEST_SECRET),
+                             "https://example.test/api/telegram", telegram=telegram)
+        self.assertIn("callback_query", printed.getvalue())
+
+
+class WebhookUpdatesReportTests(unittest.TestCase):
+    """--webhook-info: видно, присылает ли Telegram нажатия кнопок и состав чата."""
+
+    def test_warns_when_webhook_has_old_update_types(self) -> None:
+        """Вебхук, поставленный без callback_query: кнопки молчат — говорим об этом прямо."""
+        telegram = WebhookCliTelegram(allowed_updates=["message"])
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = show_webhook_info(Settings(telegram_token="t"), telegram=telegram)
+        self.assertEqual(code, 0)
+        self.assertIn("callback_query", printed.getvalue())
+        self.assertIn("my_chat_member", printed.getvalue())
+        self.assertIn("--set-webhook", printed.getvalue())
+
+    def test_silent_when_all_types_requested(self) -> None:
+        telegram = WebhookCliTelegram(allowed_updates=list(DEFAULT_ALLOWED_UPDATES))
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = show_webhook_info(Settings(telegram_token="t"), telegram=telegram)
+        self.assertEqual(code, 0)
+        self.assertIn("callback_query", printed.getvalue())
+        self.assertNotIn("⚠", printed.getvalue())
+
+    def test_unlimited_types_are_reported(self) -> None:
+        """Пустое поле allowed_updates = «ограничений нет»: Telegram присылает всё."""
+        telegram = WebhookCliTelegram()
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = show_webhook_info(Settings(telegram_token="t"), telegram=telegram)
+        self.assertEqual(code, 0)
+        self.assertIn("не ограничены", printed.getvalue())
+
+    def test_updates_report_marks_missing_types(self) -> None:
+        lines = updates_report({"allowed_updates": ["message", "callback_query"]})
+        self.assertIn("my_chat_member", " ".join(lines))
+        self.assertIn("не ограничены", updates_report({})[0])
 
 
 class TelegramCommandsApiTests(unittest.TestCase):
@@ -4351,6 +4464,241 @@ class ChatListTests(unittest.TestCase):
                              FakeResponse([{"chat_id": 2}, {"chat_id": 3}])]
         self.assertEqual(storage.list_chat_ids(), [1, 2, 3])
         self.assertEqual(session.calls[0]["params"]["select"], "chat_id")
+
+
+class OpenReportTests(unittest.TestCase):
+    """Команда /open: кому перевести и от кого получить лично — только строки автора."""
+
+    def setUp(self) -> None:
+        self.storage = InMemoryStorage(default_currency="BYN")
+        self.members = seed_chat(self.storage, chat=CHAT)
+
+    def ask(self, author: ChatMember | None = MEMBER_LEHA) -> str:
+        """Гоняет /open через handle_text и возвращает ответ бота."""
+        return handle_text("/open", CHAT, storage=self.storage, parser=HeuristicParser(),
+                           settings=Settings(default_currency="BYN"),
+                           members=self.members, author=author)
+
+    def debt(self, debtor: ChatMember, creditor: ChatMember, amount: float) -> None:
+        """Записывает долг между участниками чата (как это делает бот)."""
+        self.storage.add_debt(CHAT, debtor.display_name, creditor.display_name, "BYN", amount,
+                              from_user_id=debtor.user_id, to_user_id=creditor.user_id)
+
+    def test_person_transfers_split(self) -> None:
+        """Переводы делятся на «я перевожу» и «мне переводят» по подписи человека."""
+        transfers = [Balance("Леша", "Дима", "BYN", 3.0),
+                     Balance("Маша", "Леша", "BYN", 5.0),
+                     Balance("Петя", "Маша", "BYN", 1.0)]
+        outgoing, incoming = person_transfers(transfers, "Леша")
+        self.assertEqual([item.creditor for item in outgoing], ["Дима"])
+        self.assertEqual([item.debtor for item in incoming], ["Маша"])
+        self.assertEqual(person_transfers(transfers, ""), ([], []))
+
+    def test_format_shows_both_directions(self) -> None:
+        label = "Леша Козлов (@kozlovAlex)"
+        report = format_open_report(
+            label,
+            [Balance(label, "Дмитрий Болт (@bdzmity)", "BYN", 3.0)],
+            [Balance("Маша Петрова (@petrova_m)", label, "USD", 10.0)],
+            "BYN",
+        )
+        self.assertIn("🧭 Долги лично вам — Леша Козлов (@kozlovAlex) (валюта: BYN)", report)
+        self.assertIn("🔴 Переведите:", report)
+        self.assertIn("• Дмитрий Болт (@bdzmity) — 3.00 BYN", report)
+        self.assertIn("Итого перевести: 3.00 BYN", report)
+        self.assertIn("🟢 Вам переведут:", report)
+        self.assertIn("Итого получить: 10.00 USD", report)
+        self.assertIn("/settle", report)
+
+    def test_format_without_debts_and_without_person(self) -> None:
+        self.assertIn("🎉 Чисто", format_open_report("Леша", [], []))
+        self.assertIn("Не вижу, кто вы", format_open_report("", [], []))
+
+    def test_open_lists_only_my_transfers(self) -> None:
+        """Переводы чужих людей в личный список не попадают — только адресаты автора."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_MASHA, MEMBER_DIMA, 10.0)
+        reply = self.ask()
+        self.assertIsInstance(reply, ChatReply)          # ответ приходит с кнопками
+        self.assertIn("🔴 Переведите:", reply)
+        self.assertIn("• Дмитрий Болт (@bdzmity) — 3.00 BYN", reply)
+        self.assertIn("Итого перевести: 3.00 BYN", reply)
+        self.assertNotIn("Маша", reply)
+        self.assertNotIn("🟢 Вам переведут:", reply)     # зачитывать ему никто не должен
+
+    def test_open_counts_netting_towards_me(self) -> None:
+        """Взаимозачёт учтён: «должен 3» и «должны 5» — это «вам переведут 2»."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_DIMA, MEMBER_LEHA, 5.0)
+        reply = self.ask()
+        self.assertIn("🟢 Вам переведут:", reply)
+        self.assertIn("• Дмитрий Болт (@bdzmity) — 2.00 BYN", reply)
+        self.assertNotIn("🔴 Переведите:", reply)
+
+    def test_open_without_debts_and_without_author(self) -> None:
+        self.assertIn("Долгов нет", self.ask())
+        self.assertIn("Не вижу, кто вы", self.ask(author=None))
+
+    def test_open_hints_registration_to_newcomer(self) -> None:
+        """Незарегистрированному автору бот напоминает про /reg."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        newcomer = ChatMember(chat_id=CHAT, user_id=999, username="gosha",
+                              display_name="Гоша Петров")
+        self.assertIn("/reg", self.ask(author=newcomer))
+
+    def test_open_is_declared_and_advised(self) -> None:
+        """/open есть и в меню Telegram, и в справке — иначе его не нажать."""
+        self.assertIn("open", [name for name, _ in BOT_COMMANDS])
+        self.assertIn("/open", format_help("BYN"))
+
+
+class CommandButtonsTests(unittest.TestCase):
+    """Клавиатура кнопок: содержимое, разбор callback_data и лимиты Telegram."""
+
+    def test_keyboard_layout(self) -> None:
+        """Кнопки идут по две в ряд, и каждая несёт свою команду."""
+        rows = inline_commands()["inline_keyboard"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows[0]), BUTTONS_PER_ROW)
+        self.assertEqual(rows[0][0]["callback_data"], "cmd:/open")
+        self.assertEqual([button["text"] for row in rows for button in row],
+                         [title for title, _ in CHAT_BUTTONS])
+        for row in rows:
+            for button in row:
+                # Telegram ограничивает callback_data 64 байтами.
+                self.assertLessEqual(len(button["callback_data"].encode("utf-8")), 64)
+                self.assertLessEqual(len(button["text"]), 64)
+
+    def test_buttons_carry_only_declared_commands(self) -> None:
+        """Кнопка без объявленной команды выглядела бы «мёртвой» — такой быть не должно."""
+        declared = {name for name, _ in BOT_COMMANDS}
+        for _, command in CHAT_BUTTONS:
+            self.assertIn(command.lstrip("/"), declared)
+
+    def test_button_command_parsing(self) -> None:
+        self.assertEqual(button_command("cmd:/settle"), "/settle")
+        self.assertEqual(button_command("cmd:/open"), "/open")
+        self.assertEqual(button_command("cmd:/unknown"), "")   # не наша команда
+        self.assertEqual(button_command("чужое"), "")
+        self.assertEqual(button_command(""), "")
+        self.assertEqual(button_command(None), "")
+
+    def test_with_buttons_keeps_text(self) -> None:
+        """ChatReply — это строка: текст и сравнение работают как обычно."""
+        reply = with_buttons("привет")
+        self.assertEqual(reply, "привет")
+        self.assertTrue(reply.buttons)
+        self.assertIsInstance(reply, str)
+
+
+class ChatButtonsTests(unittest.TestCase):
+    """Кнопки в чате: клавиатура под ответом и обработка нажатий (callback_query)."""
+
+    def build(self, **settings_kwargs: Any) -> tuple[Settings, InMemoryStorage, FakeTelegram]:
+        """Бот с хранилищем в памяти и подменённым Telegram."""
+        settings = Settings(default_currency="BYN", **settings_kwargs)
+        storage = InMemoryStorage(default_currency="BYN")
+        seed_chat(storage, chat=CHAT)
+        return settings, storage, FakeTelegram([])
+
+    def callback_update(self, data: str, *, update_id: int = 9, user: int = 101) -> dict:
+        """Апдейт с нажатием кнопки — так его присылает Telegram."""
+        return {
+            "update_id": update_id,
+            "callback_query": {
+                "id": "cb-1",
+                "from": {"id": user, "username": "kozlovAlex", "first_name": "Леша"},
+                "message": {"message_id": 5, "chat": {"id": CHAT}},
+                "data": data,
+            },
+        }
+
+    def run_bot(self, settings: Settings, storage: InMemoryStorage,
+                telegram: FakeTelegram) -> None:
+        """Прогоняет один апдейт через бота."""
+        DebtBot(settings, storage, HeuristicParser(), telegram).run(poll_timeout=0, max_updates=1)
+
+    def test_report_comes_with_command_buttons(self) -> None:
+        """Под отчётом — кнопки команд чата, среди них /settle и /open."""
+        settings, storage, telegram = self.build()
+        telegram.updates = [make_update(5, "/debts", chat=CHAT, user=101)]
+        self.run_bot(settings, storage, telegram)
+        self.assertEqual(telegram.markups[0], inline_commands())
+        data = [button["callback_data"]
+                for row in telegram.markups[0]["inline_keyboard"] for button in row]
+        self.assertIn("cmd:/settle", data)
+        self.assertIn("cmd:/open", data)
+
+    def test_saved_debt_also_comes_with_buttons(self) -> None:
+        """После записи долга кнопки тоже есть: сразу видно, кому переводить."""
+        settings, storage, telegram = self.build()
+        telegram.updates = [make_update(5, "Леша должен Диме 3 рубля", chat=CHAT, user=101)]
+        self.run_bot(settings, storage, telegram)
+        self.assertEqual(telegram.markups[0], inline_commands())
+
+    def test_help_has_no_buttons(self) -> None:
+        """Справка — не отчёт: клавиатура там только мешала бы."""
+        settings, storage, telegram = self.build()
+        telegram.updates = [make_update(5, "/help", chat=CHAT, user=101)]
+        self.run_bot(settings, storage, telegram)
+        self.assertIsNone(telegram.markups[0])
+
+    def test_pressing_settle_button_runs_settle(self) -> None:
+        """Нажатие кнопки выполняется как команда — и снова с кнопками."""
+        settings, storage, telegram = self.build()
+        storage.add_debt(CHAT, "Леша Козлов", "Дмитрий Болт", "BYN", 3.0,
+                         from_user_id=101, to_user_id=102)
+        telegram.updates = [self.callback_update("cmd:/settle")]
+        self.run_bot(settings, storage, telegram)
+        self.assertEqual(telegram.callbacks, [("cb-1", "")])          # «часики» погашены
+        self.assertIn("Минимум переводов", telegram.sent[0][1])
+        self.assertIn("→ Дмитрий Болт (@bdzmity): 3.00 BYN", telegram.sent[0][1])
+        self.assertEqual(telegram.markups[0], inline_commands())
+
+    def test_pressing_open_button_shows_my_transfers(self) -> None:
+        """Кнопка «Кому перевести» отвечает личным списком нажавшего."""
+        settings, storage, telegram = self.build()
+        storage.add_debt(CHAT, "Маша Петрова", "Дмитрий Болт", "BYN", 10.0,
+                         from_user_id=103, to_user_id=102)
+        telegram.updates = [self.callback_update("cmd:/open")]
+        self.run_bot(settings, storage, telegram)
+        self.assertIn("Долги лично вам —", telegram.sent[0][1])
+        self.assertIn("(@kozlovAlex)", telegram.sent[0][1])   # подпись нажавшего
+        self.assertIn("🎉 Чисто", telegram.sent[0][1])         # Маша должна Диме, не Леше
+
+    def test_foreign_button_is_ignored(self) -> None:
+        """Незнакомый callback_data: ничего не отвечаем, но кнопку «отпускаем»."""
+        settings, storage, telegram = self.build()
+        telegram.updates = [self.callback_update("cmd:/rm-rf"),
+                            self.callback_update("чужое", update_id=10)]
+        DebtBot(settings, storage, HeuristicParser(), telegram).run(poll_timeout=0, max_updates=2)
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(telegram.callbacks, [("cb-1", ""), ("cb-1", "")])
+
+    def test_button_from_denied_user_is_refused(self) -> None:
+        """Доступ проверяется и при нажатии кнопки, а не только на сообщениях."""
+        settings, storage, telegram = self.build(allowed_user_ids=frozenset({555}))
+        telegram.updates = [self.callback_update("cmd:/settle")]
+        self.run_bot(settings, storage, telegram)
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(telegram.callbacks, [("cb-1", DENIED_REPLY)])
+
+    def test_button_respects_chat_password(self) -> None:
+        """Пока пароль чата не подтверждён, кнопка тоже просит пароль."""
+        settings, storage, telegram = self.build(chat_password="сезам")
+        telegram.updates = [self.callback_update("cmd:/debts")]
+        self.run_bot(settings, storage, telegram)
+        self.assertIn("пришлите пароль", telegram.sent[0][1])
+
+    def test_button_works_through_webhook(self) -> None:
+        """Вебхук передаёт апдейт боту как есть — нажатие кнопки работает и там."""
+        settings, storage, telegram = self.build()
+        storage.add_debt(CHAT, "Леша Козлов", "Дмитрий Болт", "BYN", 3.0,
+                         from_user_id=101, to_user_id=102)
+        bot = DebtBot(settings, storage, HeuristicParser(), telegram)
+        self.assertTrue(bot.process_update(self.callback_update("cmd:/open")))
+        self.assertIn("Долги лично вам", telegram.sent[0][1])
+        self.assertEqual(telegram.callbacks, [("cb-1", "")])
 
 
 if __name__ == "__main__":

@@ -32,6 +32,12 @@ REPORT_EMAIL, месяц последней отправки хранится в
 в тех чатах, где пароль введён верно. Пароль принимается командой /login (или
 /password ваш-пароль, или просто сообщением с паролем); /login и /reg — нажимаемые
 команды, их бот показывает тем, кто ещё не вошёл или ещё не зарегистрировался.
+
+Кнопки: под отчётами (/debts, /mydebts, /open, /settle, /d) и под подтверждением записи
+бот показывает кнопки команд чата (CHAT_BUTTONS) — их можно нажать вместо набора команды.
+Telegram присылает нажатие апдейтом callback_query, и бот выполняет ту же команду от имени
+нажавшего (см. DebtBot._handle_callback). /open — короткий личный ответ «кому перевести
+и кто переведёт мне»: тот же зачёт, что /settle, но только строки этого человека.
 """
 
 from __future__ import annotations
@@ -67,12 +73,15 @@ from debts import (
     format_expense_saved,
     format_help,
     format_members_report,
+    format_open_report,
     format_person_report,
     format_registered,
     format_repayment_saved,
     format_transfers,
     minimal_transfers,
     normalize_name,
+    person_label,
+    person_transfers,
     split_amount,
 )
 from deepseek import (
@@ -110,7 +119,12 @@ from storage import (
     probe_key_headers,
     storage_from_settings,
 )
-from telegram_api import CSV_DOCUMENT_TYPE, TelegramBot, TelegramError
+from telegram_api import (
+    CSV_DOCUMENT_TYPE,
+    DEFAULT_ALLOWED_UPDATES,
+    TelegramBot,
+    TelegramError,
+)
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 logger = logging.getLogger("debt_bot")
@@ -196,8 +210,21 @@ DEMO_PREVIEW_LINES = 8
 EXPORT_COMMANDS = ("/export", "/report", "/csv", "/файл")
 # Команда личных итогов: «сколько должен я и сколько должны мне» — только про автора.
 MY_DEBTS_COMMANDS = ("/mydebts", "/me", "/мои")
+# Команда «кому перевести лично мне»: тот же зачёт, что /settle, но только строки автора.
+OPEN_COMMANDS = ("/open", "/кому")
 # Команда диагностики: сервисы, курсы и настройки чата — ответ приходит в чат.
 STATUS_COMMANDS = ("/status", "/статус", "/диагностика")
+
+# Кнопки под сообщением: те же команды, что в меню «/», но нажимать их не нужно — они
+# приходят вместе с отчётом и записью. callback_data = CALLBACK_PREFIX + команда.
+CHAT_BUTTONS: tuple[tuple[str, str], ...] = (
+    ("🧭 Кому перевести", "/open"),
+    ("🧮 Взаимозачёт", "/settle"),
+    ("📊 Долги чата", "/debts"),
+    ("👤 Мои итоги", "/mydebts"),
+)
+BUTTONS_PER_ROW = 2
+CALLBACK_PREFIX = "cmd:"
 
 # Список команд для меню Telegram (setMyCommands): то же, что в /help, только коротко.
 # Из-за этого списка команды видны в меню «/», а в ответах бота Telegram подсвечивает
@@ -211,6 +238,7 @@ BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("reg", "регистрация: /reg Имя, кличка (или /reg @ник Имя)"),
     ("who", "кто в чате и кто уже зарегистрирован"),
     ("mydebts", "мои долги: сколько должен я и сколько должны мне"),
+    ("open", "кому перевести лично мне и кто переведёт мне"),
     ("debts", "все долги чата с взаимозачётом"),
     ("settle", "минимум переводов, чтобы все долги закрылись"),
     ("d", "все записи в валюте чата по курсу на дату записи"),
@@ -246,6 +274,53 @@ class CsvReport:
         if len(lines) > limit:
             head.append(f"… (в файле ещё строк: {len(lines) - limit})")
         return "\n".join([f"[файл {self.filename}]", *head])
+
+
+class ChatReply(str):
+    """Текстовый ответ, под которым бот показывает кнопки команд чата (см. CHAT_BUTTONS).
+
+    Наследник str намеренно: такие ответы читаются и сравниваются как обычный текст
+    (тесты, демо-режим, логи), а `handle_text` по типу решает, добавлять ли клавиатуру, —
+    ровно так же, как CsvReport решает «текст или файл». Кнопки нужны там, где человеку
+    дальше есть что нажать: отчёты (/debts, /mydebts, /open, /settle, /d) и подтверждение
+    записи. На приветствиях, справке и ошибках они бы только мешали.
+    """
+
+    buttons: bool = True
+
+    def __new__(cls, text: str, buttons: bool = True) -> "ChatReply":
+        reply = super().__new__(cls, text)
+        reply.buttons = buttons
+        return reply
+
+
+def with_buttons(reply: str) -> ChatReply:
+    """Помечает текстовый ответ как «показать кнопки команд чата»."""
+    return ChatReply(reply)
+
+
+def inline_commands() -> dict[str, Any]:
+    """Inline-клавиатура с командами чата: по две кнопки в ряд (для reply_markup)."""
+    rows: list[list[dict[str, str]]] = []
+    for start in range(0, len(CHAT_BUTTONS), BUTTONS_PER_ROW):
+        rows.append([
+            {"text": title, "callback_data": f"{CALLBACK_PREFIX}{command}"}
+            for title, command in CHAT_BUTTONS[start:start + BUTTONS_PER_ROW]
+        ])
+    return {"inline_keyboard": rows}
+
+
+def button_command(data: str) -> str:
+    """Команда из callback_data нажатой кнопки («cmd:/settle» → «/settle»).
+
+    Пустая строка — если это не наша кнопка (старое сообщение, чужой callback_data):
+    такие нажатия игнорируем, но «часики» всё равно гасим.
+    """
+    text = str(data or "")
+    if not text.startswith(CALLBACK_PREFIX):
+        return ""
+    command = text[len(CALLBACK_PREFIX):].strip()
+    return command if command in {item for _, item in CHAT_BUTTONS} else ""
 
 
 class HeuristicParser:
@@ -452,6 +527,44 @@ def my_debts_report(chat_id: int, storage: Storage, members: Sequence[ChatMember
         return f"⚠️ Проблема с базой данных: {exc}"
     report = format_person_report(debts, members, author, chat_currency)
     return _with_registration_tip(report, author)
+
+
+def open_report(chat_id: int, storage: Storage, settings: Settings,
+                members: Sequence[ChatMember], author: ChatMember | None,
+                chat_currency: str) -> str:
+    """Команда /open: кому перевести и от кого получить лично мне — короткий список.
+
+    Считаем тот же взаимозачёт, что /settle (минимум переводов, курсы на дату записи), и
+    оставляем только строки автора: он видит конкретные адресаты и суммы, а не общий котёл
+    чата. Именно этот список адресатов и есть ответ «кому должен лично я».
+    """
+    if author is None:
+        return ("🤔 Не вижу, кто вы: у сообщения нет автора.\n"
+                "Напишите что-нибудь в чат от себя и повторите /open.")
+    try:
+        debts = storage.list_debts(chat_id)
+        if not debts:
+            return _with_registration_tip("📭 Долгов нет — переводить нечего.", author)
+        base = str(settings.rates_base or "BYN").upper()
+        update = update_rates(settings, storage)
+        points = storage.rates_since(base, history_start(debts))
+    except StorageError as exc:
+        return f"⚠️ Проблема с базой данных: {exc}"
+    converted = convert_debts(debts, chat_currency, rate_table(points), base)
+    source = converted.debts if converted.changed else debts
+    label = person_label(source, members, author)
+    outgoing, incoming = person_transfers(minimal_transfers(source, members), label)
+    lines: list[str] = []
+    if converted.changed:
+        lines.append(f"💱 Считаю в {chat_currency.upper()} по курсу на дату записи:")
+        lines.extend(format_used_rates(converted.rates_used, chat_currency.upper()))
+        lines.append("")
+    lines.append(format_open_report(label, outgoing, incoming, chat_currency))
+    if converted.skipped:
+        lines.append("• Без курса оставил: " + ", ".join(sorted(set(converted.skipped))))
+    if update.problems:
+        lines.append("⚠️ " + "; ".join(update.problems[:2]))
+    return _with_registration_tip("\n".join(lines), author)
 
 
 def status_report(chat_id: int, storage: Storage, settings: Settings,
@@ -774,7 +887,8 @@ def handle_text(
 
     Обычный ответ — строка; команда выгрузки (/export) отвечает объектом CsvReport:
     Telegram не умеет отправлять файл сообщением, поэтому решение «файл или текст»
-    принимает вызывающая сторона (DebtBot).
+    принимает вызывающая сторона (DebtBot). Отчёт помечается как ChatReply — это значит
+    «текст с кнопками команд чата» (см. CHAT_BUTTONS).
     """
     raw = (text or "").strip()
     if members is None:
@@ -813,15 +927,20 @@ def handle_text(
     if command in ("/rates", "/rate"):
         return rates_report(storage, settings, default_currency)
     if command in ("/d", "/convert"):
-        return converted_report(chat_id, storage, settings, members, default_currency)
+        return with_buttons(converted_report(chat_id, storage, settings, members, default_currency))
     if command in ("/settle", "/offset", "/зачёт", "/зачет"):
-        return settle_report(chat_id, storage, settings, members, default_currency)
+        return with_buttons(settle_report(chat_id, storage, settings, members, default_currency))
     if command in MY_DEBTS_COMMANDS:
-        return my_debts_report(chat_id, storage, members, author, default_currency)
+        return with_buttons(my_debts_report(chat_id, storage, members, author, default_currency))
+    if command in OPEN_COMMANDS:
+        return with_buttons(open_report(chat_id, storage, settings, members, author,
+                                        default_currency))
     if command in EXPORT_COMMANDS:
         return debts_csv_report(chat_id, storage)
     if command == "/debts":
-        return format_debts_report(storage.list_debts(chat_id), default_currency, members)
+        return with_buttons(
+            format_debts_report(storage.list_debts(chat_id), default_currency, members)
+        )
     if command == "/currency":
         return set_default_currency(argument or raw, chat_id, storage, default_currency)
     if command == "/reset":
@@ -867,16 +986,18 @@ def handle_text(
             to_user_id=member_to.user_id if member_to else None,
         )
         formatter = format_repayment_saved if is_repayment else format_debt_saved
-        return formatter(record, members)
+        return with_buttons(formatter(record, members))
 
     if parsed.intent == "expense":
-        return save_expense(
+        return with_buttons(save_expense(
             parsed, raw, chat_id, storage, members, author,
             currency=(parsed.currency or explicit_currency or default_currency).upper(),
-        )
+        ))
 
     if parsed.intent == "debts":
-        return format_debts_report(storage.list_debts(chat_id), default_currency, members)
+        return with_buttons(
+            format_debts_report(storage.list_debts(chat_id), default_currency, members)
+        )
     if parsed.intent == "set_currency":
         if not parsed.currency:
             return "Не понял валюту. Пример: /currency USD"
@@ -1197,6 +1318,10 @@ class DebtBot:
         if isinstance(membership, Mapping):
             self._handle_membership(membership)
             return
+        callback = update.get("callback_query")
+        if isinstance(callback, Mapping):
+            self._handle_callback(callback)
+            return
         message = update.get("message") or {}
         text = message.get("text")
         chat_id = (message.get("chat") or {}).get("id")
@@ -1271,10 +1396,73 @@ class DebtBot:
             members = [*members, author]      # состав мог не прочитаться — автора всё равно знаем
         return members
 
-    def _send(self, chat_id: Any, text: str, message: Mapping[str, Any]) -> None:
-        """Отправляет ответ, логируя проблемы доставки."""
+    def _handle_callback(self, callback: Mapping[str, Any]) -> None:
+        """Нажатие кнопки под сообщением: выполняет команду от имени того, кто нажал.
+
+        Кнопки — те же команды чата (см. CHAT_BUTTONS), поэтому нажатие обрабатывается как
+        сообщение с этой командой: ответы, проверки доступа и пароля чата одинаковые.
+        Кнопка при этом не «залипает»: Telegram ждёт answerCallbackQuery, и мы его шлём.
+        """
+        query_id = str(callback.get("id") or "")
+        message = callback.get("message") or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        user = callback.get("from") or {}
+        command = button_command(callback.get("data") or "")
+        if chat_id is None:
+            return
+        if not command:
+            # Чужая кнопка или сообщение без наших команд: молчим, но «часики» гасим.
+            self._answer_callback(query_id)
+            logger.info("Нажата незнакомая кнопка в чате %s — пропускаю.", chat_id)
+            return
+        if not is_allowed(user.get("id"), self._settings):
+            logger.warning("Кнопка от недопущенного пользователя id=%s", user.get("id"))
+            self._answer_callback(query_id, DENIED_REPLY)
+            return
+
+        self._answer_callback(query_id)
+        self._telegram.send_typing(chat_id)
+        author = member_from_telegram(int(chat_id), user)
+        members = self._remember_author(author)
         try:
-            self._telegram.send_message(chat_id, text, reply_to=message.get("message_id"))
+            reply = handle_text(
+                command, int(chat_id),
+                storage=self._storage, parser=self._parser, settings=self._settings,
+                members=members, author=author,
+            )
+        except StorageError as exc:
+            logger.error("Хранилище: %s", exc)
+            reply = f"⚠️ Проблема с базой данных: {exc}"
+        except Exception as exc:  # noqa: BLE001 — бот не должен падать из-за одного нажатия
+            logger.exception("Ошибка обработки нажатия кнопки: %s", exc)
+            reply = "⚠️ Внутренняя ошибка, попробуйте ещё раз."
+        self._send_reply(chat_id, reply, {})
+
+    def _answer_callback(self, query_id: str, text: str = "") -> None:
+        """Гасит «часики» на нажатой кнопке — Telegram ждёт этого сразу после callback_query."""
+        if not query_id:
+            return
+        try:
+            self._telegram.answer_callback_query(query_id, text=text)
+        except TelegramError as exc:
+            logger.debug("answerCallbackQuery: %s", exc)
+        except AttributeError:
+            # Подменённый клиент (тесты, чужая обёртка) без этого метода: нажатие всё равно
+            # обрабатывается, просто Telegram будет считать кнопку «неотвеченной».
+            logger.debug("Клиент Telegram не умеет answerCallbackQuery — пропускаю.")
+
+    def _send(self, chat_id: Any, text: str, message: Mapping[str, Any],
+              buttons: bool = False) -> None:
+        """Отправляет ответ, логируя проблемы доставки.
+
+        `buttons=True` добавляет под сообщением кнопки команд чата (CHAT_BUTTONS):
+        после отчёта или записи долга человеку есть что нажать, не набирая команду руками.
+        """
+        try:
+            self._telegram.send_message(
+                chat_id, text, reply_to=message.get("message_id"),
+                reply_markup=inline_commands() if buttons else None,
+            )
         except TelegramError as exc:
             logger.error("sendMessage: %s", exc)
 
@@ -1284,7 +1472,11 @@ class DebtBot:
 
         Если документ не дошёл, честно сообщаем об этом в чат: молчание выглядело бы как
         «бот ничего не нашёл», а причина (лимиты, права в чате) важна для человека.
+        Ответ с пометкой ChatReply уходит текстом и с кнопками команд чата.
         """
+        if isinstance(reply, ChatReply):
+            self._send(chat_id, str(reply), message, buttons=reply.buttons)
+            return
         if not isinstance(reply, CsvReport):
             self._send(chat_id, reply, message)
             return
@@ -1393,6 +1585,8 @@ def set_webhook_mode(settings: Settings, url: str, *, drop_pending: bool = False
 
     print("✓ Вебхук установлен:", info.get("url"))
     print(f"  ожидает апдейтов: {info.get('pending_update_count', 0)}")
+    print(f"  типы апдейтов: {', '.join(DEFAULT_ALLOWED_UPDATES)} "
+          "(сообщения, добавление в чат, нажатия кнопок)")
     # В режиме вебхука `python bot.py` не запускается, поэтому список команд объявляем
     # здесь: иначе в чате не будет ни меню «/», ни нажимаемых /reg и /login.
     problem = declare_commands(client)
@@ -1450,10 +1644,35 @@ def delete_webhook_mode(settings: Settings, *, drop_pending: bool = False) -> in
     return 0
 
 
-def show_webhook_info(settings: Settings) -> int:
-    """Команда --webhook-info: что сейчас настроено в Telegram."""
+def updates_report(info: Mapping[str, Any]) -> list[str]:
+    """Что Telegram присылает по вебхуку: строки про типы апдейтов для --webhook-info и --check.
+
+    `getWebhookInfo` отдаёт поле allowed_updates, и по нему видно, дойдут ли нажатия кнопок
+    (callback_query) и просьба пароля при добавлении бота (my_chat_member). Пустое поле
+    означает «без ограничений»: Telegram пришлёт все типы. Если вебхук поставлен старой
+    версией бота, список ограничен одними сообщениями — тогда кнопки молчат, и это самая
+    частая причина «нажимаю, а ничего не происходит».
+    """
+    types = [str(item) for item in (info.get("allowed_updates") or [])]
+    if not types:
+        return ["• Типы апдейтов: не ограничены — Telegram присылает всё"]
+    lines = ["• Типы апдейтов: " + ", ".join(types)]
+    missing = [item for item in DEFAULT_ALLOWED_UPDATES if item not in types]
+    if missing:
+        lines.append(f"  ⚠ не приходят: {', '.join(missing)} — кнопки и просьба пароля при "
+                     "добавлении в чат работать не будут")
+        lines.append("  переустановите вебхук: python bot.py --set-webhook <адрес>")
+    return lines
+
+
+def show_webhook_info(settings: Settings, *, telegram: Any = None) -> int:
+    """Команда --webhook-info: что сейчас настроено в Telegram.
+
+    Клиента можно подменить — тесты проверяют разбор ответа без сети.
+    """
     try:
-        info = _telegram_for(settings).get_webhook_info()
+        client = telegram if telegram is not None else _telegram_for(settings)
+        info = client.get_webhook_info()
     except (ConfigError, TelegramError) as exc:
         print("Ошибка:", exc, file=sys.stderr)
         return 1
@@ -1461,6 +1680,8 @@ def show_webhook_info(settings: Settings) -> int:
     url = str(info.get("url") or "")
     print("Режим:", f"вебхук {url}" if url else "long polling (вебхук не установлен)")
     print("Ожидает апдейтов:", info.get("pending_update_count", 0))
+    for line in updates_report(info):
+        print(line)
     if info.get("last_error_date"):
         print("Последняя ошибка доставки:", info.get("last_error_message"))
     if info.get("ip_address"):
@@ -1529,6 +1750,8 @@ def check_services(settings: Settings) -> bool:
                 print("  ✗", secret_problem)
             else:
                 print("  ✓ секрет вебхука задан — заголовки запросов проверяются")
+            for line in updates_report(info):
+                print("  " + line)
         else:
             print("• Telegram: вебхук не установлен — режим: python bot.py (long polling)")
             print("  включить вебхук: python bot.py --set-webhook https://<домен>/api/telegram")

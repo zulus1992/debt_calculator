@@ -12,6 +12,13 @@ MAX_MESSAGE_LENGTH = 4096
 MAX_CAPTION_LENGTH = 1024   # лимит подписи к документу в Bot API
 TEXT_DOCUMENT_TYPE = "text/plain; charset=utf-8"
 CSV_DOCUMENT_TYPE = "text/csv; charset=utf-8"   # выгрузка /export: копия таблицы debts
+# Какие апдейты просим у Telegram: сообщения, изменения состава чата (по ним бот здоровается
+# и просит пароль при добавлении) и нажатия inline-кнопок. Telegram присылает ТОЛЬКО
+# перечисленное, поэтому список общий для long polling и вебхука: без callback_query кнопки
+# под сообщением не работают, а без my_chat_member не приходит приветствие с просьбой о пароле.
+DEFAULT_ALLOWED_UPDATES = ("message", "my_chat_member", "callback_query")
+# Текст всплывающей подсказки у кнопки (answerCallbackQuery) — не длиннее 200 символов.
+CALLBACK_ANSWER_LIMIT = 200
 
 
 class TelegramError(RuntimeError):
@@ -117,12 +124,17 @@ class TelegramBot:
         *,
         poll_timeout: int = 30,
         limit: int = 20,
+        allowed_updates: Sequence[str] = DEFAULT_ALLOWED_UPDATES,
     ) -> list[dict[str, Any]]:
-        """Забирает новые апдейты методом длинного опроса (long polling)."""
+        """Забирает новые апдейты методом длинного опроса (long polling).
+
+        В `allowed_updates` по умолчанию входят и нажатия кнопок, и изменение состава
+        чата: без них Telegram эти апдейты просто не пришлёт.
+        """
         payload: dict[str, Any] = {
             "timeout": poll_timeout,
             "limit": limit,
-            "allowed_updates": ["message"],
+            "allowed_updates": list(allowed_updates),
         }
         if offset is not None:
             payload["offset"] = offset
@@ -136,7 +148,7 @@ class TelegramBot:
         *,
         secret_token: str | None = None,
         drop_pending_updates: bool = False,
-        allowed_updates: tuple[str, ...] = ("message",),
+        allowed_updates: tuple[str, ...] = DEFAULT_ALLOWED_UPDATES,
         max_connections: int | None = None,
     ) -> bool:
         """Переводит бота на вебхук: Telegram сам присылает апдейты на url.
@@ -172,10 +184,16 @@ class TelegramBot:
         *,
         reply_to: int | None = None,
         silent: bool = False,
+        reply_markup: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Отправляет текст, разбивая его на части по лимиту Telegram."""
+        """Отправляет текст, разбивая его на части по лимиту Telegram.
+
+        `reply_markup` — inline-кнопки (см. bot.inline_commands): они прикрепляются
+        к последней части длинного ответа, чтобы оказаться под текстом, а не над ним.
+        """
         sent: list[dict[str, Any]] = []
-        for chunk in split_message(text):
+        chunks = split_message(text)
+        for index, chunk in enumerate(chunks):
             payload: dict[str, Any] = {
                 "chat_id": chat_id,
                 "text": chunk,
@@ -186,9 +204,25 @@ class TelegramBot:
                 payload["allow_sending_without_reply"] = True
             if silent:
                 payload["disable_notification"] = True
+            if reply_markup is not None and index == len(chunks) - 1:
+                payload["reply_markup"] = dict(reply_markup)
             sent.append(dict(self.call("sendMessage", **payload) or {}))
             reply_to = None  # отвечаем на исходное сообщение только первым куском
         return sent
+
+    def answer_callback_query(self, callback_query_id: str, *, text: str = "",
+                              show_alert: bool = False) -> bool:
+        """Гасит «часики» на нажатой кнопке (Telegram ждёт этот вызов после callback_query).
+
+        Без ответа кнопка остаётся «нажатой», а Telegram будет повторять апдейт. Текстом
+        можно показать короткую подсказку (до 200 символов) — например, что нет доступа.
+        """
+        payload: dict[str, Any] = {"callback_query_id": str(callback_query_id or "")}
+        if text:
+            payload["text"] = str(text)[:CALLBACK_ANSWER_LIMIT]
+        if show_alert:
+            payload["show_alert"] = True
+        return bool(self.call("answerCallbackQuery", **payload))
 
     def send_document(
         self,
