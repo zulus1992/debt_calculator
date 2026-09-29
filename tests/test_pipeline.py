@@ -16,6 +16,8 @@ import unittest
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from email import policy
+from email.parser import BytesParser
 from typing import Any, Sequence
 
 import httpx
@@ -68,6 +70,7 @@ from debts import (
     split_amount,
     totals_by_person,
 )
+from gmail_api import Attachment, GmailSender, MailError, SentMessage, build_raw_message
 from deepseek import (
     SYSTEM_PROMPT,
     DeepSeekParser,
@@ -97,6 +100,14 @@ from rates import (
     rates_day,
     update_rates,
     update_rates_scheduled,
+)
+from reports import (
+    REPORT_STATE_KEY,
+    build_monthly_letter,
+    period_title,
+    report_period,
+    reports_check_lines,
+    send_monthly_reports,
 )
 from storage import (
     ChatMember,
@@ -755,12 +766,15 @@ class FakeSession:
 
     def post(self, url: str, json: Any = None, timeout: float | None = None,
              data: Any = None, files: Any = None, **kwargs: Any) -> FakeResponse:
-        """Имитация requests.post (Telegram, DeepSeek).
+        """Имитация requests.post (Telegram, DeepSeek, Gmail API).
 
         Отправка файла (sendDocument) уходит полями data/files — их тоже запоминаем.
+        Заголовки (например Authorization у Gmail API) попадают в kwargs — сохраняем их
+        отдельно, чтобы проверять авторизацию запросов.
         """
         self.calls.append({"method": "POST", "url": url, "payload": json,
-                           "data": data, "files": files, "timeout": timeout})
+                           "data": data, "files": files, "timeout": timeout,
+                           "headers": dict(kwargs.get("headers") or {})})
         return self._next()
 
     def request(self, method: str, url: str, params: Any = None, json: Any = None,
@@ -3964,6 +3978,379 @@ class TelegramCommandsApiTests(unittest.TestCase):
         """Бот без объявленных команд: пустой список, а не ошибка."""
         self.session.responses = [FakeResponse({"ok": True, "result": []})]
         self.assertEqual(self.bot.get_my_commands(), [])
+
+
+class FakeMailer:
+    """Подменяет GmailSender: запоминает письма (с вложениями) и отдаёт предсказуемый id."""
+
+    def __init__(self) -> None:
+        self.letters: list[dict[str, Any]] = []
+
+    def send(self, *, to: str, subject: str, body: str,
+             attachments: Sequence[Attachment] = ()) -> SentMessage:
+        """«Отправляет» письмо: только запись в список — сеть не нужна."""
+        self.letters.append({"to": to, "subject": subject, "body": body,
+                             "attachments": tuple(attachments)})
+        return SentMessage(message_id=f"msg-{len(self.letters)}", to=to, subject=subject)
+
+    def files(self, index: int = 0) -> list[str]:
+        """Имена файлов во вложении указанного письма."""
+        return [attachment.filename for attachment in self.letters[index]["attachments"]]
+
+
+class GmailMessageTests(unittest.TestCase):
+    """Письмо для Gmail API: заголовки, кодировка темы и base64url."""
+
+    def parse(self, raw: str):
+        """Разбирает поле raw так, как его увидит Gmail: письмо RFC 5322."""
+        return BytesParser(policy=policy.default).parsebytes(base64.urlsafe_b64decode(raw))
+
+    def test_raw_message_headers_and_encoding(self) -> None:
+        raw = build_raw_message(sender="bot@example.com", to="boss@example.com",
+                                subject="Отчёт по долгам за сентябрь 2026",
+                                body="Леша должен Диме 3.00 BYN")
+        message = self.parse(raw)
+        self.assertEqual(message["To"], "boss@example.com")
+        self.assertEqual(message["From"], "bot@example.com")
+        # Русская тема уходит в MIME-кодировке, но читается словами — как в почте.
+        self.assertEqual(str(message["Subject"]), "Отчёт по долгам за сентябрь 2026")
+        self.assertIn("Леша должен Диме 3.00 BYN", message.get_content())
+
+    def test_raw_message_without_sender_has_no_from(self) -> None:
+        """Без GMAIL_SENDER «From» не подставляем — это сделает сам Gmail."""
+        message = self.parse(build_raw_message(sender="", to="boss@example.com",
+                                               subject="Отчёт", body="текст"))
+        self.assertIsNone(message["From"])
+        self.assertEqual(str(message["Subject"]), "Отчёт")
+
+    def test_each_attachment_is_a_named_csv_file(self) -> None:
+        """Вложения — отдельные файлы CSV: по одному на чат, со своим именем и содержимым."""
+        raw = build_raw_message(
+            sender="bot@example.com", to="boss@example.com", subject="Отчёт",
+            body="текст письма",
+            attachments=[
+                Attachment(filename="debts_1_2026-09.csv", text="id,amount\n1,3.00\n"),
+                Attachment(filename="debts_2_2026-09.csv", text="id,amount\n2,10.00\n"),
+            ],
+        )
+        message = self.parse(raw)
+        self.assertEqual(message.get_content_type(), "multipart/mixed")
+        self.assertEqual(message.get_body(preferencelist=("plain",)).get_content().strip(),
+                         "текст письма")
+        attachments = list(message.iter_attachments())
+        self.assertEqual([part.get_filename() for part in attachments],
+                         ["debts_1_2026-09.csv", "debts_2_2026-09.csv"])
+        self.assertEqual(attachments[0].get_content_type(), "text/csv")
+        self.assertIn("1,3.00", attachments[0].get_content())
+        self.assertIn("2,10.00", attachments[1].get_content())
+
+
+class GmailSenderTests(unittest.TestCase):
+    """Gmail API: обновление access-токена, отправка письма и понятные ошибки."""
+
+    def sender(self, session: FakeSession) -> GmailSender:
+        """Клиент с подменённой сессией requests."""
+        return GmailSender("client-id", "client-secret", "refresh-token",
+                           sender="bot@example.com", session=session)
+
+    def token_response(self, token: str = "ya29.test") -> FakeResponse:
+        """Ответ Google на обновление токена: как настоящий, со временем жизни."""
+        return FakeResponse({"access_token": token, "expires_in": 3600, "token_type": "Bearer"})
+
+    def test_send_refreshes_token_and_posts_raw_letter(self) -> None:
+        session = FakeSession([self.token_response(), FakeResponse({"id": "18c0ffee"})])
+        sent = self.sender(session).send(to="boss@example.com", subject="Отчёт за сентябрь",
+                                         body="Долги: 3.00 BYN")
+        self.assertEqual(sent.message_id, "18c0ffee")
+        self.assertEqual(sent.to, "boss@example.com")
+
+        token_call, send_call = session.calls[0], session.calls[1]
+        self.assertEqual(token_call["url"], "https://oauth2.googleapis.com/token")
+        self.assertEqual(token_call["data"]["grant_type"], "refresh_token")
+        self.assertEqual(token_call["data"]["client_id"], "client-id")
+        self.assertEqual(token_call["data"]["refresh_token"], "refresh-token")
+        self.assertTrue(send_call["url"].endswith("/users/me/messages/send"))
+        self.assertEqual(send_call["headers"]["Authorization"], "Bearer ya29.test")
+        message = BytesParser(policy=policy.default).parsebytes(
+            base64.urlsafe_b64decode(send_call["payload"]["raw"])
+        )
+        self.assertEqual(str(message["Subject"]), "Отчёт за сентябрь")
+        self.assertIn("Долги: 3.00 BYN", message.get_content())
+
+    def test_token_is_reused_for_the_second_letter(self) -> None:
+        """Access-токен живёт час: за одну отправку двух писем он обновляется один раз."""
+        session = FakeSession([
+            self.token_response("ya29.one"),
+            FakeResponse({"id": "id-1"}),
+            FakeResponse({"id": "id-2"}),
+        ])
+        sender = self.sender(session)
+        sender.send(to="a@example.com", subject="s", body="b")
+        sender.send(to="b@example.com", subject="s", body="b")
+        self.assertEqual(len(session.calls), 3)
+        self.assertEqual(session.calls[2]["headers"]["Authorization"], "Bearer ya29.one")
+
+    def test_expired_token_is_refreshed_once_on_401(self) -> None:
+        """401 на отправке: токен обновляем и повторяем один раз (письмо не ушло)."""
+        session = FakeSession([
+            self.token_response("ya29.first"),
+            FakeResponse({"error": "expired"}, status=401),
+            self.token_response("ya29.second"),
+            FakeResponse({"id": "id-2"}),
+        ])
+        sent = self.sender(session).send(to="boss@example.com", subject="s", body="b")
+        self.assertEqual(sent.message_id, "id-2")
+        self.assertEqual(session.calls[2]["url"], "https://oauth2.googleapis.com/token")
+        self.assertEqual(session.calls[3]["headers"]["Authorization"], "Bearer ya29.second")
+
+    def test_send_403_is_not_repeated_and_explains_scope(self) -> None:
+        session = FakeSession([
+            self.token_response(),
+            FakeResponse({"error": {"message": "Insufficient Permission"}}, status=403),
+        ])
+        with self.assertRaises(MailError) as ctx:
+            self.sender(session).send(to="boss@example.com", subject="s", body="b")
+        self.assertIn("gmail.send", str(ctx.exception))
+        self.assertEqual(len(session.calls), 2)      # повторов нет: письмо всё равно не ушло бы
+
+    def test_token_error_explains_what_to_check(self) -> None:
+        session = FakeSession([FakeResponse({"error": "invalid_grant"}, status=400)])
+        with self.assertRaises(MailError) as ctx:
+            self.sender(session).access_token()
+        message = str(ctx.exception)
+        self.assertIn("GMAIL_REFRESH_TOKEN", message)
+        self.assertIn("invalid_grant", message)
+
+    def test_missing_credentials_are_reported(self) -> None:
+        sender = GmailSender("", "", "", session=FakeSession())
+        with self.assertRaises(MailError) as ctx:
+            sender.send(to="boss@example.com", subject="s", body="b")
+        self.assertIn("GMAIL_CLIENT_ID", str(ctx.exception))
+
+    def test_empty_recipient_is_reported(self) -> None:
+        session = FakeSession([self.token_response()])
+        with self.assertRaises(MailError) as ctx:
+            self.sender(session).send(to="", subject="s", body="b")
+        self.assertIn("REPORT_EMAIL", str(ctx.exception))
+        self.assertEqual(session.calls, [])          # токен не запрашивали
+
+
+class MonthlyReportTests(unittest.TestCase):
+    """Ежемесячный отчёт: сборка письма, защита от повторов и понятные причины отказа."""
+
+    def settings(self, **kwargs: Any) -> Settings:
+        """Настройки с заполненными доступами Gmail API (сеть не нужна: почта подменяется)."""
+        base: dict[str, Any] = {
+            "supabase_url": "https://example.supabase.co",
+            "supabase_key": "sb_secret_test",
+            "report_email": "boss@example.com",
+            "gmail_client_id": "client-id",
+            "gmail_client_secret": "client-secret",
+            "gmail_refresh_token": "refresh-token",
+        }
+        base.update(kwargs)
+        return Settings(**base)
+
+    def storage(self) -> InMemoryStorage:
+        """Два чата с записями и один пустой — как в жизни."""
+        storage = InMemoryStorage(default_currency="BYN")
+        storage.add_debt(1, "Леша", "Дима", "BYN", 3.0)
+        storage.add_debt(2, "Маша", "Петя", "USD", 10.0)
+        storage.set_default_currency(2, "USD")
+        storage.set_chat_authorized(3, True)
+        return storage
+
+    def test_letter_has_every_chat_with_records(self) -> None:
+        letter = build_monthly_letter(self.storage(), "2026-09")
+        self.assertEqual(letter.subject, "Отчёт по долгам за сентябрь 2026")
+        self.assertIn("📊 Отчёт по долгам за сентябрь 2026", letter.body)
+        self.assertIn("💬 Чат 1", letter.body)
+        self.assertIn("💬 Чат 2", letter.body)
+        self.assertIn("Итог с взаимозачётом", letter.body)
+        self.assertNotIn("💬 Чат 3", letter.body)     # пустой чат письмо не удлиняет
+        self.assertIn("по одному CSV на каждый чат.\n\n💬 Чат 1", letter.body)
+        self.assertFalse(letter.empty)
+        self.assertEqual([chat.records for chat in letter.chats], [1, 1, 0])
+
+    def test_letter_carries_one_csv_file_per_chat(self) -> None:
+        """Файлов ровно столько, сколько чатов с записями: у пустого чата файла нет."""
+        letter = build_monthly_letter(self.storage(), "2026-09")
+        self.assertEqual(letter.files, ("debts_1_2026-09.csv", "debts_2_2026-09.csv"))
+        self.assertIn("Файлов во вложении: 2", letter.body)
+        self.assertIn("📄 Файл во вложении: debts_1_2026-09.csv", letter.body)
+
+    def test_file_holds_only_its_own_chat(self) -> None:
+        """В файле чата — только его записи: строки таблицы debts, как в /export."""
+        letter = build_monthly_letter(self.storage(), "2026-09")
+        first, second = letter.attachments[0], letter.attachments[1]
+        self.assertEqual(first.content_type, "text/csv; charset=utf-8")
+        rows = list(csv.reader(io.StringIO(first.text)))
+        self.assertEqual(rows[0][0], "id")            # шапка как в таблице debts
+        self.assertIn("Леша", rows[1])
+        self.assertNotIn("Маша", first.text)          # чужие чаты в файл не попадают
+        self.assertIn("Маша", second.text)
+
+    def test_send_marks_month_and_skips_the_second_run(self) -> None:
+        storage = self.storage()
+        mailer = FakeMailer()
+        settings = self.settings()
+        run = send_monthly_reports(settings, storage, period="2026-09", sender=mailer)
+        self.assertTrue(run.delivered)
+        self.assertEqual(run.sent, ("boss@example.com",))
+        self.assertEqual(run.message_id, "msg-1")
+        self.assertEqual(storage.get_state(REPORT_STATE_KEY), "2026-09")
+        self.assertEqual(len(mailer.letters), 1)
+        self.assertIn("сентябрь 2026", mailer.letters[0]["body"])
+
+        again = send_monthly_reports(settings, storage, period="2026-09", sender=mailer)
+        self.assertFalse(again.delivered)
+        self.assertIn("уже отправлен", again.reason)
+        self.assertEqual(len(mailer.letters), 1)
+
+    def test_force_resends_and_new_month_is_not_blocked(self) -> None:
+        storage = self.storage()
+        mailer = FakeMailer()
+        settings = self.settings()
+        send_monthly_reports(settings, storage, period="2026-09", sender=mailer)
+        forced = send_monthly_reports(settings, storage, period="2026-09", force=True, sender=mailer)
+        self.assertTrue(forced.delivered)
+        october = send_monthly_reports(settings, storage, period="2026-10", sender=mailer)
+        self.assertTrue(october.delivered)
+        self.assertEqual(len(mailer.letters), 3)
+        self.assertEqual(storage.get_state(REPORT_STATE_KEY), "2026-10")
+
+    def test_empty_letter_is_not_sent(self) -> None:
+        storage = InMemoryStorage(default_currency="BYN")
+        storage.set_chat_authorized(7, True)
+        run = send_monthly_reports(self.settings(), storage, period="2026-09", sender=FakeMailer())
+        self.assertFalse(run.delivered)
+        self.assertIn("записей нет", run.reason)
+        self.assertIsNone(storage.get_state(REPORT_STATE_KEY))
+
+    def test_no_chats_at_all_is_reported(self) -> None:
+        run = send_monthly_reports(self.settings(), InMemoryStorage(), period="2026-09",
+                                   sender=FakeMailer())
+        self.assertFalse(run.delivered)
+        self.assertIn("ни одного чата", run.reason)
+
+    def test_dry_run_shows_letter_without_sending(self) -> None:
+        mailer = FakeMailer()
+        run = send_monthly_reports(self.settings(), self.storage(), period="2026-09",
+                                   dry_run=True, sender=mailer)
+        self.assertFalse(run.delivered)
+        self.assertEqual(mailer.letters, [])
+        self.assertIn("💬 Чат 1", run.body)
+        self.assertEqual(run.chats, (1, 2, 3))
+        self.assertEqual(run.files, ("debts_1_2026-09.csv", "debts_2_2026-09.csv"))
+
+    def test_to_overrides_recipient(self) -> None:
+        mailer = FakeMailer()
+        run = send_monthly_reports(self.settings(), self.storage(), period="2026-09",
+                                   to="me@example.com", sender=mailer)
+        self.assertEqual(run.sent, ("me@example.com",))
+        self.assertEqual(mailer.letters[0]["to"], "me@example.com")
+
+    def test_real_sender_is_used_with_gmail_session(self) -> None:
+        """Без подмены mailer письмо уходит через GmailSender — на доступах из настроек."""
+        session = FakeSession([
+            FakeResponse({"access_token": "ya29.test", "expires_in": 3600}),
+            FakeResponse({"id": "18c0ffee"}),
+        ])
+        run = send_monthly_reports(self.settings(), self.storage(), period="2026-09",
+                                   session=session)
+        self.assertTrue(run.delivered)
+        self.assertEqual(run.message_id, "18c0ffee")
+        self.assertEqual(session.calls[0]["data"]["refresh_token"], "refresh-token")
+        message = BytesParser(policy=policy.default).parsebytes(
+            base64.urlsafe_b64decode(session.calls[1]["payload"]["raw"]))
+        self.assertEqual(message["To"], "boss@example.com")
+        self.assertIn("сентябрь 2026", str(message["Subject"]))
+
+    def test_letter_is_sent_as_one_mail_with_a_file_per_chat(self) -> None:
+        """Одно письмо — и в нём по файлу на чат (в том же поле raw, без доп. запросов)."""
+        session = FakeSession([
+            FakeResponse({"access_token": "ya29.test", "expires_in": 3600}),
+            FakeResponse({"id": "18c0ffee"}),
+        ])
+        run = send_monthly_reports(self.settings(), self.storage(), period="2026-09",
+                                   session=session)
+        self.assertTrue(run.delivered)
+        self.assertEqual(run.files, ("debts_1_2026-09.csv", "debts_2_2026-09.csv"))
+        self.assertEqual(len(session.calls), 2)       # обновление токена + одно письмо
+        message = BytesParser(policy=policy.default).parsebytes(
+            base64.urlsafe_b64decode(session.calls[1]["payload"]["raw"]))
+        self.assertEqual([part.get_filename() for part in message.iter_attachments()],
+                         ["debts_1_2026-09.csv", "debts_2_2026-09.csv"])
+
+    def test_several_recipients_from_secret(self) -> None:
+        """REPORT_EMAIL принимает список адресов через запятую: письмо уходит каждому."""
+        settings = self.settings(report_email="one@example.com, two@example.com")
+        self.assertEqual(settings.report_recipients, ("one@example.com", "two@example.com"))
+        mailer = FakeMailer()
+        run = send_monthly_reports(settings, self.storage(), period="2026-09", sender=mailer)
+        self.assertEqual(len(run.sent), 2)
+        self.assertEqual([letter["to"] for letter in mailer.letters],
+                         ["one@example.com", "two@example.com"])
+        # Файлы по чатам уходят каждому адресату: письмо только одно, вложений — по чату.
+        self.assertEqual([len(letter["attachments"]) for letter in mailer.letters], [2, 2])
+
+    def test_partly_configured_reports_are_reported(self) -> None:
+        settings = self.settings(gmail_refresh_token="")
+        problem = settings.reports_problem()
+        self.assertIn("GMAIL_REFRESH_TOKEN", problem)
+        self.assertFalse(settings.reports_enabled)
+        run = send_monthly_reports(settings, self.storage(), period="2026-09", sender=FakeMailer())
+        self.assertFalse(run.delivered)
+        self.assertIn("GMAIL_REFRESH_TOKEN", run.problems[0])
+
+    def test_switch_off_is_not_a_problem(self) -> None:
+        """Пока почта не настроена, отчёты просто выключены — бот работает как обычно."""
+        settings = Settings()
+        self.assertIsNone(settings.reports_problem())
+        self.assertFalse(settings.reports_enabled)
+        self.assertIn("не настроен", reports_check_lines(settings)[0])
+
+    def test_bad_address_is_reported(self) -> None:
+        self.assertIn("не похож", self.settings(report_email="не-адрес").reports_problem())
+
+    def test_check_lines_show_recipient_and_sender(self) -> None:
+        lines = reports_check_lines(self.settings(gmail_sender="bot@example.com"))
+        self.assertIn("boss@example.com", lines[0])
+        self.assertIn("cron", lines[0])
+        self.assertIn("bot@example.com", lines[1])
+
+    def test_period_helpers(self) -> None:
+        self.assertEqual(period_title("2026-09"), "сентябрь 2026")
+        self.assertEqual(period_title("2026-12"), "декабрь 2026")
+        self.assertEqual(period_title("мусор"), "мусор")
+        self.assertEqual(report_period(datetime(2026, 9, 30, 23, 0)), "2026-09")
+
+    def test_database_problem_ignores_telegram_and_ai(self) -> None:
+        """Отчёту не нужны токен бота и ключ ИИ — только база."""
+        self.assertIsNone(self.settings().database_problem())
+        self.assertIn("SUPABASE_URL", Settings(supabase_key="sb_secret_test").database_problem())
+
+
+class ChatListTests(unittest.TestCase):
+    """list_chat_ids: по каким чатам собирается ежемесячный отчёт."""
+
+    def test_memory_storage_lists_every_known_chat(self) -> None:
+        storage = InMemoryStorage(default_currency="BYN")
+        storage.add_debt(5, "Аня", "Боря", "BYN", 1.0)
+        storage.set_default_currency(7, "USD")
+        storage.set_chat_authorized(9, True)
+        storage.remember_member(ChatMember(chat_id=11, user_id=1, display_name="Кто-то"))
+        self.assertEqual(storage.list_chat_ids(), [5, 7, 9, 11])
+
+    def test_supabase_storage_merges_settings_and_members(self) -> None:
+        """Чаты берутся из bot_settings и chat_members: где-то валюта, где-то участники."""
+        session = FakeRestApi()
+        storage = SupabaseStorage("https://example.supabase.co", "service-key",
+                                  client=session.client())
+        session.responses = [FakeResponse([{"chat_id": 1}, {"chat_id": 2}]),
+                             FakeResponse([{"chat_id": 2}, {"chat_id": 3}])]
+        self.assertEqual(storage.list_chat_ids(), [1, 2, 3])
+        self.assertEqual(session.calls[0]["params"]["select"], "chat_id")
 
 
 if __name__ == "__main__":

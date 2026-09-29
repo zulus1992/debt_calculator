@@ -184,6 +184,11 @@ create table if not exists public.bot_state (
 comment on table public.bot_state is
     'Служебное состояние бота: например last_update_id — последний обработанный апдейт Telegram';
 
+-- Ключ reports_sent хранит «год-месяц» (2026-09), за который ежемесячный отчёт уже ушёл
+-- на почту: защита от повторной отправки, если cron сработает лишний раз (reports.py).
+comment on column public.bot_state.value is
+    'Значение ключа: last_update_id — смещение апдейтов, reports_sent — месяц последнего письма';
+
 alter table public.bot_state enable row level security;
 
 -- Проверка: должно вернуть 0 строк и не выдать ошибку.

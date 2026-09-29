@@ -246,6 +246,9 @@ python bot.py                             # постоянный процесс 
   для `/d` и `/rates`; без ключа работает открытый эндпоинт `open.er-api.com`). Курсы бот
   подтягивает сам раз в день в 12:00 по Минску — час задаётся в `RATES_HOUR` (0–23),
   cron и ручные запуски не нужны.
+* необязательно: `REPORT_EMAIL` и доступы Gmail API (`GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`,
+  `GMAIL_REFRESH_TOKEN`) — ежемесячный отчёт на почту. Пишет его отдельный скрипт `reports.py`,
+  поэтому ему нужен **cron** хостинга (см. раздел «Отчёт на почту по cron» ниже).
 
 ## Шаги на HidenCloud (панель в стиле Pterodactyl)
 
@@ -255,6 +258,7 @@ python bot.py                             # постоянный процесс 
 2. **Скопировать файлы** из репозитория (ветка `main`) в панель — через встроенный **File Manager** или **SFTP**:
    ```
    bot.py  config.py  debts.py  deepseek.py  storage.py  telegram_api.py
+   reports.py  gmail_api.py           (нужны только для ежемесячного отчёта на почту)
    requirements.txt  start.sh  Procfile
    webhook.py  api/telegram.py  vercel.json   (нужны только для режима вебхука)
    tests/            (необязательно, но удобно для самопроверки)
@@ -374,6 +378,57 @@ python bot.py --check                    # проверка ключей, сер
   ```
 * **Android + Termux**: `pkg install python`, `pip install -r requirements.txt`, затем
   `termux-wake-lock && python bot.py &` (телефон должен быть включён).
+
+## Отчёт на почту по cron (1-е число месяца)
+
+Ежемесячный отчёт — единственное, что запускается **не самим ботом**: его вызывает
+планировщик, а письмо уходит через Gmail API на адрес из секрета `REPORT_EMAIL`. Письмо
+одно, во вложении — по одному CSV-файлу на каждый чат (`debts_<chat_id>_<год-месяц>.csv`).
+Подготовка доступов — в `README.md` («Отчёт на почту раз в месяц»), здесь только расписание.
+
+```bash
+# crontab -e: 1-е число, 10:00 по времени сервера
+0 10 1 * *  cd /opt/debt_calculator && /usr/bin/python3 reports.py >> reports.log 2>&1
+```
+
+* **VPS с systemd.** Вместо cron можно таймер — рядом с `debt-bot.service`:
+  `/etc/systemd/system/debt-report.service`
+  ```ini
+  [Unit]
+  Description=Debt calculator monthly report
+
+  [Service]
+  Type=oneshot
+  WorkingDirectory=/opt/debt_calculator
+  ExecStart=/usr/bin/python3 /opt/debt_calculator/reports.py
+  ```
+  `/etc/systemd/system/debt-report.timer`
+  ```ini
+  [Unit]
+  Description=Monthly debt report
+
+  [Timer]
+  OnCalendar=*-*-01 10:00:00
+  Persistent=true
+
+  [Install]
+  WantedBy=timers.target
+  ```
+  ```bash
+  systemctl enable --now debt-report.timer && systemctl list-timers debt-report.timer
+  ```
+* **PythonAnywhere** — вкладка *Tasks*: строка `python reports.py` с расписанием
+  «Monthly» (на бесплатном тарифе доступно только ежедневное задание, месячное — на платном).
+* **Панели в стиле Pterodactyl (HidenCloud).** Cron-а нет — запускайте `python reports.py`
+  руками в консоли панели или перенесите отчёт на VPS/GitHub Actions: команда везде одна.
+* **Проверка перед cron** (ничего не отправляет и не занимает базу надолго):
+  ```bash
+  python reports.py --check      # что настроено
+  python reports.py --dry-run    # напечатать письмо и список файлов вложения
+  ```
+* Один месяц — одно письмо: месяц последней отправки лежит в `bot_state` (`reports_sent`).
+  Повторный запуск cron или ручной запуск за тот же месяц письма не продублирует; заново
+  отправить — `python reports.py --force` (досрочно: `--period 2026-09 --force`).
 
 ## Быстрый переезд между режимами
 

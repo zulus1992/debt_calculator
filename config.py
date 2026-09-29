@@ -37,6 +37,14 @@ DEFAULT_RATES_CURRENCIES = ("BYN", "RUB", "USD", "EUR", "CNY", "THB")
 # Во сколько по Минску (UTC+3) обновлять курсы: раз в день, без cron. 0–23.
 DEFAULT_RATES_HOUR = 12
 
+# Ежемесячный отчёт на почту: письмо уходит через Gmail API (OAuth2-токен обновляется по
+# refresh-токену), получатель задаётся секретом REPORT_EMAIL, а расписание — cron хостинга
+# (первое число месяца). См. reports.py и gmail_api.py.
+DEFAULT_GMAIL_TOKEN_URL = "https://oauth2.googleapis.com/token"
+DEFAULT_GMAIL_API_URL = "https://gmail.googleapis.com/gmail/v1"
+# Проверка адреса получателя: одна «собачка», домен с точкой. Больше ничего не требуем.
+EMAIL_RE = re.compile(r"^[^@\s,]+@[^@\s,]+\.[A-Za-z]{2,}$")
+
 # Как передавать ключ базы в запросах к PostgREST:
 #   apikey — только заголовок apikey (так требует Supabase для ключей нового формата
 #            sb_secret_…/sb_publishable_… и так делает supabase-js);
@@ -117,6 +125,16 @@ class Settings:
     webhook_secret: str = ""
     require_mention: bool = True
     bot_username: str = ""
+    # Ежемесячный отчёт на почту (Gmail API): кому отправлять и доступы OAuth-приложения.
+    report_email: str = ""
+    gmail_client_id: str = ""
+    gmail_client_secret: str = ""
+    gmail_refresh_token: str = ""
+    # Адрес отправителя: обычно тот же Gmail-аккаунт, что выдал refresh-токен. Пусто —
+    # «From» подставит сам Gmail по выданному токену.
+    gmail_sender: str = ""
+    gmail_token_url: str = DEFAULT_GMAIL_TOKEN_URL
+    gmail_api_url: str = DEFAULT_GMAIL_API_URL
 
     @property
     def rest_url(self) -> str:
@@ -151,6 +169,62 @@ class Settings:
         if str(self.rates_api_key or "").strip():
             return "аккаунт exchangerate-api.com (ключ задан)"
         return "открытый эндпоинт open.er-api.com (без ключа)"
+
+    @property
+    def report_recipients(self) -> tuple[str, ...]:
+        """Кому уходит ежемесячный отчёт: REPORT_EMAIL (несколько адресов — через запятую)."""
+        recipients: list[str] = []
+        for chunk in str(self.report_email or "").replace(";", ",").split(","):
+            address = chunk.strip()
+            if address and address not in recipients:
+                recipients.append(address)
+        return tuple(recipients)
+
+    @property
+    def reports_enabled(self) -> bool:
+        """Настроен ли ежемесячный отчёт: есть получатель и доступы Gmail API."""
+        return bool(self.report_recipients) and self.reports_problem() is None
+
+    def database_problem(self) -> str | None:
+        """Хватает ли настроек для работы с базой (без Telegram и ИИ) — для reports.py.
+
+        Отчёт на почту читает базу, но ничего не разбирает через DeepSeek и не пишет
+        в Telegram, поэтому требуем только URL и ключ базы: иначе `python reports.py`
+        на хостинге падал бы из-за незаданного токена бота.
+        """
+        issues: list[str] = []
+        if not str(self.supabase_url or "").strip():
+            issues.append("SUPABASE_URL не задан (например https://xxxx.supabase.co)")
+        if not str(self.supabase_key or "").strip():
+            issues.append(f"Ключ базы не задан: нужен SUPABASE_SECRET_KEY. {SUPABASE_KEY_HINT}")
+        return "; ".join(issues) + "." if issues else None
+
+    def reports_problem(self) -> str | None:
+        """Проблема с настройками отчёта на почту (None — всё в порядке или отчёт выключен).
+
+        Отчёт — необязательная надстройка: пока не заданы ни REPORT_EMAIL, ни доступы
+        Gmail, бот работает как обычно, и это не ошибка. А вот если заполнена только
+        часть настроек, письмо молча не уйдёт — об этом и говорим.
+        """
+        recipients = self.report_recipients
+        credentials = (self.gmail_client_id, self.gmail_client_secret, self.gmail_refresh_token)
+        if not recipients and not any(str(value or "").strip() for value in credentials):
+            return None
+        issues: list[str] = []
+        if not recipients:
+            issues.append("REPORT_EMAIL не задан — кому отправлять отчёт, неизвестно")
+        for address in recipients:
+            if not EMAIL_RE.match(address):
+                issues.append(f"REPORT_EMAIL: «{address}» не похож на адрес электронной почты")
+        if not str(self.gmail_client_id or "").strip():
+            issues.append("GMAIL_CLIENT_ID не задан (OAuth-клиент Google Cloud)")
+        if not str(self.gmail_client_secret or "").strip():
+            issues.append("GMAIL_CLIENT_SECRET не задан (OAuth-клиент Google Cloud)")
+        if not str(self.gmail_refresh_token or "").strip():
+            issues.append("GMAIL_REFRESH_TOKEN не задан — без него письмо не отправить")
+        if issues:
+            return "Отчёт на почту: " + "; ".join(issues) + "."
+        return None
 
     def problems(self) -> list[str]:
         """Список проблем конфигурации (пустой — всё настроено)."""
@@ -395,6 +469,13 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         webhook_secret=get("WEBHOOK_SECRET"),
         require_mention=_parse_bool(get("REQUIRE_MENTION"), True),
         bot_username=get("BOT_USERNAME").lstrip("@"),
+        report_email=get("REPORT_EMAIL"),
+        gmail_client_id=get("GMAIL_CLIENT_ID"),
+        gmail_client_secret=get("GMAIL_CLIENT_SECRET"),
+        gmail_refresh_token=get("GMAIL_REFRESH_TOKEN"),
+        gmail_sender=get("GMAIL_SENDER"),
+        gmail_token_url=get("GMAIL_TOKEN_URL", DEFAULT_GMAIL_TOKEN_URL).rstrip("/"),
+        gmail_api_url=get("GMAIL_API_URL", DEFAULT_GMAIL_API_URL).rstrip("/"),
     )
 
 

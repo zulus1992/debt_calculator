@@ -351,6 +351,8 @@ class Storage(Protocol):
 
     def list_members(self, chat_id: int) -> list[ChatMember]: ...
 
+    def list_chat_ids(self) -> list[int]: ...
+
     def chat_authorized(self, chat_id: int) -> bool: ...
 
     def set_chat_authorized(self, chat_id: int, value: bool = True) -> None: ...
@@ -638,6 +640,23 @@ class SupabaseStorage:
         )
         return [_row_to_member(row) for row in _rows(self._execute(query))]
 
+    def list_chat_ids(self) -> list[int]:
+        """Чаты, которые бот уже видел: из настроек (bot_settings) и участников (chat_members).
+
+        Нужен ежемесячному отчёту на почту: письмо собирается по всем чатам сразу, а
+        «списка чатов» в базе нет — chat_id есть только в строках о самом чате (валюта,
+        отметка пароля) и в записях об участниках. Пустой список — бот ещё не работал
+        ни в одном чате.
+        """
+        found: set[int] = set()
+        for table in (self._settings_table, self._members_table):
+            query = self._table(table).select("chat_id").limit(5000)
+            for row in _rows(self._execute(query)):
+                chat_id = _to_int(row.get("chat_id"))
+                if chat_id is not None:
+                    found.add(chat_id)
+        return sorted(found)
+
     def get_default_currency(self, chat_id: int, fallback: str = DEFAULT_CURRENCY) -> str:
         """Валюта по умолчанию для чата."""
         query = (
@@ -886,6 +905,14 @@ class InMemoryStorage:
             if member_chat == chat_id
         ]
 
+    def list_chat_ids(self) -> list[int]:
+        """Чаты из памяти: по записям, участникам, валюте и отметке пароля."""
+        found = {debt.chat_id for debt in self.debts}
+        found |= {chat_id for chat_id, _ in self.members}
+        found |= set(self.currencies)
+        found |= set(self.authorized)
+        return sorted(found)
+
     def get_default_currency(self, chat_id: int, fallback: str = DEFAULT_CURRENCY) -> str:
         """Валюта по умолчанию для чата."""
         return (self.currencies.get(chat_id) or fallback or self.default_currency).upper()
@@ -952,3 +979,23 @@ class InMemoryStorage:
     def set_state(self, key: str, value: str) -> None:
         """Сохраняет служебное значение в память."""
         self.state[key] = str(value)
+
+
+def storage_from_settings(settings: Any) -> SupabaseStorage:
+    """Собирает хранилище Supabase по настройкам приложения (таблицы и ключ из .env).
+
+    Общее для бота, вебхука, --check и ежемесячного отчёта на почту: имена таблиц и
+    параметры запросов задаются в одном месте, чтобы они не разъезжались.
+    """
+    return SupabaseStorage(
+        settings.supabase_url,
+        settings.supabase_key,
+        debts_table=settings.debts_table,
+        settings_table=settings.settings_table,
+        state_table=settings.state_table,
+        members_table=settings.members_table,
+        rates_table=settings.rates_table,
+        timeout=settings.request_timeout,
+        key_header=settings.supabase_key_header,
+        retries=settings.supabase_retries,
+    )

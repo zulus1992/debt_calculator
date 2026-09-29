@@ -16,6 +16,11 @@
 Курсы валют подтягиваются сами раз в день в 12:00 по Минску (RATES_HOUR): постоянный процесс
 проверяет расписание сам, а режим вебхука — при первом апдейте после назначенного часа.
 
+Ежемесячный отчёт по долгам уходит на почту из отдельного скрипта — его вызывает cron
+хостинга (см. reports.py): письмо отправляется через Gmail API на адрес из секрета
+REPORT_EMAIL, месяц последней отправки хранится в bot_state (reports_sent), поэтому
+повторный запуск за тот же месяц письма не продублирует.
+
 Вебхук (мгновенные ответы на serverless-хостингах — Vercel, PythonAnywhere, WSGI):
     python bot.py --set-webhook https://<домен>/api/telegram   # Telegram шлёт апдейты нам
     python bot.py --webhook-info                               # что сейчас настроено
@@ -95,7 +100,16 @@ from rates import (
     update_rates,
     update_rates_scheduled,
 )
-from storage import ChatMember, InMemoryStorage, Storage, StorageError, SupabaseStorage, probe_key_headers
+from reports import reports_check_lines
+from storage import (
+    ChatMember,
+    InMemoryStorage,
+    Storage,
+    StorageError,
+    SupabaseStorage,
+    probe_key_headers,
+    storage_from_settings,
+)
 from telegram_api import CSV_DOCUMENT_TYPE, TelegramBot, TelegramError
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -978,19 +992,12 @@ def configure_logging(level: str = "INFO") -> None:
 
 
 def _storage_for(settings: Settings) -> SupabaseStorage:
-    """Хранилище Supabase с таблицами из настроек (общее для бота, вебхука и --check)."""
-    return SupabaseStorage(
-        settings.supabase_url,
-        settings.supabase_key,
-        debts_table=settings.debts_table,
-        settings_table=settings.settings_table,
-        state_table=settings.state_table,
-        members_table=settings.members_table,
-        rates_table=settings.rates_table,
-        timeout=settings.request_timeout,
-        key_header=settings.supabase_key_header,
-        retries=settings.supabase_retries,
-    )
+    """Хранилище Supabase с таблицами из настроек (общее для бота, вебхука и --check).
+
+    Само построение живёт в storage.storage_from_settings: тем же кодом пользуется
+    ежемесячный отчёт на почту (reports.py), чтобы имена таблиц не разъезжались.
+    """
+    return storage_from_settings(settings)
 
 
 def build_runtime(settings: Settings) -> tuple[Storage, DeepSeekParser, TelegramBot]:
@@ -1582,6 +1589,11 @@ def check_services(settings: Settings) -> bool:
         print(f"✓ Курсы валют: {settings.rates_source}, база {settings.rates_base}, "
               f"валюты {', '.join(settings.rates_currencies)}")
         print(f"  обновление — {rates_schedule_text(settings)}; вручную: python bot.py --rates")
+
+    # Отчёт на почту — необязательная надстройка: не настроен — это не проблема бота,
+    # поэтому строки идут как «•», а не как «✗», и на ok не влияют.
+    for line in reports_check_lines(settings):
+        print(line)
 
     if settings.password_required:
         print("• CHAT_PASSWORD задан — бот просит пароль при добавлении в чат "
