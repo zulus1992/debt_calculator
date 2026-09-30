@@ -2265,7 +2265,9 @@ class RegistrationTests(unittest.TestCase):
         reply = self.send("/reg @gosha_p Гоша, Гоша Петров, жекич")
         gosha = self.member(106)
         self.assertTrue(gosha.is_registered)
-        self.assertEqual(gosha.aliases, ["Гоша", "Гоша Петров", "жекич"])
+        # «Гоша Петров» сохраняем целиком и отдельными словами — иначе по фамилии («Петров»)
+        # бот человека не узнает: в Telegram он может быть записан как «Гоша».
+        self.assertEqual(gosha.aliases, ["Гоша", "Гоша Петров", "Петров", "жекич"])
         self.assertIn("Гоша Петров (@gosha_p)", reply)
         # теперь по новому имени человек узнаётся, и запись сохраняется
         assert_saved_debt(self, self.send("жекич должен Диме 2 рубля"))
@@ -5312,6 +5314,124 @@ class RoutesAppTests(unittest.TestCase):
         self.assertTrue(report_path({"PATH_INFO": "/Report/"}))
         self.assertFalse(report_path({"PATH_INFO": "/api/telegram"}))
         self.assertFalse(report_path({}))
+
+
+class RegistrationBugsTests(unittest.TestCase):
+    """Регистрация людей, чьих сообщений бот не видел.
+
+    В группах Telegram присылает боту только сообщения с обращением к нему, поэтому «человек
+    писал в чат» и «бот его знает» — не одно и то же. Дополнительные источники id: ответ
+    на его сообщение (`reply_to_message.from`) и упоминание без @ника (`text_mention`).
+    """
+
+    def build(self) -> tuple[DebtBot, InMemoryStorage, FakeTelegram]:
+        """Бот с пустым чатом: никто ещё не писал — повторим самое начало работы."""
+        storage = InMemoryStorage(default_currency="BYN")
+        telegram = FakeTelegram([])
+        bot = DebtBot(Settings(default_currency="BYN"), storage, HeuristicParser(), telegram)
+        return bot, storage, telegram
+
+    def message(self, update_id: int, text: str, *, user_id: int = 101,
+                username: str = "kozlovAlex", first: str = "Леша",
+                reply_from: dict | None = None, entities: list | None = None) -> dict:
+        """Апдейт группы: можно добавить ответ (`from` того, кому отвечают) и упоминания."""
+        message: dict[str, Any] = {
+            "message_id": update_id,
+            "chat": {"id": CHAT, "type": "group"},
+            "from": {"id": user_id, "username": username, "first_name": first},
+            "text": text,
+        }
+        if reply_from is not None:
+            message["reply_to_message"] = {"message_id": update_id - 1, "from": reply_from}
+        if entities:
+            message["entities"] = entities
+        return {"update_id": update_id, "message": message}
+
+    @staticmethod
+    def texts(telegram: FakeTelegram) -> list[str]:
+        """Тексты ответов бота."""
+        return [text for _, text in telegram.sent]
+
+    def member(self, storage: InMemoryStorage, user_id: int) -> ChatMember:
+        """Участник чата по user id (что бот о нём знает)."""
+        return next(item for item in storage.list_members(CHAT) if item.user_id == user_id)
+
+    def test_unknown_handle_explains_what_to_do(self) -> None:
+        """@ник, чьих сообщений бот не видел: объясняем причину и два рабочих способа."""
+        bot, _, telegram = self.build()
+        bot.process_update(self.message(1, "/reg @bdzmity Дима, Димон"))
+        reply = self.texts(telegram)[0]
+        self.assertIn("Не нашёл @bdzmity", reply)
+        self.assertIn("пусть он сам напишет", reply)
+        self.assertIn("ответьте на любое его сообщение", reply)
+
+    def test_reply_brings_the_person_and_registration_works(self) -> None:
+        """Ответ на сообщение даёт боту id человека — /reg @ник после этого срабатывает."""
+        bot, storage, telegram = self.build()
+        dima = {"id": 102, "username": "bdzmity", "first_name": "Дима"}
+        bot.process_update(self.message(1, "/reg Леша, Лёха"))
+        bot.process_update(self.message(2, "/reg @bdzmity Дима, Димон", reply_from=dima))
+        reply = self.texts(telegram)[1]
+        self.assertIn("Зарегистрировал", reply)
+        self.assertIn("@bdzmity", reply)
+        self.assertTrue(self.member(storage, 102).is_registered)
+        # человек узнаётся в записях: долг ложится на его id, а не на строку текста
+        bot.process_update(self.message(3, "@test_bot Дима должен Леше 3 рубля"))
+        assert_saved_debt(self, self.texts(telegram)[2])
+        record = storage.list_debts(CHAT)[0]
+        self.assertEqual((record.from_user_id, record.to_user_id), (102, 101))
+
+    def test_reply_registers_the_person_you_replied_to(self) -> None:
+        """«/reg Имя» в ответе регистрирует того, кому ответили (а не автора)."""
+        bot, storage, telegram = self.build()
+        bot.process_update(self.message(1, "/reg Дима, Димон",
+                                        reply_from={"id": 102, "first_name": "Дима"}))
+        reply = self.texts(telegram)[0]
+        self.assertIn("Дима", reply)
+        self.assertTrue(self.member(storage, 102).is_registered)
+        self.assertFalse(self.member(storage, 101).is_registered)   # автора не трогаем
+
+    def test_bare_reg_as_reply_still_registers_me(self) -> None:
+        """Просто «/reg» в ответе — всё равно про себя: имена не указаны."""
+        bot, storage, _ = self.build()
+        bot.process_update(self.message(1, "/reg", reply_from={"id": 102, "first_name": "Дима"}))
+        self.assertTrue(self.member(storage, 101).is_registered)
+        self.assertFalse(self.member(storage, 102).is_registered)
+
+    def test_aliases_split_by_spaces_too(self) -> None:
+        """«/reg Леша Лёха» без запятой: имена сохраняются оба, и человека узнают."""
+        bot, storage, telegram = self.build()
+        bot.process_update(self.message(1, "/reg Леша Лёха"))
+        # Целая фраза сохраняется (её можно писать вместе) и отдельные слова — по ним бот
+        # и узнаёт человека в сообщениях: «Лёхе» → «Лёха».
+        self.assertEqual(self.member(storage, 101).aliases, ["Леша Лёха", "Леша", "Лёха"])
+        bot.process_update(self.message(2, "/reg Дима", user_id=102, username="bdzmity",
+                                        first="Дима"))
+        bot.process_update(self.message(3, "@test_bot Дима должен Лёхе 3 рубля",
+                                        user_id=102, username="bdzmity", first="Дима"))
+        assert_saved_debt(self, self.texts(telegram)[2])
+        record = storage.list_debts(CHAT)[0]
+        self.assertEqual((record.from_user_id, record.to_user_id), (102, 101))
+
+    def test_text_mention_is_remembered(self) -> None:
+        """Упоминание без @ника (text_mention) — тоже источник id: человек виден в /who."""
+        bot, _, telegram = self.build()
+        bot.process_update(self.message(
+            1, "@test_bot смотри, кто тут",
+            entities=[{"type": "text_mention", "offset": 0, "length": 5,
+                       "user": {"id": 103, "username": "petrova_m", "first_name": "Маша"}}]))
+        bot.process_update(self.message(2, "/who"))
+        self.assertIn("Маша", self.texts(telegram)[1])
+
+    def test_registering_another_nudges_to_register_me(self) -> None:
+        """Зарегистрировал друга, а сам без отметки — бот напоминает про себя (иначе записи
+        отклонялись бы с «Ещё не зарегистрирован: <вы же>»)."""
+        bot, _, telegram = self.build()
+        bot.process_update(self.message(1, "/reg Дима, Димон",
+                                        reply_from={"id": 102, "first_name": "Дима"}))
+        self.assertIn(REGISTER_SELF_HINT, self.texts(telegram)[0])
+        bot.process_update(self.message(2, "/reg Леша, Лёха"))
+        self.assertNotIn(REGISTER_SELF_HINT, self.texts(telegram)[1])
 
 
 if __name__ == "__main__":

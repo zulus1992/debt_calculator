@@ -164,7 +164,8 @@ PASSWORD_REPLY = (
     "🔐 Чтобы я начал работать в этом чате, пришлите пароль:\n"
     "• нажмите /login — и следующим сообщением пришлите пароль\n"
     "• или сразу: /password ваш-пароль\n"
-    "• или просто сообщением с паролем — второй раз спрашивать не буду."
+    "• или просто сообщением с паролем — второй раз спрашивать не буду.\n"
+    "После входа сможете отметиться: /reg Женя, ЖеняШ, кличка"
 )
 LOGIN_DONE_REPLY = (
     "✅ Вход в этот чат уже выполнен — пароль принят, можно работать.\n"
@@ -190,6 +191,8 @@ REGISTER_HINT = (
     "Регистрация — командой /reg (её можно нажать):\n"
     "• себя: /reg Женя, ЖеняШ, как вас ещё зовут\n"
     "• другого: /reg @его_ник Гоша, Гоша Петров, кличка\n"
+    "• или ответьте на любое его сообщение и напишите /reg Гоша, кличка — так я точно\n"
+    "  узнаю, о ком речь, даже если его сообщений сам не видел\n"
     "После регистрации повторите сообщение — тогда и запишу.\n"
     "Кто уже есть в чате: /who"
 )
@@ -715,18 +718,82 @@ def _with_registration_tip(reply: str, author: ChatMember | None) -> str:
     return f"{reply}\n\n{REGISTER_SELF_HINT}"
 
 
+def _author_registered(storage: Storage, chat_id: int, user_id: int) -> bool:
+    """Отметка /reg человека по свежим данным из базы.
+
+    Нужна после самой команды /reg: объект автора, прочитанный в начале обработки, уже устарел
+    — им нельзя проверять, отметился ли человек только что.
+    """
+    for member in _load_members(storage, chat_id):
+        if member.user_id == user_id:
+            return member.is_registered
+    return False
+
+
+def _parse_aliases(rest: str) -> list[str]:
+    """Имена из аргументов /reg: «Женя, ЖеняШ шаман» и «Женя ЖеняШ» одинаково понятны.
+
+    Разделяем по запятым и точкам с запятой, а внутри куска — ещё и по пробелам: иначе
+    «/reg Леша Лёха» (без запятой) превращалось в один бесполезный псевдоним «Леша Лёха»,
+    и бот потом не узнавал человека по имени — со стороны это выглядело как «регистрация
+    не сработала». Многословный кусок сохраняем целиком («Леша Козлов») и добавляем слова
+    по отдельности: «Леша» и «Козлов» — так узнаётся и имя, и фамилия.
+    """
+    aliases: list[str] = []
+    for chunk in REG_ALIAS_SPLIT_RE.split(str(rest or "")):
+        chunk = chunk.strip().lstrip("@").strip()
+        if not chunk:
+            continue
+        words = [word for word in re.split(r"\s+", chunk) if word]
+        for alias in ([chunk] if len(words) > 1 else []) + words:
+            if alias.lower() not in {item.lower() for item in aliases}:
+                aliases.append(alias)
+    return aliases
+
+
+def _mentioned_members(chat_id: int, message: Mapping[str, Any]) -> list[ChatMember]:
+    """Люди, которых видно в самом сообщении: кому отвечают и кого позвали без @ника.
+
+    В группах Telegram присылает боту только адресованные ему сообщения, поэтому «я знаю тех,
+    кто мне писал» — не фигура речи. Дополнительно узнать человека можно двумя способами:
+    из `reply_to_message.from` (ответ на его сообщение) и из `text_mention` (упоминание без
+    @ника — в такой сущности лежит готовый объект пользователя с id). Оба случая разбираем
+    и запоминаем участника: тогда /reg @ник и «/reg Имя» ответом на его сообщение работают.
+    """
+    found: list[ChatMember] = []
+    replied = member_from_telegram(chat_id, (message.get("reply_to_message") or {}).get("from"))
+    if replied is not None:
+        found.append(replied)
+    for key in ("entities", "caption_entities"):
+        for entity in message.get(key) or []:
+            if not isinstance(entity, Mapping):
+                continue
+            if str(entity.get("type") or "") != "text_mention":
+                continue
+            mentioned = member_from_telegram(chat_id, entity.get("user"))
+            if mentioned is not None:
+                found.append(mentioned)
+    return found
+
+
 def parse_registration(argument: str, author: ChatMember | None,
-                       members: Sequence[ChatMember]) -> tuple[ChatMember | None, list[str], str]:
+                       members: Sequence[ChatMember],
+                       replied: ChatMember | None = None) -> tuple[ChatMember | None, list[str], str]:
     """Разбирает аргументы /reg и отвечает: кого регистрируем, какие имена, что не так.
 
     Формы:
       «/reg @Genia Женя, ЖеняШ, шаман» — регистрируем участника с таким @ником;
-      «/reg Женя, ЖеняШ, шаман»        — регистрируем автора сообщения;
-      «/reg @Genia»                    — без новых имён: просто отметить участника.
+      «/reg Женя, ЖеняШ, шаман»        — регистрируем автора сообщения... а если это ответ
+                                         на чьё-то сообщение — того, кому ответили;
+      «/reg @Genia»                    — без новых имён: просто отметить участника;
+      «/reg»                           — отметить себя (даже если это ответ).
+
+    Ответ на сообщение — единственный надёжный способ зарегистрировать человека, чьи
+    сообщения бот сам не видел: из ответа Telegram отдаёт его id и @ник.
     """
     raw = (argument or "").strip()
     if not raw:
-        return author, [], ""
+        return (author or replied), [], ""
     target: ChatMember | None = author
     rest = raw
     handle_match = REG_HANDLE_RE.match(raw)
@@ -741,25 +808,33 @@ def parse_registration(argument: str, author: ChatMember | None,
             known = ", ".join(f"@{member.username}" for member in members if member.username)
             return None, [], (
                 f"❌ Не нашёл @{handle_match.group('handle')} в этом чате.\n"
-                "Я запоминаю людей по их сообщениям — пусть этот человек напишет что-нибудь "
-                "в чат, и я его узнаю.\n"
+                "В группах Telegram присылает мне только сообщения с обращением ко мне, поэтому\n"
+                "я знаю лишь тех, кто мне писал, кому отвечали или кого звали без @ника.\n"
+                "Как зарегистрировать этого человека:\n"
+                "• пусть он сам напишет: /reg Имя, кличка\n"
+                "• или ответьте на любое его сообщение и повторите: /reg @его_ник Имя, кличка\n"
                 f"Известные @ники: {known or 'пока никого'}.\n"
                 "Себя можно зарегистрировать так: /reg Женя, ЖеняШ, кличка"
             )
-    elif author is None:
+    elif replied is not None:
+        target = replied          # ответ на сообщение — регистрируем того, кому ответили
+    if target is None:
         return None, [], (
             "❌ Не понял, кого регистрируем: не вижу автора сообщения.\n"
-            "Напишите так: /reg @его_ник Имя, кличка — или /reg Имя, кличка про себя."
+            "Напишите так: /reg @его_ник Имя, кличка — или ответьте на его сообщение\n"
+            "и напишите /reg Имя, кличка."
         )
     rest = rest.lstrip(":—-–— \t")
-    aliases = [part.strip().lstrip("@") for part in REG_ALIAS_SPLIT_RE.split(rest)]
-    return target, [alias for alias in aliases if alias], ""
+    return target, _parse_aliases(rest), ""
 
 
 def register_command(argument: str, storage: Storage, members: Sequence[ChatMember],
-                     author: ChatMember | None) -> str:
-    """Команда /reg: связывает участника чата с именами, по которым его узнают."""
-    target, aliases, problem = parse_registration(argument, author, members)
+                     author: ChatMember | None, replied: ChatMember | None = None) -> str:
+    """Команда /reg: связывает участника чата с именами, по которым его узнают.
+
+    `replied` — тот, кому адресован ответ: тогда «/reg Имя» регистрирует его, а не автора.
+    """
+    target, aliases, problem = parse_registration(argument, author, members, replied)
     if problem:
         return problem
     if target is None:
@@ -1023,12 +1098,14 @@ def handle_text(
     settings: Settings,
     members: Sequence[ChatMember] | None = None,
     author: ChatMember | None = None,
+    replied: ChatMember | None = None,
 ) -> str | CsvReport:
     """Обрабатывает одно сообщение и формирует ответ бота.
 
     Функция не знает про Telegram — это делает её простой для тестов.
     `members` и `author` — состав чата и автор сообщения: по ним ИИ (и локальный
     резолвер) понимают, кто такой «Лешак» из текста, и запись привязывается к user id.
+    `replied` — тот, кому адресован ответ: «/reg Имя» в ответе регистрирует его.
 
     Обычный ответ — строка; команда выгрузки (/export) отвечает объектом CsvReport:
     Telegram не умеет отправлять файл сообщением, поэтому решение «файл или текст»
@@ -1067,7 +1144,13 @@ def handle_text(
     if command in ("/start", "/help"):
         return format_help(default_currency)
     if command in ("/reg", "/register"):
-        return register_command(argument, storage, members, author)
+        reply = register_command(argument, storage, members, author, replied)
+        # Зарегистрировали другого, а сами остались без отметки? Тогда любая запись будет
+        # отклоняться с «Ещё не зарегистрирован: <вы сами>» — поэтому напоминаем о себе.
+        # Состояние читаем из базы: после только что выполненного /reg объект автора устарел.
+        if author is not None and not _author_registered(storage, chat_id, author.user_id):
+            reply = _with_registration_tip(reply, author)
+        return reply
     if command in ("/who", "/members"):
         return format_members_report(members)
     if command in STATUS_COMMANDS:
@@ -1481,11 +1564,20 @@ class DebtBot:
         # Леша Козлов, и запись привязывается к его user id.
         author = member_from_telegram(int(chat_id), message.get("from") or {})
         members = self._remember_author(author)
+        # Дополнительно запоминаем тех, кого видно в сообщении: того, кому отвечают, и
+        # упомянутых без @ника. В группах Telegram присылает боту только адресованные ему
+        # сообщения, поэтому иначе человека, который «писал в чат», бот просто не знает —
+        # и /reg @ник отвечает «не нашёл».
+        replied_user = member_from_telegram(
+            int(chat_id), (message.get("reply_to_message") or {}).get("from"))
+        for seen in _mentioned_members(int(chat_id), message):
+            members = self._remember_author(seen) or members
+        replied = author_from_members(replied_user, members) if replied_user else None
         try:
             reply = handle_text(
                 text, int(chat_id),
                 storage=self._storage, parser=self._parser, settings=self._settings,
-                members=members, author=author,
+                members=members, author=author, replied=replied,
             )
         except StorageError as exc:
             logger.error("Хранилище: %s", exc)
