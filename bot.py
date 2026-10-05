@@ -80,6 +80,7 @@ from debts import (
     format_repayment_saved,
     format_transfers,
     minimal_transfers,
+    net_balances,
     normalize_name,
     person_label,
     person_transfers,
@@ -90,6 +91,7 @@ from deepseek import (
     ParsedMessage,
     check_api_key,
     detect_currency,
+    heuristic_paid_all,
     heuristic_parse,
 )
 from members import (
@@ -216,6 +218,8 @@ EXPORT_COMMANDS = ("/export", "/report", "/csv", "/файл")
 MY_DEBTS_COMMANDS = ("/mydebts", "/me", "/мои")
 # Команда «кому перевести лично мне»: тот же зачёт, что /settle, но только строки автора.
 OPEN_COMMANDS = ("/open", "/кому")
+# Команда «закрыть все долги человека»: пишет возвраты одной операцией, /undo отменяет целиком.
+PAID_COMMANDS = ("/paid", "/оплатил")
 # Запись долга командой: строгая форма «кто кому сколько [валюта]» и фраза как обычным сообщением.
 ADD_COMMANDS = ("/add", "/добавить")
 # Строгая форма /add: «кто кому сколько [валюта]». Сумма ищется отдельным токеном, поэтому
@@ -261,6 +265,7 @@ BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("who", "кто в чате и кто уже зарегистрирован"),
     ("mydebts", "мои долги: сколько должен я и сколько должны мне"),
     ("open", "кому перевести лично мне и кто переведёт мне"),
+    ("paid", "закрыть все долги человека: /paid (или /paid @ник)"),
     ("debts", "все долги чата с взаимозачётом"),
     ("add", "записать долг командой: /add Леша Дима 3 BYN"),
     ("settle", "минимум переводов, чтобы все долги закрылись"),
@@ -552,18 +557,176 @@ def my_debts_report(chat_id: int, storage: Storage, members: Sequence[ChatMember
     return _with_registration_tip(report, author)
 
 
+def _person_for_argument(argument: str, members: Sequence[ChatMember],
+                         author: ChatMember | None,
+                         command: str) -> tuple[ChatMember | None, str]:
+    """Человек из аргумента команды («/open Дима», «/paid @ник»): пусто — автор сообщения.
+
+    Возвращает (человек, текст проблемы): если имя не из этого чата, лучше сказать об этом
+    прямо, чем молча показать про автора — иначе выглядит как «команда не работает».
+    """
+    raw = str(argument or "").strip()
+    if not raw:
+        if author is None:
+            return None, ("🤔 Не вижу, кто вы: у сообщения нет автора.\n"
+                          f"Напишите так: {command} @ник или {command} Имя.")
+        return author, ""
+    member = resolve_member(raw, members, author)
+    if member is None:
+        return None, (
+            f"❓ Не знаю такого человека: «{raw}».\n"
+            f"• кто есть в чате: /who\n"
+            f"• написать по нику: {command} @его_ник\n"
+            f"• зарегистрировать: /reg {raw} Имя, кличка"
+        )
+    return member, ""
+
+
+def _member_by_label(members: Sequence[ChatMember], label: str) -> ChatMember | None:
+    """Участник по подписи из зачёта («Леша Козлов (@kozlovAlex)») — чтобы взять его user id."""
+    return next((member for member in members if member.label == label), None)
+
+
+def _close_balances(storage: Storage, chat_id: int, items: Sequence[Balance], *,
+                    payer: ChatMember, members: Sequence[ChatMember], raw_text: str) -> int:
+    """Пишет возвраты по сальдо одной операцией: payer — должник в каждой строке.
+
+    Все записи получают один group_id, поэтому /undo убирает операцию целиком: «оплатил всё»
+    не страшно нажать по ошибке. Возвращает, сколько записей записано.
+    """
+    group_id = uuid.uuid4().hex[:16]
+    records = []
+    for item in items:
+        creditor = _member_by_label(members, item.creditor)
+        records.append({
+            "from_name": _member_name(payer, payer.label),
+            "to_name": _member_name(creditor, item.creditor),
+            "currency": item.currency,
+            "amount": item.amount,
+            "kind": "repayment",
+            "from_user_id": payer.user_id,
+            "to_user_id": creditor.user_id if creditor else None,
+            "raw_text": raw_text,
+            "group_id": group_id,
+        })
+    return len(storage.add_debts(chat_id, records))
+
+
+def _totals_text(items: Sequence[Balance]) -> str:
+    """«3.00 BYN, 2.00 USD» — итог по валютам из списка сальдо."""
+    totals: dict[str, float] = {}
+    for item in items:
+        totals[item.currency] = round(totals.get(item.currency, 0.0) + float(item.amount), 2)
+    return ", ".join(f"{amount:.2f} {code}" for code, amount in sorted(totals.items()))
+
+
+def _closed_reply(title: str, items: Sequence[Balance], *, saved: int = 0,
+                  incoming: Sequence[Balance] = ()) -> str:
+    """Общий ответ «долги закрыты»: что закрыли, что осталось и как отменить."""
+    lines = [title, ""]
+    lines.extend(f"• {item.creditor} — {item.amount:.2f} {item.currency}" for item in items)
+    tail = f" (возвратов записано: {saved})" if saved else ""
+    lines.append(f"Итого: {_totals_text(items)}{tail}")
+    if incoming:
+        lines.append("")
+        lines.append("• Осталось должны ему: " + _paid_lines(incoming))
+    lines.append("")
+    lines.append("Отменить операцию целиком: /undo — долги вернутся как были.")
+    return "\n".join(lines)
+
+
+def paid_report(chat_id: int, storage: Storage, members: Sequence[ChatMember],
+                author: ChatMember | None, argument: str = "") -> str:
+    """Команда /paid: закрывает все долги человека — записывает возвраты одной операцией.
+
+    Берём парный зачёт (`net_balances`): сколько человек должен каждому после взаимозачёта,
+    и на каждую такую пару пишем возврат — в той же валюте, что и записи (пересчёт по курсам
+    здесь не нужен: закрываем именно те долги, что есть). Все возвраты получают один group_id,
+    поэтому /undo убирает операцию целиком, как общий счёт: нажать «оплатил всё» не страшно.
+    Деньги, которые должны самому человеку, не трогаем — о них пишем в ответе.
+    """
+    person, problem = _person_for_argument(argument, members, author, "/paid")
+    if problem:
+        return problem
+    try:
+        debts = storage.list_debts(chat_id)
+    except StorageError as exc:
+        return f"⚠️ Проблема с базой данных: {exc}"
+    registered = _not_registered_reply([(person, person.label if person else "")])
+    if registered:
+        return registered
+    label = person_label(debts, members, person)
+    outgoing, incoming = person_transfers(net_balances(debts, members), label)
+    if not outgoing:
+        lines = [f"🎉 У {label} нет долгов — закрывать нечего."]
+        if incoming:
+            lines.append("• Должны ему: " + _paid_lines(incoming))
+        return _with_registration_tip("\n".join(lines), author)
+    try:
+        saved = _close_balances(storage, chat_id, outgoing, payer=person, members=members,
+                                raw_text=f"/paid {argument}".strip())
+    except StorageError as exc:
+        return f"⚠️ Проблема с базой данных: {exc}"
+    return _with_registration_tip(
+        _closed_reply(f"✅ Закрыл все долги: {label}", outgoing, saved=saved, incoming=incoming),
+        author)
+
+
+def repay_all_report(chat_id: int, storage: Storage, members: Sequence[ChatMember],
+                     author: ChatMember | None, recipient: ChatMember) -> str:
+    """Фраза «я отдал всё Леше»: закрывает долги автора перед одним человеком.
+
+    Возврат пишем в тех валютах, в которых долги записаны, — одной операцией, поэтому
+    /undo убирает её целиком. Если автор этому человеку ничего не должен, честно об этом
+    говорим (и подсказываем, если наоборот — должны ему).
+    """
+    try:
+        debts = storage.list_debts(chat_id)
+    except StorageError as exc:
+        return f"⚠️ Проблема с базой данных: {exc}"
+    registered = _not_registered_reply([(author, author.label if author else "")])
+    if registered:
+        return registered
+    balances = net_balances(debts, members)
+    author_label = person_label(debts, members, author)
+    recipient_label = person_label(debts, members, recipient)
+    outgoing = [item for item in balances
+                if item.debtor == author_label and item.creditor == recipient_label]
+    incoming = [item for item in balances
+                if item.debtor == recipient_label and item.creditor == author_label]
+    if not outgoing:
+        lines = [f"🎉 Долгов перед ним нет — закрывать нечего: {recipient.label}."]
+        if incoming:
+            lines.append("• Наоборот, должны вам: " + _paid_lines(incoming))
+        return _with_registration_tip("\n".join(lines), author)
+    try:
+        saved = _close_balances(storage, chat_id, outgoing, payer=author, members=members,
+                                raw_text=f"отдал всё {recipient.label}")
+    except StorageError as exc:
+        return f"⚠️ Проблема с базой данных: {exc}"
+    return _with_registration_tip(
+        _closed_reply(f"✅ Закрыл ваш долг: {recipient.label}", outgoing, saved=saved),
+        author)
+
+
+def _paid_lines(items: Sequence[Balance]) -> str:
+    """«Кто — 3.00 BYN» для ответа /paid: перечисляем должников (кто ещё должен человеку)."""
+    return "; ".join(f"{item.debtor} — {item.amount:.2f} {item.currency}" for item in items)
+
+
 def open_report(chat_id: int, storage: Storage, settings: Settings,
                 members: Sequence[ChatMember], author: ChatMember | None,
-                chat_currency: str) -> str:
-    """Команда /open: кому перевести и от кого получить лично мне — короткий список.
+                chat_currency: str, argument: str = "") -> str:
+    """Команда /open: кому перевести и от кого получить — коротким списком.
 
-    Считаем тот же взаимозачёт, что /settle (минимум переводов, курсы на дату записи), и
-    оставляем только строки автора: он видит конкретные адресаты и суммы, а не общий котёл
-    чата. Именно этот список адресатов и есть ответ «кому должен лично я».
+    Без аргумента — про автора сообщения, с аргументом (/open Дима, /open @ник) — про него:
+    считаем тот же взаимозачёт, что /settle (минимум переводов, курсы на дату записи), и
+    оставляем только строки этого человека: он видит конкретные адресаты и суммы, а не общий
+    котёл чата. Именно этот список адресатов и есть ответ «кому должен лично я».
     """
-    if author is None:
-        return ("🤔 Не вижу, кто вы: у сообщения нет автора.\n"
-                "Напишите что-нибудь в чат от себя и повторите /open.")
+    person, problem = _person_for_argument(argument, members, author, "/open")
+    if problem:
+        return problem
     try:
         debts = storage.list_debts(chat_id)
         if not debts:
@@ -575,14 +738,15 @@ def open_report(chat_id: int, storage: Storage, settings: Settings,
         return f"⚠️ Проблема с базой данных: {exc}"
     converted = convert_debts(debts, chat_currency, rate_table(points), base)
     source = converted.debts if converted.changed else debts
-    label = person_label(source, members, author)
+    label = person_label(source, members, person)
     outgoing, incoming = person_transfers(minimal_transfers(source, members), label)
     lines: list[str] = []
     if converted.changed:
         lines.append(f"💱 Считаю в {chat_currency.upper()} по курсу на дату записи:")
         lines.extend(format_used_rates(converted.rates_used, chat_currency.upper()))
         lines.append("")
-    lines.append(format_open_report(label, outgoing, incoming, chat_currency))
+    lines.append(format_open_report(label, outgoing, incoming, chat_currency,
+                                    mine=author is None or person.user_id == author.user_id))
     if converted.skipped:
         lines.append("• Без курса оставил: " + ", ".join(sorted(set(converted.skipped))))
     if update.problems:
@@ -1165,7 +1329,9 @@ def handle_text(
         return with_buttons(my_debts_report(chat_id, storage, members, author, default_currency))
     if command in OPEN_COMMANDS:
         return with_buttons(open_report(chat_id, storage, settings, members, author,
-                                        default_currency))
+                                        default_currency, argument))
+    if command in PAID_COMMANDS:
+        return with_buttons(paid_report(chat_id, storage, members, author, argument))
     if command in EXPORT_COMMANDS:
         return debts_csv_report(chat_id, storage)
     if command == "/debts":
@@ -1185,11 +1351,21 @@ def handle_text(
         if removed is None:
             return "📭 Записей нет — удалять нечего."
         if removed.group_id:
-            # Общий счёт — одна операция: убираем все его доли, а не одну строку.
+            # Общий счёт или «оплатил всё» — одна операция: убираем все её записи, а не одну.
             rest = storage.delete_group(chat_id, removed.group_id)
             text = f" «{removed.raw_text}»" if removed.raw_text else ""
-            return f"🗑 Удалил общий счёт{text} целиком: записей {rest + 1}."
+            title = "общий счёт" if removed.is_expense else "операцию возвратов"
+            return f"🗑 Удалил {title}{text} целиком: записей {rest + 1}."
         return f"🗑 Удалил последнюю запись: {removed.pretty()}"
+
+    # «Отдал всё Леше»: числа в тексте нет, но смысл ясен — закрыть свои долги этому человеку.
+    # Разбираем сами и до ИИ: обычный разбор ищет сумму, и такую фразу он не понимает.
+    # Имя ищем среди участников чата: если не нашли — идём обычным путём, без лишних ошибок.
+    if author is not None:
+        paid_to = heuristic_paid_all(raw)
+        recipient = resolve_member(paid_to, members, author) if paid_to else None
+        if recipient is not None:
+            return with_buttons(repay_all_report(chat_id, storage, members, author, recipient))
 
     parsed = parser.parse(raw, default_currency, members=members, author=author)
     explicit_currency = detect_currency(raw)

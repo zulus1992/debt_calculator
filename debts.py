@@ -632,16 +632,17 @@ def _sum_by_currency(items: Sequence[Balance]) -> str:
 
 
 def format_open_report(label: str, outgoing: Sequence[Balance], incoming: Sequence[Balance],
-                       target: str = "") -> str:
-    """Ответ /open: кому перевести и от кого получить лично мне — адресаты, а не весь чат.
+                       target: str = "", *, mine: bool = True) -> str:
+    """Ответ /open: кому перевести и от кого получить — коротким списком адресатов.
 
-    Берём те же минимальные переводы, что и /settle, и оставляем строки с автором: человек
-    видит конкретные адресаты и суммы, а не общий котёл из пар долгов всего чата.
+    Берём те же минимальные переводы, что и /settle, и оставляем строки одного человека:
+    он видит конкретные адресаты и суммы, а не общий котёл из пар долгов всего чата.
+    `mine=False` — смотрим не свои переводы, а другого человека (заголовок без «лично вам»).
     """
     if not label:
         return ("🤔 Не вижу, кто вы: у сообщения нет автора.\n"
                 "Напишите что-нибудь в чат от себя и повторите /open.")
-    title = f"🧭 Долги лично вам — {label}"
+    title = f"🧭 Долги лично вам — {label}" if mine else f"🧭 Долги — {label}"
     if target:
         title += f" (валюта: {target.upper()})"
     lines = [title, ""]
@@ -651,19 +652,20 @@ def format_open_report(label: str, outgoing: Sequence[Balance], incoming: Sequen
         lines.append("Весь чат и зачёт: /settle, ваши итоги по парам: /mydebts")
         return "\n".join(lines)
     if outgoing:
-        lines.append("🔴 Переведите:")
+        lines.append("🔴 Переведите:" if mine else "🔴 Переведёт:")
         lines.extend(f"• {item.creditor} — {_money(item.amount, item.currency)}"
                      for item in sorted(outgoing, key=lambda item: (-item.amount, item.creditor)))
         lines.append(f"Итого перевести: {_sum_by_currency(outgoing)}")
     if incoming:
         if outgoing:
             lines.append("")
-        lines.append("🟢 Вам переведут:")
+        lines.append("🟢 Вам переведут:" if mine else "🟢 Ему переведут:")
         lines.extend(f"• {item.debtor} — {_money(item.amount, item.currency)}"
                      for item in sorted(incoming, key=lambda item: (-item.amount, item.debtor)))
         lines.append(f"Итого получить: {_sum_by_currency(incoming)}")
     lines.append("")
-    lines.append("Весь чат и зачёт: /settle, ваши итоги по парам: /mydebts")
+    lines.append("Весь чат и зачёт: /settle, итоги по парам: /mydebts"
+                 if not mine else "Весь чат и зачёт: /settle, ваши итоги по парам: /mydebts")
     return "\n".join(lines)
 
 
@@ -688,6 +690,8 @@ def format_help(default_currency: str = "BYN") -> str:
         "",
         "2. Записать возврат долга (уменьшает сальдо):",
         "   «Леша вернул Диме 3 рубля» или «Маша отдала Пете 10$».",
+        "   Всё сразу одному человеку: «я отдал все деньги Леше» — закрою ваши долги ему",
+        "   (командой: /paid — все ваши долги, /paid Леша — все долги Леши)",
         "",
         "3. Общий счёт — делю сумму между участниками поровну:",
         "   «Дима заплатил 10 за всех», «я заплатил 10»,",
@@ -702,6 +706,9 @@ def format_help(default_currency: str = "BYN") -> str:
         "5. Взаимозачёт: кто кому сколько переводит, чтобы всё закрылось:",
         "   /settle — минимум переводов (если A→B и B→C, то A платит C)",
         "   /open — только про вас: кому перевести и кто переведёт вам",
+        "   /open Дима — то же про другого человека (или /open @ник)",
+        "   /paid — закрыть все долги человека: /paid про себя, /paid @ник — про другого",
+        "   (пишу возвраты одной операцией, отменить целиком: /undo)",
         "   Итоги в ответе о записи не показываю — считаю их тут, по команде.",
         "",
         "6. Привести всё к валюте чата по курсу на дату записи:",

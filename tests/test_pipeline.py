@@ -94,6 +94,7 @@ from deepseek import (
     DeepSeekParser,
     ParsedMessage,
     detect_currency,
+    heuristic_paid_all,
     heuristic_parse,
 )
 from members import (
@@ -4566,9 +4567,9 @@ class OpenReportTests(unittest.TestCase):
         self.storage = InMemoryStorage(default_currency="BYN")
         self.members = seed_chat(self.storage, chat=CHAT)
 
-    def ask(self, author: ChatMember | None = MEMBER_LEHA) -> str:
-        """Гоняет /open через handle_text и возвращает ответ бота."""
-        return handle_text("/open", CHAT, storage=self.storage, parser=HeuristicParser(),
+    def ask(self, author: ChatMember | None = MEMBER_LEHA, text: str = "/open") -> str:
+        """Гоняет /open (или другую команду) через handle_text и возвращает ответ бота."""
+        return handle_text(text, CHAT, storage=self.storage, parser=HeuristicParser(),
                            settings=Settings(default_currency="BYN"),
                            members=self.members, author=author)
 
@@ -4643,6 +4644,31 @@ class OpenReportTests(unittest.TestCase):
         """/open есть и в меню Telegram, и в справке — иначе его не нажать."""
         self.assertIn("open", [name for name, _ in BOT_COMMANDS])
         self.assertIn("/open", format_help("BYN"))
+
+    def test_open_for_another_person(self) -> None:
+        """«/open Дима» показывает переводы Димы: заголовок без «лично вам»."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_MASHA, MEMBER_DIMA, 10.0)
+        reply = self.ask(text="/open Дима")
+        self.assertIn("🧭 Долги — Дмитрий Болт (@bdzmity) (валюта: BYN)", reply)
+        self.assertIn("🟢 Ему переведут:", reply)
+        self.assertIn("• Маша Петрова (@petrova_m) — 10.00 BYN", reply)
+        self.assertIn("• Леша Козлов (@kozlovAlex) — 3.00 BYN", reply)
+        self.assertIn("Итого получить: 13.00 BYN", reply)
+
+    def test_open_by_username_and_unknown_person(self) -> None:
+        """Человека можно назвать ником; незнакомое имя — подсказка, а не пустой отчёт."""
+        self.debt(MEMBER_MASHA, MEMBER_DIMA, 10.0)
+        self.assertIn("Дмитрий Болт (@bdzmity)", self.ask(text="/open @bdzmity"))
+        self.assertIn("Не знаю такого человека", self.ask(text="/open Гоша"))
+
+    def test_open_for_another_person_without_their_debts(self) -> None:
+        """У чужого человека долгов нет — говорим об этом, а не показываем чужие пары."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        reply = self.ask(text="/open Маша")
+        self.assertIn("🧭 Долги — Маша Петрова (@petrova_m)", reply)
+        self.assertIn("🎉 Чисто", reply)
+        self.assertNotIn("Дмитрий Болт (@bdzmity) — ", reply)
 
 
 class CommandButtonsTests(unittest.TestCase):
@@ -5432,6 +5458,125 @@ class RegistrationBugsTests(unittest.TestCase):
         self.assertIn(REGISTER_SELF_HINT, self.texts(telegram)[0])
         bot.process_update(self.message(2, "/reg Леша, Лёха"))
         self.assertNotIn(REGISTER_SELF_HINT, self.texts(telegram)[1])
+
+
+class PaidCommandTests(unittest.TestCase):
+    """Закрытие долгов целиком: команда /paid и фраза «я отдал всё Леше»."""
+
+    def setUp(self) -> None:
+        self.storage = InMemoryStorage(default_currency="BYN")
+        self.members = seed_chat(self.storage, chat=CHAT)
+
+    def send(self, text: str, author: ChatMember | None = MEMBER_LEHA) -> str:
+        """Проводит сообщение через handle_text (в сети не ходим: парсер — эвристики)."""
+        return handle_text(text, CHAT, storage=self.storage, parser=HeuristicParser(),
+                           settings=Settings(default_currency="BYN"),
+                           members=self.storage.list_members(CHAT), author=author)
+
+    def debt(self, debtor: ChatMember, creditor: ChatMember, amount: float,
+             currency: str = "BYN") -> None:
+        """Записывает долг между участниками чата."""
+        self.storage.add_debt(CHAT, debtor.display_name, creditor.display_name, currency, amount,
+                              from_user_id=debtor.user_id, to_user_id=creditor.user_id)
+
+    def test_paid_closes_all_my_debts_as_one_operation(self) -> None:
+        """/paid закрывает все мои долги, и /undo убирает операцию целиком."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 2.0, "USD")
+        reply = self.send("/paid")
+        self.assertIn("Закрыл все долги", reply)
+        self.assertIn("3.00 BYN", reply)
+        self.assertIn("2.00 USD", reply)          # валюты записей не пересчитываем
+        self.assertIn("возвратов записано: 2", reply)
+        self.assertIn("/undo", reply)
+        records = self.storage.list_debts(CHAT)
+        self.assertEqual(len(records), 4)         # два долга и два возврата
+        self.assertEqual(net_balances(records, self.members), [])   # после закрытия долгов нет
+
+        undo = self.send("/undo")
+        self.assertIn("операцию возвратов", undo)  # одна операция — одно удаление
+        self.assertEqual(len(self.storage.list_debts(CHAT)), 2)     # остались только долги
+
+    def test_paid_keeps_what_others_owe_me(self) -> None:
+        """Закрывая свои долги, чужие долги передо мной не трогаем — о них пишем в ответе."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_MASHA, MEMBER_LEHA, 5.0)
+        reply = self.send("/paid")
+        self.assertIn("Осталось должны ему", reply)
+        self.assertIn("Маша", reply)
+        records = self.storage.list_debts(CHAT)
+        self.assertEqual(len(records), 3)          # 2 долга + 1 возврат
+        self.assertEqual([(item.debtor, item.amount)
+                          for item in minimal_transfers(records, self.members)],
+                         [("Маша Петрова (@petrova_m)", 5.0)])
+
+    def test_paid_for_another_person(self) -> None:
+        """«/paid Дима» закрывает долги Димы (а не автора)."""
+        self.debt(MEMBER_DIMA, MEMBER_MASHA, 4.0)
+        reply = self.send("/paid Дима")
+        self.assertIn("Закрыл все долги", reply)
+        self.assertIn("Маша", reply)
+        record = self.storage.list_debts(CHAT)[-1]
+        self.assertEqual((record.from_user_id, record.to_user_id, record.kind),
+                         (MEMBER_DIMA.user_id, MEMBER_MASHA.user_id, "repayment"))
+
+    def test_paid_without_debts_says_nothing_to_close(self) -> None:
+        self.debt(MEMBER_DIMA, MEMBER_MASHA, 4.0)
+        reply = self.send("/paid")
+        self.assertIn("нет долгов", reply)
+        self.assertEqual(len(self.storage.list_debts(CHAT)), 1)     # ничего не записали
+
+    def test_paid_unknown_person_and_unregistered(self) -> None:
+        """Незнакомое имя — подсказка; незарегистрированный — просьба отметиться."""
+        self.assertIn("Не знаю такого человека", self.send("/paid Гоша"))
+        storage = InMemoryStorage(default_currency="BYN")
+        members = seed_chat(storage, members=(MEMBER_GOSHA,), register=False)   # без /reg
+        author = next(item for item in members if item.user_id == MEMBER_GOSHA.user_id)
+        reply = handle_text("/paid", CHAT, storage=storage, parser=HeuristicParser(),
+                            settings=Settings(default_currency="BYN"), members=members,
+                            author=author)
+        self.assertIn("/reg", reply)
+        self.assertEqual(storage.list_debts(CHAT), [])              # и ничего не записали
+
+    def test_phrase_i_paid_everything_to_person(self) -> None:
+        """«я отдал все деньги Диме» — закрываю свои долги этому человеку."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 2.0)
+        self.debt(MEMBER_MASHA, MEMBER_DIMA, 7.0)        # не про Лешу — не трогаем
+        reply = self.send("я отдал все деньги Диме")
+        self.assertIn("Закрыл ваш долг:", reply)
+        self.assertIn("3.00 BYN", reply)
+        self.assertNotIn("Маша Петрова (@petrova_m) — ", reply)     # её долг не закрывали
+        self.assertEqual(sorted((item.debtor, item.creditor, item.amount)
+                                for item in net_balances(self.storage.list_debts(CHAT),
+                                                         self.members)),
+                         sorted([("Леша Козлов (@kozlovAlex)", "Маша Петрова (@petrova_m)", 2.0),
+                                 ("Маша Петрова (@petrova_m)", "Дмитрий Болт (@bdzmity)", 7.0)]))
+
+    def test_phrase_variants_and_no_false_matches(self) -> None:
+        """«рассчитался с Димой» и «закрыл долг Диме» понимаем; фразы с суммой — нет."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 4.0)
+        self.assertIn("Закрыл ваш долг:", self.send("рассчитался с Димой"))
+        self.assertIsNone(heuristic_paid_all("Леша вернул Диме 3 рубля"))
+        self.assertIsNone(heuristic_paid_all("сколько я должен"))
+        self.assertIsNone(heuristic_paid_all("привет"))
+        # фраза про неизвестного человека уходит обычным путём: «не понял», а не ошибка
+        self.assertIn("Не понял", self.send("я отдал всё незнакомцу"))
+
+    def test_phrase_by_username(self) -> None:
+        """Ник тоже годится: «я отдал всё @bdzmity» закрывает долг этому человеку."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 4.0)       # его долг остаётся
+        reply = self.send("я отдал всё @bdzmity")
+        self.assertIn("Закрыл ваш долг:", reply)
+        self.assertIn("3.00 BYN", reply)
+
+    def test_phrase_when_nothing_is_owed(self) -> None:
+        self.debt(MEMBER_DIMA, MEMBER_LEHA, 5.0)
+        reply = self.send("я отдал всё Диме")
+        self.assertIn("Долгов перед ним нет", reply)
+        self.assertIn("должны вам", reply)
 
 
 if __name__ == "__main__":

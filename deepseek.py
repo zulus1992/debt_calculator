@@ -67,6 +67,21 @@ REPAYMENT_RE = re.compile(
 
 DEBTS_KEYWORDS = ("долг", "долги", "сколько", "кто кому", "баланс", "расчёт", "расчет", "сальдо")
 CURRENCY_KEYWORDS = ("валют", "currency", "по умолчанию")
+
+# «Отдал всё Леше», «рассчитался с Петей», «закрыл долг Диме» — возврат всей суммы без числа.
+# Такую фразу обычный разбор не поймёт (он ищет сумму), поэтому распознаём её отдельно:
+# heuristic_paid_all отдаёт имя получателя, а бот закрывает долги автора перед ним.
+PAID_ALL_VERBS = ("отдал", "отдала", "вернул", "вернула", "возвратил", "возвратила",
+                  "погасил", "погасила", "рассчитался", "рассчиталась", "заплатил", "заплатила",
+                  "перевел", "перевела", "закинул", "закинула", "отправил", "отправила",
+                  "скинул", "скинула", "закрыл", "закрыла", "отдаю", "отдаёт", "верну")
+# Глаголы, которые сами по себе означают «закрыть долг целиком» — маркер «все/полностью» не нужен.
+PAID_ALL_STRONG_VERBS = ("рассчитался", "рассчиталась", "закрыл", "закрыла")
+# Маркеры «всё целиком»: без них фраза похожа на обычный возврат без суммы.
+PAID_ALL_MARKS = ("все", "весь", "вся", "всю", "полностью", "целиком", "остаток",
+                  "долг", "долги", "деньги", "сумму", "счет")
+# Служебные слова: после их удаления остаётся имя получателя.
+PAID_ALL_STOP_WORDS = ("я", "мы", "ему", "ей", "им", "с", "со", "за", "по", "на", "до", "и", "а")
 HELP_KEYWORDS = ("помощь", "help", "что ты умеешь", "как пользоваться", "команды")
 
 # Общий счёт: «Дима заплатил 10 за всех», «я заплатил 10 за всех кроме Оли», «Маша оплатила ужин».
@@ -406,6 +421,31 @@ def _segment_names(segment: str) -> list[str]:
         for token in NAME_TOKEN_RE.findall(segment or "")
         if detect_currency(token) is None
     ]
+
+
+def heuristic_paid_all(text: str) -> str | None:
+    """Ищет фразу «отдал всё <кому>» — возврат всей суммы долга одному человеку.
+
+    Возвращает имя получателя («Леше») или None. Если в тексте есть число, это обычный
+    возврат с суммой: его разбирает основной парсер, и трогать фразу не нужно. Имя может
+    не найтись в чате — тогда бот просто пойдёт обычным путём (скажет «не понял»), поэтому
+    лишних «я не знаю такого» на посторонние фразы не будет.
+    """
+    value = str(text or "").strip()
+    if not value or NUMBER_RE.search(value):
+        return None
+    lowered = value.lower().replace("ё", "е")
+    words = re.findall(r"[а-яa-z]+", lowered)
+    if not any(word in PAID_ALL_VERBS for word in words):
+        return None
+    if not any(word in PAID_ALL_STRONG_VERBS for word in words) \
+            and not any(mark in lowered for mark in PAID_ALL_MARKS):
+        return None
+    tail = lowered
+    for word in (*PAID_ALL_VERBS, *PAID_ALL_MARKS, *PAID_ALL_STOP_WORDS):
+        tail = re.sub(rf"\b{re.escape(word)}\b", " ", tail)
+    names = NAME_TOKEN_RE.findall(tail)
+    return names[0] if names else None
 
 
 def _parse_repayment(raw: str, default_currency: str = "BYN") -> ParsedMessage | None:
