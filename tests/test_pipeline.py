@@ -332,7 +332,7 @@ class BotFlowTests(unittest.TestCase):
         self.members = seed_chat(self.storage)     # без /reg записи не сохраняются
 
     def send(self, text: str, chat: int = CHAT) -> str:
-        """Отправляет сообщение боту (автор — Леша Козлов) и возвращает ответ."""
+        """Отправляет сообщение боту (автор — Леша Иванов) и возвращает ответ."""
         members = self.members if chat == CHAT else seed_chat(self.storage, chat)
         return handle_text(text, chat, storage=self.storage, parser=self.parser,
                            settings=self.settings, members=members,
@@ -362,7 +362,7 @@ class BotFlowTests(unittest.TestCase):
         self.send("Дима должен Леше 1 рубль")
         report = self.send("/debts")
         self.assertIn("Итог с взаимозачётом", report)
-        self.assertIn("Леша Козлов (@kozlovAlex) → Дмитрий Болт (@bdzmity): 2.00 BYN", report)
+        self.assertIn("Леша Иванов (@clever_hazel66) → Дмитрий Сидоров (@pearl_jolly92): 2.00 BYN", report)
 
     def test_report_when_empty(self) -> None:
         self.assertIn("Долгов нет", self.send("/debts"))
@@ -1657,7 +1657,7 @@ class RepaymentFlowTests(unittest.TestCase):
         self.members = seed_chat(self.storage)
 
     def send(self, text: str, chat: int = CHAT) -> str:
-        """Отправляет сообщение боту (автор — Леша Козлов) и возвращает ответ."""
+        """Отправляет сообщение боту (автор — Леша Иванов) и возвращает ответ."""
         members = self.members if chat == CHAT else seed_chat(self.storage, chat)
         return handle_text(text, chat, storage=self.storage, parser=self.parser,
                            settings=self.settings, members=members,
@@ -1670,7 +1670,7 @@ class RepaymentFlowTests(unittest.TestCase):
         saved = self.storage.list_debts(CHAT)[-1]
         self.assertEqual((saved.kind, saved.amount, saved.raw_text),
                          ("repayment", 3.0, "Леша вернул Диме 3 рубля"))
-        self.assertIn("Леша Козлов (@kozlovAlex) → Дмитрий Болт (@bdzmity): 2.00 BYN",
+        self.assertIn("Леша Иванов (@clever_hazel66) → Дмитрий Сидоров (@pearl_jolly92): 2.00 BYN",
                       self.send("/debts"))
 
     def test_repayment_without_amount_asks_for_details(self) -> None:
@@ -1730,7 +1730,7 @@ class SavedReplyIsSingleLineTests(unittest.TestCase):
         self.members = seed_chat(self.storage)
 
     def send(self, text: str) -> str:
-        """Отправляет сообщение боту (автор — Леша Козлов) и возвращает ответ."""
+        """Отправляет сообщение боту (автор — Леша Иванов) и возвращает ответ."""
         return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
                            settings=self.settings, members=self.members, author=MEMBER_LEHA)
 
@@ -1773,7 +1773,7 @@ class CompactSavedReplyTests(unittest.TestCase):
         seed_chat(self.storage)
 
     def send(self, text: str) -> str:
-        """Отправляет сообщение боту (автор — Леша Козлов) и возвращает ответ."""
+        """Отправляет сообщение боту (автор — Леша Иванов) и возвращает ответ."""
         return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
                            settings=self.settings,
                            members=self.storage.list_members(CHAT), author=MEMBER_LEHA)
@@ -1786,19 +1786,19 @@ class CompactSavedReplyTests(unittest.TestCase):
 
     def test_debt_reply_is_one_line(self) -> None:
         self.assert_compact(self.send("Леша должен Диме 3 рубля"),
-                            "✅ @kozlovAlex → @bdzmity 3.00 BYN")
+                            "✅ @clever_hazel66 → @pearl_jolly92 3.00 BYN")
 
     def test_repayment_reply_is_one_line(self) -> None:
         self.send("Леша должен Диме 5 рублей")
         self.assert_compact(self.send("Леша вернул Диме 3 рубля"),
-                            "↩️ @kozlovAlex → @bdzmity 3.00 BYN — возврат")
+                            "↩️ @clever_hazel66 → @pearl_jolly92 3.00 BYN — возврат")
 
     def test_expense_reply_names_payer_share_and_debtors(self) -> None:
         reply = self.send("Дима заплатил 10 за всех")
         first = reply.splitlines()[0]
-        self.assertTrue(first.startswith("🧾 @bdzmity заплатил 10.00 BYN — "
+        self.assertTrue(first.startswith("🧾 @pearl_jolly92 заплатил 10.00 BYN — "
                                          "по 2.00 BYN с "), first)
-        for handle in ("@kozlovAlex", "@petrova_m", "@olga_s", "@petya_k"):
+        for handle in ("@clever_hazel66", "@petrova_m", "@olga_s", "@petya_k"):
             self.assertIn(handle, first)
         self.assertEqual(len(reply.splitlines()), 1)      # ответ — одна строка
         for fragment in self.OLD_LINES:
@@ -1833,7 +1833,7 @@ class CompactSavedReplyTests(unittest.TestCase):
         reply = handle_text("Леша должен Диме 3 рубля", CHAT, storage=storage,
                             parser=self.parser, settings=self.settings,
                             members=storage.list_members(CHAT), author=leha)
-        self.assertIn("✅ Леша → @bdzmity 3.00 BYN", reply)
+        self.assertIn("✅ Леша → @pearl_jolly92 3.00 BYN", reply)
 
 
 class StorageRepaymentTests(unittest.TestCase):
@@ -1892,11 +1892,11 @@ class StorageRepaymentTests(unittest.TestCase):
         self.assertIsNone(memory.delete_last_debt(99))
 
 
-MEMBER_LEHA = ChatMember(chat_id=CHAT, user_id=101, username="kozlovAlex",
-                         display_name="Леша Козлов", aliases=["Леша", "Лёха"],
+MEMBER_LEHA = ChatMember(chat_id=CHAT, user_id=101, username="clever_hazel66",
+                         display_name="Леша Иванов", aliases=["Леша", "Лёха"],
                          is_registered=True)
-MEMBER_DIMA = ChatMember(chat_id=CHAT, user_id=102, username="bdzmity",
-                         display_name="Дмитрий Болт", aliases=["Дима", "Димон"],
+MEMBER_DIMA = ChatMember(chat_id=CHAT, user_id=102, username="pearl_jolly92",
+                         display_name="Дмитрий Сидоров", aliases=["Дима", "Димон"],
                          is_registered=True)
 MEMBER_MASHA = ChatMember(chat_id=CHAT, user_id=103, username="petrova_m",
                           display_name="Маша Петрова", aliases=["Маша"],
@@ -1930,21 +1930,21 @@ class MemberHelperTests(unittest.TestCase):
     """Сопоставление имён из сообщения с участниками чата."""
 
     def test_member_from_telegram(self) -> None:
-        member = member_from_telegram(7, {"id": 5, "first_name": "Леша", "last_name": "Козлов",
-                                          "username": "kozlovAlex"})
+        member = member_from_telegram(7, {"id": 5, "first_name": "Леша", "last_name": "Иванов",
+                                          "username": "clever_hazel66"})
         self.assertIsNotNone(member)
         self.assertEqual((member.user_id, member.username, member.display_name),
-                         (5, "kozlovAlex", "Леша Козлов"))
+                         (5, "clever_hazel66", "Леша Иванов"))
         self.assertIsNone(member_from_telegram(7, {"id": 5, "is_bot": True}))
         self.assertIsNone(member_from_telegram(7, None))
 
     def test_resolve_by_username(self) -> None:
-        self.assertEqual(resolve_member("@kozlovAlex", [MEMBER_LEHA, MEMBER_DIMA]).user_id, 101)
+        self.assertEqual(resolve_member("@clever_hazel66", [MEMBER_LEHA, MEMBER_DIMA]).user_id, 101)
 
     def test_resolve_by_full_and_partial_name(self) -> None:
         members = [MEMBER_LEHA, MEMBER_DIMA]
-        self.assertEqual(resolve_member("Леша Козлов", members).user_id, 101)
-        self.assertEqual(resolve_member("Козлов", members).user_id, 101)
+        self.assertEqual(resolve_member("Леша Иванов", members).user_id, 101)
+        self.assertEqual(resolve_member("Иванов", members).user_id, 101)
 
     def test_resolve_by_alias_and_case(self) -> None:
         members = [MEMBER_LEHA, MEMBER_DIMA]
@@ -1962,7 +1962,7 @@ class MemberHelperTests(unittest.TestCase):
         self.assertEqual(resolve_member("Олю", members).user_id, 104)
 
     def test_resolve_similar_spelling(self) -> None:
-        members = [ChatMember(chat_id=CHAT, user_id=101, display_name="Леша Козлов")]
+        members = [ChatMember(chat_id=CHAT, user_id=101, display_name="Леша Иванов")]
         self.assertEqual(resolve_member("Лешак", members).user_id, 101)      # общий корень
 
     def test_first_person_is_author(self) -> None:
@@ -1977,9 +1977,9 @@ class MemberHelperTests(unittest.TestCase):
     def test_roster_for_ai(self) -> None:
         roster = format_roster([MEMBER_LEHA, MEMBER_DIMA], MEMBER_LEHA)
         self.assertIn("id=101", roster)
-        self.assertIn("@kozlovAlex", roster)
+        self.assertIn("@clever_hazel66", roster)
         self.assertIn("алиасы: Дима, Димон", roster)
-        self.assertIn("Автор сообщения: Леша Козлов (@kozlovAlex) (id=101)", roster)
+        self.assertIn("Автор сообщения: Леша Иванов (@clever_hazel66) (id=101)", roster)
         self.assertIn("[зарегистрирован]", roster)
 
     def test_roster_marks_unregistered_members(self) -> None:
@@ -1998,7 +1998,7 @@ class ShortLabelTests(unittest.TestCase):
     """Короткое обращение в ответах о записи: «@ник», а без ника — только имя."""
 
     def test_username_wins(self) -> None:
-        self.assertEqual(short_label(MEMBER_LEHA), "@kozlovAlex")
+        self.assertEqual(short_label(MEMBER_LEHA), "@clever_hazel66")
 
     def test_without_username_first_name(self) -> None:
         self.assertEqual(short_label(replace(MEMBER_DIMA, username="")), "Дмитрий")
@@ -2007,7 +2007,7 @@ class ShortLabelTests(unittest.TestCase):
         self.assertEqual(short_label(ChatMember(chat_id=CHAT, user_id=107)), "id107")
 
     def test_known_member_is_taken_by_id(self) -> None:
-        self.assertEqual(short_label_for(101, "Лешак", REGISTERED), "@kozlovAlex")
+        self.assertEqual(short_label_for(101, "Лешак", REGISTERED), "@clever_hazel66")
 
     def test_unknown_member_uses_text_from_message(self) -> None:
         self.assertEqual(short_label_for(None, "Гоша", REGISTERED), "Гоша")
@@ -2015,7 +2015,7 @@ class ShortLabelTests(unittest.TestCase):
 
 
 class MemberBindingFlowTests(unittest.TestCase):
-    """Привязка записей к участникам: «Лешак», «Леша» и «@kozlovAlex» — один человек."""
+    """Привязка записей к участникам: «Лешак», «Леша» и «@clever_hazel66» — один человек."""
 
     def setUp(self) -> None:
         self.settings = Settings(default_currency="BYN")
@@ -2034,15 +2034,15 @@ class MemberBindingFlowTests(unittest.TestCase):
         reply = self.send("Лешак должен Диме 3 рубля")
         saved = self.storage.list_debts(CHAT)[0]
         self.assertEqual((saved.from_user_id, saved.to_user_id), (101, 102))
-        self.assertEqual((saved.from_name, saved.to_name), ("Леша Козлов", "Дмитрий Болт"))
+        self.assertEqual((saved.from_name, saved.to_name), ("Леша Иванов", "Дмитрий Сидоров"))
         assert_saved_debt(self, reply)
-        self.assertIn("@kozlovAlex → @bdzmity", reply)   # узнали обоих участников по никам
+        self.assertIn("@clever_hazel66 → @pearl_jolly92", reply)   # узнали обоих участников по никам
 
     def test_different_spellings_merge_by_id(self) -> None:
         self.send("Лешак должен Диме 3 рубля")
-        self.send("Леша Козлов должен Дмитрию Болту 2 рубля")
+        self.send("Леша Иванов должен Дмитрию Сидорову 2 рубля")
         report = self.send("/debts")
-        self.assertIn("Леша Козлов (@kozlovAlex) → Дмитрий Болт (@bdzmity): 5.00 BYN", report)
+        self.assertIn("Леша Иванов (@clever_hazel66) → Дмитрий Сидоров (@pearl_jolly92): 5.00 BYN", report)
 
     def test_repayment_is_bound_too(self) -> None:
         self.send("Лешак должен Диме 5 рубля")
@@ -2050,7 +2050,7 @@ class MemberBindingFlowTests(unittest.TestCase):
         saved = self.storage.list_debts(CHAT)[-1]
         self.assertEqual((saved.kind, saved.from_user_id, saved.to_user_id),
                          ("repayment", 101, 102))
-        self.assertIn("Леша Козлов (@kozlovAlex) → Дмитрий Болт (@bdzmity): 3.00 BYN",
+        self.assertIn("Леша Иванов (@clever_hazel66) → Дмитрий Сидоров (@pearl_jolly92): 3.00 BYN",
                       self.send("/debts"))
 
     def test_first_person_uses_author(self) -> None:
@@ -2085,12 +2085,12 @@ class IdentityNettingTests(unittest.TestCase):
     def test_ids_merge_different_spellings(self) -> None:
         balances = net_balances([
             make_debt("Лешак", "Дима", 3, user_ids=(101, 102)),
-            make_debt("Леша Козлов", "Дмитрий Болт", 2, user_ids=(101, 102)),
+            make_debt("Леша Иванов", "Дмитрий Сидоров", 2, user_ids=(101, 102)),
         ], members=[MEMBER_LEHA, MEMBER_DIMA])
         self.assertEqual(len(balances), 1)
         self.assertEqual(balances[0].amount, 5.0)
-        self.assertEqual(balances[0].debtor, "Леша Козлов (@kozlovAlex)")
-        self.assertEqual(balances[0].creditor, "Дмитрий Болт (@bdzmity)")
+        self.assertEqual(balances[0].debtor, "Леша Иванов (@clever_hazel66)")
+        self.assertEqual(balances[0].creditor, "Дмитрий Сидоров (@pearl_jolly92)")
 
     def test_padezh_forms_still_merge_without_ids(self) -> None:
         balances = net_balances([make_debt("Леша", "Дима", 3), make_debt("Леше", "Диме", 2)])
@@ -2106,8 +2106,8 @@ class IdentityNettingTests(unittest.TestCase):
     def test_totals_use_member_labels(self) -> None:
         owes, owed = totals_by_person([make_debt("Лешак", "Дима", 3, user_ids=(101, 102))],
                                       members=[MEMBER_LEHA, MEMBER_DIMA])
-        self.assertEqual(owes["Леша Козлов (@kozlovAlex)"]["BYN"], 3.0)
-        self.assertEqual(owed["Дмитрий Болт (@bdzmity)"]["BYN"], 3.0)
+        self.assertEqual(owes["Леша Иванов (@clever_hazel66)"]["BYN"], 3.0)
+        self.assertEqual(owed["Дмитрий Сидоров (@pearl_jolly92)"]["BYN"], 3.0)
 
 
 class MemberStorageTests(unittest.TestCase):
@@ -2122,32 +2122,32 @@ class MemberStorageTests(unittest.TestCase):
     def test_remember_member_upsert(self) -> None:
         self.session.responses = [FakeResponse([])]
         self.storage.remember_member(ChatMember(
-            chat_id=7, user_id=101, username="kozlovAlex",
-            display_name="Леша Козлов", aliases=["Леша", "Лёха"],
+            chat_id=7, user_id=101, username="clever_hazel66",
+            display_name="Леша Иванов", aliases=["Леша", "Лёха"],
         ))
         call = self.session.calls[0]
         self.assertTrue(call["url"].endswith("/rest/v1/chat_members"))
         self.assertEqual(call["params"]["on_conflict"], "chat_id,user_id")
         self.assertEqual(call["payload"]["user_id"], 101)
-        self.assertEqual(call["payload"]["display_name"], "Леша Козлов")
+        self.assertEqual(call["payload"]["display_name"], "Леша Иванов")
         self.assertEqual(call["payload"]["aliases"], ["Леша", "Лёха"])
         self.assertIn("merge-duplicates", call["headers"]["prefer"])
 
     def test_list_members_parsing(self) -> None:
         self.session.responses = [FakeResponse([{
-            "chat_id": 7, "user_id": 101, "username": "kozlovAlex",
-            "display_name": "Леша Козлов", "aliases": ["Леша"],
+            "chat_id": 7, "user_id": 101, "username": "clever_hazel66",
+            "display_name": "Леша Иванов", "aliases": ["Леша"],
         }])]
         members = self.storage.list_members(7)
         self.assertEqual(len(members), 1)
-        self.assertEqual(members[0].label, "Леша Козлов (@kozlovAlex)")
+        self.assertEqual(members[0].label, "Леша Иванов (@clever_hazel66)")
         self.assertEqual(self.session.calls[0]["params"]["chat_id"], "eq.7")
 
     def test_add_debt_with_user_ids(self) -> None:
         self.session.responses = [FakeResponse([{
             "id": 1, "chat_id": 7, "amount": 3.0, "from_user_id": 101, "to_user_id": 102,
         }])]
-        debt = self.storage.add_debt(7, "Леша Козлов", "Дмитрий Болт", "BYN", 3,
+        debt = self.storage.add_debt(7, "Леша Иванов", "Дмитрий Сидоров", "BYN", 3,
                                      from_user_id=101, to_user_id=102)
         payload = self.session.calls[0]["payload"]
         self.assertEqual((payload["from_user_id"], payload["to_user_id"]), (101, 102))
@@ -2178,8 +2178,8 @@ class AiRosterTests(unittest.TestCase):
                      members=[MEMBER_LEHA, MEMBER_DIMA], author=MEMBER_LEHA)
         system = session.calls[0]["payload"]["messages"][0]["content"]
         self.assertIn("id=101", system)
-        self.assertIn("@kozlovAlex", system)
-        self.assertIn("@bdzmity", system)
+        self.assertIn("@clever_hazel66", system)
+        self.assertIn("@pearl_jolly92", system)
         self.assertIn("Автор сообщения", system)
 
     def test_ids_from_model_are_parsed(self) -> None:
@@ -2213,8 +2213,8 @@ class AiRosterTests(unittest.TestCase):
                             members=storage.list_members(CHAT), author=MEMBER_DIMA)
         saved = storage.list_debts(CHAT)[0]
         self.assertEqual((saved.from_user_id, saved.to_user_id), (101, 102))
-        self.assertEqual(saved.from_name, "Леша Козлов")
-        self.assertIn("@kozlovAlex", reply)
+        self.assertEqual(saved.from_name, "Леша Иванов")
+        self.assertIn("@clever_hazel66", reply)
 
     def test_invented_id_falls_back_to_name(self) -> None:
         storage = InMemoryStorage(default_currency="BYN")
@@ -2284,7 +2284,7 @@ class RegistrationTests(unittest.TestCase):
     def test_who_lists_registered_and_not(self) -> None:
         reply = self.send("/who")
         self.assertIn("зарегистрированы: 2 из 3", reply)
-        self.assertIn("✅ Леша Козлов (@kozlovAlex)", reply)
+        self.assertIn("✅ Леша Иванов (@clever_hazel66)", reply)
         self.assertIn("⬜ Гоша Петров", reply)
 
     def test_only_registered_can_be_recorded(self) -> None:
@@ -2486,14 +2486,14 @@ class ExpenseFlowTests(unittest.TestCase):
         self.assertIn("Общие счета", report)
         self.assertIn("«Дима заплатил 10 за всех»", report)
         self.assertIn("(доля общего счёта)", report)
-        self.assertIn("Маша Петрова (@petrova_m) → Дмитрий Болт (@bdzmity): 2.00 BYN", report)
+        self.assertIn("Маша Петрова (@petrova_m) → Дмитрий Сидоров (@pearl_jolly92): 2.00 BYN", report)
 
     def test_expense_is_counted_in_netting(self) -> None:
         self.send("Дима заплатил 10 за всех")
         balances = net_balances(self.rows(), self.members)
         debtors = {balance.debtor for balance in balances
-                   if balance.creditor.startswith("Дмитрий Болт")}
-        self.assertEqual(debtors, {"Леша Козлов (@kozlovAlex)", "Маша Петрова (@petrova_m)",
+                   if balance.creditor.startswith("Дмитрий Сидоров")}
+        self.assertEqual(debtors, {"Леша Иванов (@clever_hazel66)", "Маша Петрова (@petrova_m)",
                                    "Оля Смирнова (@olga_s)", "Петя Кузнецов (@petya_k)"})
 
     def test_undo_removes_whole_expense(self) -> None:
@@ -2561,7 +2561,7 @@ class ExpenseStorageTests(unittest.TestCase):
     def test_register_member_marks_registration(self) -> None:
         self.session.responses = [FakeResponse([])]
         self.storage.register_member(ChatMember(
-            chat_id=7, user_id=101, username="kozlovAlex", display_name="Леша Козлов",
+            chat_id=7, user_id=101, username="clever_hazel66", display_name="Леша Иванов",
             aliases=["Леша", "Женя"], is_registered=True,
         ))
         payload = self.session.calls[0]["payload"]
@@ -2572,7 +2572,7 @@ class ExpenseStorageTests(unittest.TestCase):
         # Автообучение по автору сообщения не должно сбрасывать /reg и алиасы.
         self.session.responses = [FakeResponse([])]
         self.storage.remember_member(ChatMember(chat_id=7, user_id=101,
-                                                display_name="Леша Козлов"))
+                                                display_name="Леша Иванов"))
         payload = self.session.calls[0]["payload"]
         self.assertNotIn("is_registered", payload)
         self.assertNotIn("aliases", payload)
@@ -2594,7 +2594,7 @@ class ExpenseStorageTests(unittest.TestCase):
         memory = InMemoryStorage()
         memory.register_member(MEMBER_LEHA)
         memory.remember_member(ChatMember(chat_id=CHAT, user_id=101,
-                                          display_name="Леша Козлов"))
+                                          display_name="Леша Иванов"))
         stored = memory.list_members(CHAT)[0]
         self.assertTrue(stored.is_registered)
         self.assertEqual(stored.aliases, ["Леша", "Лёха"])
@@ -3010,7 +3010,7 @@ class PasswordTests(unittest.TestCase):
         self.settings = Settings(default_currency="BYN", chat_password="сезам")
 
     def send(self, text: str, chat: int = CHAT) -> str:
-        """Отправляет сообщение от имени Леши Козлова."""
+        """Отправляет сообщение от имени Леши Иванова."""
         return handle_text(text, chat, storage=self.storage, parser=self.parser,
                            settings=self.settings,
                            members=self.storage.list_members(chat), author=MEMBER_LEHA)
@@ -3095,7 +3095,7 @@ class LoginCommandTests(unittest.TestCase):
         self.settings = Settings(default_currency="BYN", chat_password="сезам")
 
     def send(self, text: str, settings: Settings | None = None) -> str:
-        """Отправляет сообщение от имени Леши Козлова."""
+        """Отправляет сообщение от имени Леши Иванова."""
         return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
                            settings=settings or self.settings,
                            members=self.storage.list_members(CHAT), author=MEMBER_LEHA)
@@ -3178,7 +3178,7 @@ class ConvertedReportTests(unittest.TestCase):
         ])
 
     def send(self, text: str) -> str:
-        """Отправляет сообщение от имени Леши Козлова."""
+        """Отправляет сообщение от имени Леши Иванова."""
         return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
                            settings=self.settings, members=self.members, author=MEMBER_LEHA)
 
@@ -3202,7 +3202,7 @@ class ConvertedReportTests(unittest.TestCase):
         self.storage.rates = [
             RatePoint(rate_date="2026-09-20", base="BYN", currency="USD", rate=Decimal("3.10")),
         ]
-        self.storage.add_debt(CHAT, "Леша Козлов", "Дмитрий Болт", "USD", 10,
+        self.storage.add_debt(CHAT, "Леша Иванов", "Дмитрий Сидоров", "USD", 10,
                               created_at="2026-09-22T10:00:00+00:00")
         report = self.send("/d")
         self.assertIn("20.09.2026", report)               # курса на 22-е нет — взяли 20-е
@@ -3210,7 +3210,7 @@ class ConvertedReportTests(unittest.TestCase):
         self.assertIn("31.00 BYN", report)
 
     def test_d_keeps_records_without_rates(self) -> None:
-        self.storage.add_debt(CHAT, "Леша Козлов", "Дмитрий Болт", "PLN", 40,
+        self.storage.add_debt(CHAT, "Леша Иванов", "Дмитрий Сидоров", "PLN", 40,
                               created_at="2026-09-21T10:00:00+00:00")
         report = self.send("/d")
         self.assertIn("Без курса оставил: 40.00 PLN", report)
@@ -3313,42 +3313,42 @@ class MinimalTransfersTests(unittest.TestCase):
     def test_chain_collapses_to_one_transfer(self) -> None:
         # Леша должен Диме 10, Дима должен Маше 10 → Леша переводит Маше 10
         transfers = minimal_transfers([
-            make_debt("Леша Козлов", "Дмитрий Болт", 10, user_ids=(101, 102)),
-            make_debt("Дмитрий Болт", "Маша Петрова", 10, user_ids=(102, 103)),
+            make_debt("Леша Иванов", "Дмитрий Сидоров", 10, user_ids=(101, 102)),
+            make_debt("Дмитрий Сидоров", "Маша Петрова", 10, user_ids=(102, 103)),
         ], [MEMBER_LEHA, MEMBER_DIMA, MEMBER_MASHA])
         self.assertEqual([item.pretty() for item in transfers],
-                         ["Леша Козлов (@kozlovAlex) → Маша Петрова (@petrova_m): 10.00 BYN"])
+                         ["Леша Иванов (@clever_hazel66) → Маша Петрова (@petrova_m): 10.00 BYN"])
 
     def test_pairwise_netting_still_applies(self) -> None:
         transfers = minimal_transfers([
-            make_debt("Леша Козлов", "Дмитрий Болт", 10, user_ids=(101, 102)),
-            make_debt("Дмитрий Болт", "Леша Козлов", 4, user_ids=(102, 101)),
+            make_debt("Леша Иванов", "Дмитрий Сидоров", 10, user_ids=(101, 102)),
+            make_debt("Дмитрий Сидоров", "Леша Иванов", 4, user_ids=(102, 101)),
         ], [MEMBER_LEHA, MEMBER_DIMA])
         self.assertEqual(len(transfers), 1)
         self.assertEqual(transfers[0].amount, 6.0)
 
     def test_repayments_reduce_transfers(self) -> None:
         transfers = minimal_transfers([
-            make_debt("Леша Козлов", "Дмитрий Болт", 10, user_ids=(101, 102)),
-            make_debt("Леша Козлов", "Дмитрий Болт", 3, kind="repayment", user_ids=(101, 102)),
+            make_debt("Леша Иванов", "Дмитрий Сидоров", 10, user_ids=(101, 102)),
+            make_debt("Леша Иванов", "Дмитрий Сидоров", 3, kind="repayment", user_ids=(101, 102)),
         ], [MEMBER_LEHA, MEMBER_DIMA])
         self.assertEqual([item.amount for item in transfers], [7.0])
 
     def test_transfers_are_fewer_than_debts(self) -> None:
         transfers = minimal_transfers([
-            make_debt("Леша Козлов", "Дмитрий Болт", 10, user_ids=(101, 102)),
-            make_debt("Маша Петрова", "Дмитрий Болт", 5, user_ids=(103, 102)),
-            make_debt("Дмитрий Болт", "Оля Смирнова", 15, user_ids=(102, 104)),
+            make_debt("Леша Иванов", "Дмитрий Сидоров", 10, user_ids=(101, 102)),
+            make_debt("Маша Петрова", "Дмитрий Сидоров", 5, user_ids=(103, 102)),
+            make_debt("Дмитрий Сидоров", "Оля Смирнова", 15, user_ids=(102, 104)),
         ], [MEMBER_LEHA, MEMBER_DIMA, MEMBER_MASHA, MEMBER_OLYA])
         self.assertEqual(len(transfers), 2)              # вместо трёх долгов — два перевода
         self.assertEqual({(item.debtor, item.amount) for item in transfers},
-                         {("Леша Козлов (@kozlovAlex)", 10.0), ("Маша Петрова (@petrova_m)", 5.0)})
+                         {("Леша Иванов (@clever_hazel66)", 10.0), ("Маша Петрова (@petrova_m)", 5.0)})
         self.assertTrue(all(item.creditor == "Оля Смирнова (@olga_s)" for item in transfers))
 
     def test_currencies_are_kept_apart(self) -> None:
         transfers = minimal_transfers([
-            make_debt("Леша Козлов", "Дмитрий Болт", 10, currency="BYN", user_ids=(101, 102)),
-            make_debt("Леша Козлов", "Дмитрий Болт", 5, currency="USD", user_ids=(101, 102)),
+            make_debt("Леша Иванов", "Дмитрий Сидоров", 10, currency="BYN", user_ids=(101, 102)),
+            make_debt("Леша Иванов", "Дмитрий Сидоров", 5, currency="USD", user_ids=(101, 102)),
         ], [MEMBER_LEHA, MEMBER_DIMA])
         self.assertEqual([(item.currency, item.amount) for item in transfers],
                          [("BYN", 10.0), ("USD", 5.0)])
@@ -3356,8 +3356,8 @@ class MinimalTransfersTests(unittest.TestCase):
     def test_nothing_to_offset(self) -> None:
         self.assertEqual(minimal_transfers([], []), [])
         self.assertEqual(minimal_transfers([
-            make_debt("Леша Козлов", "Дмитрий Болт", 5, user_ids=(101, 102)),
-            make_debt("Леша Козлов", "Дмитрий Болт", 5, kind="repayment", user_ids=(101, 102)),
+            make_debt("Леша Иванов", "Дмитрий Сидоров", 5, user_ids=(101, 102)),
+            make_debt("Леша Иванов", "Дмитрий Сидоров", 5, kind="repayment", user_ids=(101, 102)),
         ], [MEMBER_LEHA, MEMBER_DIMA]), [])
 
 
@@ -3402,7 +3402,7 @@ class SettleCommandTests(unittest.TestCase):
         ])
 
     def send(self, text: str) -> str:
-        """Отправляет сообщение от имени Леши Козлова."""
+        """Отправляет сообщение от имени Леши Иванова."""
         return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
                            settings=self.settings, members=self.members, author=MEMBER_LEHA)
 
@@ -3411,8 +3411,8 @@ class SettleCommandTests(unittest.TestCase):
         self.send("Дима должен Маше 10 рублей")
         reply = self.send("/settle")
         self.assertIn("Минимум переводов, чтобы всё закрылось", reply)
-        self.assertIn("Леша Козлов (@kozlovAlex) → Маша Петрова (@petrova_m): 10.00 BYN", reply)
-        self.assertNotIn("Дмитрий Болт", reply)          # долг «через Диму» больше не нужен
+        self.assertIn("Леша Иванов (@clever_hazel66) → Маша Петрова (@petrova_m): 10.00 BYN", reply)
+        self.assertNotIn("Дмитрий Сидоров", reply)          # долг «через Диму» больше не нужен
 
     def test_settle_converts_to_chat_currency(self) -> None:
         self.send("Маша заняла у Пети 10$")
@@ -3426,7 +3426,7 @@ class SettleCommandTests(unittest.TestCase):
     def test_settle_aliases(self) -> None:
         self.send("Леша должен Диме 3 рубля")
         for text in ("/offset", "/зачёт", "/зачет"):
-            self.assertIn("Леша Козлов (@kozlovAlex) → Дмитрий Болт (@bdzmity): 3.00 BYN",
+            self.assertIn("Леша Иванов (@clever_hazel66) → Дмитрий Сидоров (@pearl_jolly92): 3.00 BYN",
                           self.send(text))
 
     def test_report_shows_minimal_transfers_block(self) -> None:
@@ -3434,7 +3434,7 @@ class SettleCommandTests(unittest.TestCase):
         self.send("Дима должен Маше 10 рублей")
         report = self.send("/debts")
         self.assertIn("Минимум переводов, чтобы всё закрылось:", report)
-        self.assertIn("Леша Козлов (@kozlovAlex) → Маша Петрова (@petrova_m): 10.00 BYN", report)
+        self.assertIn("Леша Иванов (@clever_hazel66) → Маша Петрова (@petrova_m): 10.00 BYN", report)
 
     def test_block_is_hidden_when_same_as_pairwise(self) -> None:
         self.send("Леша должен Диме 3 рубля")
@@ -3452,14 +3452,14 @@ class DebtsDumpTests(unittest.TestCase):
     def test_dump_has_header_columns_and_row(self) -> None:
         debts = [
             Debt(id=1, chat_id=CHAT, created_at="2026-09-21T10:00:00+00:00",
-                 from_name="Леша Козлов", to_name="Дмитрий Болт", from_user_id=101,
+                 from_name="Леша Иванов", to_name="Дмитрий Сидоров", from_user_id=101,
                  to_user_id=102, currency="BYN", amount=3.0, kind="debt",
                  raw_text="Леша должен Диме 3 рубля"),
         ]
         rows = self.rows(format_debts_dump(debts))
         self.assertEqual(rows[0], list(DEBTS_DUMP_COLUMNS))     # первая строка — колонки
         self.assertEqual(rows[1][:5], ["1", "2026-09-21T10:00:00+00:00", str(CHAT),
-                                       "Леша Козлов", "Дмитрий Болт"])
+                                       "Леша Иванов", "Дмитрий Сидоров"])
         self.assertEqual(rows[1][5:9], ["101", "102", "BYN", "3.00"])
         self.assertEqual(rows[1][11], "Леша должен Диме 3 рубля")
 
@@ -3498,7 +3498,7 @@ class ExportCommandTests(unittest.TestCase):
         self.members = seed_chat(self.storage)     # без /reg записи не сохраняются
 
     def send(self, text: str) -> str | CsvReport:
-        """Отправляет сообщение боту (автор — Леша Козлов)."""
+        """Отправляет сообщение боту (автор — Леша Иванов)."""
         return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
                            settings=self.settings, members=self.members, author=MEMBER_LEHA)
 
@@ -3515,7 +3515,7 @@ class ExportCommandTests(unittest.TestCase):
         self.assertEqual(reply.content_type, CSV_DOCUMENT_TYPE)
         rows = self.rows(reply.text)
         self.assertEqual(rows[0], list(DEBTS_DUMP_COLUMNS))
-        self.assertEqual(rows[1][3:9], ["Леша Козлов", "Дмитрий Болт", "101", "102",
+        self.assertEqual(rows[1][3:9], ["Леша Иванов", "Дмитрий Сидоров", "101", "102",
                                        "BYN", "3.00"])
         self.assertEqual(rows[1][9], "debt")
         self.assertIn("Леша должен Диме 3 рубля", rows[1][11])
@@ -3587,7 +3587,7 @@ class ExportThroughBotTests(unittest.TestCase):
         header, *rows = content.splitlines()
         self.assertEqual(header, ",".join(DEBTS_DUMP_COLUMNS))   # первая строка — колонки
         self.assertEqual(len(rows), 1)                           # одна запись
-        self.assertIn("Леша Козлов", rows[0])
+        self.assertIn("Леша Иванов", rows[0])
         self.assertIn("Леша должен Диме 3 рубля", rows[0])
 
     def test_nothing_to_export_goes_as_message(self) -> None:
@@ -3702,16 +3702,16 @@ class MyDebtsCommandTests(unittest.TestCase):
         self.members = seed_chat(self.storage)
 
     def send(self, text: str, author: ChatMember | None = MEMBER_LEHA) -> str:
-        """Отправляет сообщение боту (по умолчанию пишет Леша Козлов) и отдаёт ответ."""
+        """Отправляет сообщение боту (по умолчанию пишет Леша Иванов) и отдаёт ответ."""
         return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
                            settings=self.settings, members=self.members, author=author)
 
     def test_shows_what_i_owe(self) -> None:
         self.send("Леша должен Диме 3 рубля")
         reply = self.send("/mydebts")
-        self.assertIn("👤 Мои долги — Леша Козлов (@kozlovAlex)", reply)
+        self.assertIn("👤 Мои долги — Леша Иванов (@clever_hazel66)", reply)
         self.assertIn("🔴 Вы должны:", reply)
-        self.assertIn("• Дмитрий Болт (@bdzmity): 3.00 BYN", reply)
+        self.assertIn("• Дмитрий Сидоров (@pearl_jolly92): 3.00 BYN", reply)
         self.assertIn("Всего должны: 3.00 BYN", reply)
         self.assertNotIn("Вам должны", reply)
 
@@ -3719,14 +3719,14 @@ class MyDebtsCommandTests(unittest.TestCase):
         self.send("Дима должен Леше 5 рублей")
         reply = self.send("/mydebts")
         self.assertIn("🟢 Вам должны:", reply)
-        self.assertIn("• Дмитрий Болт (@bdzmity): 5.00 BYN", reply)
+        self.assertIn("• Дмитрий Сидоров (@pearl_jolly92): 5.00 BYN", reply)
         self.assertIn("Всего должны вам: 5.00 BYN", reply)
         self.assertNotIn("🔴 Вы должны", reply)
 
     def test_repayment_reduces_what_i_owe(self) -> None:
         self.send("Леша должен Диме 3 рубля")
         self.send("Леша вернул Диме 1 рубль")
-        self.assertIn("• Дмитрий Болт (@bdzmity): 2.00 BYN", self.send("/mydebts"))
+        self.assertIn("• Дмитрий Сидоров (@pearl_jolly92): 2.00 BYN", self.send("/mydebts"))
 
     def test_full_repayment_is_clean(self) -> None:
         self.send("Леша должен Диме 3 рубля")
@@ -3741,7 +3741,7 @@ class MyDebtsCommandTests(unittest.TestCase):
 
     def test_my_share_of_expense(self) -> None:
         self.send("Дима заплатил 10 за всех")             # 10 делится на 5 зарегистрированных
-        self.assertIn("• Дмитрий Болт (@bdzmity): 2.00 BYN", self.send("/mydebts"))
+        self.assertIn("• Дмитрий Сидоров (@pearl_jolly92): 2.00 BYN", self.send("/mydebts"))
 
     def test_nothing_recorded(self) -> None:
         self.assertIn("📭 Записей нет", self.send("/mydebts"))
@@ -3779,7 +3779,7 @@ class StatusCommandTests(unittest.TestCase):
                         rates_open_url="https://open.er-api.com/v6", **kwargs)
 
     def send(self, text: str, settings: Settings | None = None) -> str:
-        """Отправляет сообщение боту (автор — Леша Козлов) и отдаёт ответ."""
+        """Отправляет сообщение боту (автор — Леша Иванов) и отдаёт ответ."""
         return handle_text(text, CHAT, storage=self.storage, parser=self.parser,
                            settings=settings or self.settings(), members=self.members,
                            author=MEMBER_LEHA)
@@ -4589,16 +4589,16 @@ class OpenReportTests(unittest.TestCase):
         self.assertEqual(person_transfers(transfers, ""), ([], []))
 
     def test_format_shows_both_directions(self) -> None:
-        label = "Леша Козлов (@kozlovAlex)"
+        label = "Леша Иванов (@clever_hazel66)"
         report = format_open_report(
             label,
-            [Balance(label, "Дмитрий Болт (@bdzmity)", "BYN", 3.0)],
+            [Balance(label, "Дмитрий Сидоров (@pearl_jolly92)", "BYN", 3.0)],
             [Balance("Маша Петрова (@petrova_m)", label, "USD", 10.0)],
             "BYN",
         )
-        self.assertIn("🧭 Долги лично вам — Леша Козлов (@kozlovAlex) (валюта: BYN)", report)
+        self.assertIn("🧭 Долги лично вам — Леша Иванов (@clever_hazel66) (валюта: BYN)", report)
         self.assertIn("🔴 Переведите:", report)
-        self.assertIn("• Дмитрий Болт (@bdzmity) — 3.00 BYN", report)
+        self.assertIn("• Дмитрий Сидоров (@pearl_jolly92) — 3.00 BYN", report)
         self.assertIn("Итого перевести: 3.00 BYN", report)
         self.assertIn("🟢 Вам переведут:", report)
         self.assertIn("Итого получить: 10.00 USD", report)
@@ -4615,7 +4615,7 @@ class OpenReportTests(unittest.TestCase):
         reply = self.ask()
         self.assertIsInstance(reply, ChatReply)          # ответ приходит с кнопками
         self.assertIn("🔴 Переведите:", reply)
-        self.assertIn("• Дмитрий Болт (@bdzmity) — 3.00 BYN", reply)
+        self.assertIn("• Дмитрий Сидоров (@pearl_jolly92) — 3.00 BYN", reply)
         self.assertIn("Итого перевести: 3.00 BYN", reply)
         self.assertNotIn("Маша", reply)
         self.assertNotIn("🟢 Вам переведут:", reply)     # зачитывать ему никто не должен
@@ -4626,7 +4626,7 @@ class OpenReportTests(unittest.TestCase):
         self.debt(MEMBER_DIMA, MEMBER_LEHA, 5.0)
         reply = self.ask()
         self.assertIn("🟢 Вам переведут:", reply)
-        self.assertIn("• Дмитрий Болт (@bdzmity) — 2.00 BYN", reply)
+        self.assertIn("• Дмитрий Сидоров (@pearl_jolly92) — 2.00 BYN", reply)
         self.assertNotIn("🔴 Переведите:", reply)
 
     def test_open_without_debts_and_without_author(self) -> None:
@@ -4650,16 +4650,16 @@ class OpenReportTests(unittest.TestCase):
         self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
         self.debt(MEMBER_MASHA, MEMBER_DIMA, 10.0)
         reply = self.ask(text="/open Дима")
-        self.assertIn("🧭 Долги — Дмитрий Болт (@bdzmity) (валюта: BYN)", reply)
+        self.assertIn("🧭 Долги — Дмитрий Сидоров (@pearl_jolly92) (валюта: BYN)", reply)
         self.assertIn("🟢 Ему переведут:", reply)
         self.assertIn("• Маша Петрова (@petrova_m) — 10.00 BYN", reply)
-        self.assertIn("• Леша Козлов (@kozlovAlex) — 3.00 BYN", reply)
+        self.assertIn("• Леша Иванов (@clever_hazel66) — 3.00 BYN", reply)
         self.assertIn("Итого получить: 13.00 BYN", reply)
 
     def test_open_by_username_and_unknown_person(self) -> None:
         """Человека можно назвать ником; незнакомое имя — подсказка, а не пустой отчёт."""
         self.debt(MEMBER_MASHA, MEMBER_DIMA, 10.0)
-        self.assertIn("Дмитрий Болт (@bdzmity)", self.ask(text="/open @bdzmity"))
+        self.assertIn("Дмитрий Сидоров (@pearl_jolly92)", self.ask(text="/open @pearl_jolly92"))
         self.assertIn("Не знаю такого человека", self.ask(text="/open Гоша"))
 
     def test_open_for_another_person_without_their_debts(self) -> None:
@@ -4668,7 +4668,7 @@ class OpenReportTests(unittest.TestCase):
         reply = self.ask(text="/open Маша")
         self.assertIn("🧭 Долги — Маша Петрова (@petrova_m)", reply)
         self.assertIn("🎉 Чисто", reply)
-        self.assertNotIn("Дмитрий Болт (@bdzmity) — ", reply)
+        self.assertNotIn("Дмитрий Сидоров (@pearl_jolly92) — ", reply)
 
 
 class CommandButtonsTests(unittest.TestCase):
@@ -4726,7 +4726,7 @@ class ChatButtonsTests(unittest.TestCase):
             "update_id": update_id,
             "callback_query": {
                 "id": "cb-1",
-                "from": {"id": user, "username": "kozlovAlex", "first_name": "Леша"},
+                "from": {"id": user, "username": "clever_hazel66", "first_name": "Леша"},
                 "message": {"message_id": 5, "chat": {"id": CHAT}},
                 "data": data,
             },
@@ -4765,24 +4765,24 @@ class ChatButtonsTests(unittest.TestCase):
     def test_pressing_settle_button_runs_settle(self) -> None:
         """Нажатие кнопки выполняется как команда — и снова с кнопками."""
         settings, storage, telegram = self.build()
-        storage.add_debt(CHAT, "Леша Козлов", "Дмитрий Болт", "BYN", 3.0,
+        storage.add_debt(CHAT, "Леша Иванов", "Дмитрий Сидоров", "BYN", 3.0,
                          from_user_id=101, to_user_id=102)
         telegram.updates = [self.callback_update("cmd:/settle")]
         self.run_bot(settings, storage, telegram)
         self.assertEqual(telegram.callbacks, [("cb-1", "")])          # «часики» погашены
         self.assertIn("Минимум переводов", telegram.sent[0][1])
-        self.assertIn("→ Дмитрий Болт (@bdzmity): 3.00 BYN", telegram.sent[0][1])
+        self.assertIn("→ Дмитрий Сидоров (@pearl_jolly92): 3.00 BYN", telegram.sent[0][1])
         self.assertEqual(telegram.markups[0], inline_commands())
 
     def test_pressing_open_button_shows_my_transfers(self) -> None:
         """Кнопка «Кому перевести» отвечает личным списком нажавшего."""
         settings, storage, telegram = self.build()
-        storage.add_debt(CHAT, "Маша Петрова", "Дмитрий Болт", "BYN", 10.0,
+        storage.add_debt(CHAT, "Маша Петрова", "Дмитрий Сидоров", "BYN", 10.0,
                          from_user_id=103, to_user_id=102)
         telegram.updates = [self.callback_update("cmd:/open")]
         self.run_bot(settings, storage, telegram)
         self.assertIn("Долги лично вам —", telegram.sent[0][1])
-        self.assertIn("(@kozlovAlex)", telegram.sent[0][1])   # подпись нажавшего
+        self.assertIn("(@clever_hazel66)", telegram.sent[0][1])   # подпись нажавшего
         self.assertIn("🎉 Чисто", telegram.sent[0][1])         # Маша должна Диме, не Леше
 
     def test_stale_button_asks_for_command(self) -> None:
@@ -4835,7 +4835,7 @@ class ChatButtonsTests(unittest.TestCase):
     def test_button_works_through_webhook(self) -> None:
         """Вебхук передаёт апдейт боту как есть — нажатие кнопки работает и там."""
         settings, storage, telegram = self.build()
-        storage.add_debt(CHAT, "Леша Козлов", "Дмитрий Болт", "BYN", 3.0,
+        storage.add_debt(CHAT, "Леша Иванов", "Дмитрий Сидоров", "BYN", 3.0,
                          from_user_id=101, to_user_id=102)
         bot = DebtBot(settings, storage, HeuristicParser(), telegram)
         self.assertTrue(bot.process_update(self.callback_update("cmd:/open")))
@@ -4971,7 +4971,7 @@ class RegistrationStateTests(unittest.TestCase):
         return bot, storage, telegram
 
     def message(self, update_id: int, text: str, *, user_id: int = 101,
-                username: str = "kozlovAlex", first: str = "Леша") -> dict:
+                username: str = "clever_hazel66", first: str = "Леша") -> dict:
         """Апдейт сообщения с полем `from` — как их присылает Telegram (личный чат)."""
         return {
             "update_id": update_id,
@@ -4989,7 +4989,7 @@ class RegistrationStateTests(unittest.TestCase):
             "update_id": update_id,
             "callback_query": {
                 "id": "cb-1",
-                "from": {"id": user_id, "username": "kozlovAlex", "first_name": "Леша"},
+                "from": {"id": user_id, "username": "clever_hazel66", "first_name": "Леша"},
                 "message": {"message_id": 5, "chat": {"id": CHAT, "type": "private"}},
                 "data": data,
             },
@@ -5061,10 +5061,10 @@ class WeeklyReportTests(unittest.TestCase):
         """Чат: свежая запись (попадает в текущую неделю) и старая (только в месячный отчёт)."""
         storage = InMemoryStorage(default_currency="BYN")
         storage.set_default_currency(CHAT, "BYN")
-        storage.add_debt(CHAT, "Леша Козлов", "Дмитрий Болт", "BYN", 3.0,
+        storage.add_debt(CHAT, "Леша Иванов", "Дмитрий Сидоров", "BYN", 3.0,
                          from_user_id=101, to_user_id=102,
                          created_at=f"{minsk_now().date().isoformat()}T10:00:00+00:00")
-        storage.add_debt(CHAT, "Маша Петрова", "Дмитрий Болт", "BYN", 10.0,
+        storage.add_debt(CHAT, "Маша Петрова", "Дмитрий Сидоров", "BYN", 10.0,
                          from_user_id=103, to_user_id=102,
                          created_at="2020-01-01T10:00:00+00:00")
         return storage
@@ -5091,7 +5091,7 @@ class WeeklyReportTests(unittest.TestCase):
     def test_week_letter_has_only_this_week(self) -> None:
         """В недельном письме — записи этой недели, чужие (старые) в него не попадают."""
         weekly = build_weekly_letter(self.storage(), week_period_key())
-        self.assertIn("Леша Козлов", weekly.body)
+        self.assertIn("Леша Иванов", weekly.body)
         self.assertNotIn("Маша", weekly.body)
         self.assertIn(f"debts_{CHAT}_{week_period_key()}.csv", weekly.files)
 
@@ -5186,10 +5186,10 @@ class ReportEndpointTests(unittest.TestCase):
         """Чат со свежей записью (текущая неделя) и со старой (в неделю не попадёт)."""
         storage = InMemoryStorage(default_currency="BYN")
         storage.set_default_currency(CHAT, "BYN")
-        storage.add_debt(CHAT, "Леша Козлов", "Дмитрий Болт", "BYN", 3.0,
+        storage.add_debt(CHAT, "Леша Иванов", "Дмитрий Сидоров", "BYN", 3.0,
                          from_user_id=101, to_user_id=102,
                          created_at=f"{minsk_now().date().isoformat()}T10:00:00+00:00")
-        storage.add_debt(CHAT, "Маша Петрова", "Дмитрий Болт", "BYN", 10.0,
+        storage.add_debt(CHAT, "Маша Петрова", "Дмитрий Сидоров", "BYN", 10.0,
                          from_user_id=103, to_user_id=102,
                          created_at="2020-01-01T10:00:00+00:00")
         return storage
@@ -5281,7 +5281,7 @@ class ReportEndpointTests(unittest.TestCase):
         self.assertEqual(status, "200 OK")
         self.assertEqual(payload["sent"], [])
         self.assertEqual(self.mailer.letters, [])
-        self.assertIn("Леша Козлов", payload["body"])
+        self.assertIn("Леша Иванов", payload["body"])
         self.assertNotIn("Маша", payload["body"])        # неделя: старые записи не попадают
 
     def test_month_kind_includes_all_history(self) -> None:
@@ -5358,7 +5358,7 @@ class RegistrationBugsTests(unittest.TestCase):
         return bot, storage, telegram
 
     def message(self, update_id: int, text: str, *, user_id: int = 101,
-                username: str = "kozlovAlex", first: str = "Леша",
+                username: str = "clever_hazel66", first: str = "Леша",
                 reply_from: dict | None = None, entities: list | None = None) -> dict:
         """Апдейт группы: можно добавить ответ (`from` того, кому отвечают) и упоминания."""
         message: dict[str, Any] = {
@@ -5385,21 +5385,21 @@ class RegistrationBugsTests(unittest.TestCase):
     def test_unknown_handle_explains_what_to_do(self) -> None:
         """@ник, чьих сообщений бот не видел: объясняем причину и два рабочих способа."""
         bot, _, telegram = self.build()
-        bot.process_update(self.message(1, "/reg @bdzmity Дима, Димон"))
+        bot.process_update(self.message(1, "/reg @pearl_jolly92 Дима, Димон"))
         reply = self.texts(telegram)[0]
-        self.assertIn("Не нашёл @bdzmity", reply)
+        self.assertIn("Не нашёл @pearl_jolly92", reply)
         self.assertIn("пусть он сам напишет", reply)
         self.assertIn("ответьте на любое его сообщение", reply)
 
     def test_reply_brings_the_person_and_registration_works(self) -> None:
         """Ответ на сообщение даёт боту id человека — /reg @ник после этого срабатывает."""
         bot, storage, telegram = self.build()
-        dima = {"id": 102, "username": "bdzmity", "first_name": "Дима"}
+        dima = {"id": 102, "username": "pearl_jolly92", "first_name": "Дима"}
         bot.process_update(self.message(1, "/reg Леша, Лёха"))
-        bot.process_update(self.message(2, "/reg @bdzmity Дима, Димон", reply_from=dima))
+        bot.process_update(self.message(2, "/reg @pearl_jolly92 Дима, Димон", reply_from=dima))
         reply = self.texts(telegram)[1]
         self.assertIn("Зарегистрировал", reply)
-        self.assertIn("@bdzmity", reply)
+        self.assertIn("@pearl_jolly92", reply)
         self.assertTrue(self.member(storage, 102).is_registered)
         # человек узнаётся в записях: долг ложится на его id, а не на строку текста
         bot.process_update(self.message(3, "@test_bot Дима должен Леше 3 рубля"))
@@ -5431,10 +5431,10 @@ class RegistrationBugsTests(unittest.TestCase):
         # Целая фраза сохраняется (её можно писать вместе) и отдельные слова — по ним бот
         # и узнаёт человека в сообщениях: «Лёхе» → «Лёха».
         self.assertEqual(self.member(storage, 101).aliases, ["Леша Лёха", "Леша", "Лёха"])
-        bot.process_update(self.message(2, "/reg Дима", user_id=102, username="bdzmity",
+        bot.process_update(self.message(2, "/reg Дима", user_id=102, username="pearl_jolly92",
                                         first="Дима"))
         bot.process_update(self.message(3, "@test_bot Дима должен Лёхе 3 рубля",
-                                        user_id=102, username="bdzmity", first="Дима"))
+                                        user_id=102, username="pearl_jolly92", first="Дима"))
         assert_saved_debt(self, self.texts(telegram)[2])
         record = storage.list_debts(CHAT)[0]
         self.assertEqual((record.from_user_id, record.to_user_id), (102, 101))
@@ -5550,8 +5550,8 @@ class PaidCommandTests(unittest.TestCase):
         self.assertEqual(sorted((item.debtor, item.creditor, item.amount)
                                 for item in net_balances(self.storage.list_debts(CHAT),
                                                          self.members)),
-                         sorted([("Леша Козлов (@kozlovAlex)", "Маша Петрова (@petrova_m)", 2.0),
-                                 ("Маша Петрова (@petrova_m)", "Дмитрий Болт (@bdzmity)", 7.0)]))
+                         sorted([("Леша Иванов (@clever_hazel66)", "Маша Петрова (@petrova_m)", 2.0),
+                                 ("Маша Петрова (@petrova_m)", "Дмитрий Сидоров (@pearl_jolly92)", 7.0)]))
 
     def test_phrase_variants_and_no_false_matches(self) -> None:
         """«рассчитался с Димой» и «закрыл долг Диме» понимаем; фразы с суммой — нет."""
@@ -5561,6 +5561,10 @@ class PaidCommandTests(unittest.TestCase):
         self.assertIsNone(heuristic_paid_all("Леша вернул Диме 3 рубля"))
         self.assertIsNone(heuristic_paid_all("сколько я должен"))
         self.assertIsNone(heuristic_paid_all("привет"))
+        # сумма в тексте — это обычный возврат с суммой, фразу «всё» не подставляем…
+        self.assertIsNone(heuristic_paid_all("я отдал всё Диме 5 рублей"))
+        # …а цифры внутри ника суммой не считаем: «@user1234» — это человек
+        self.assertEqual(heuristic_paid_all("я отдал всё @user1234"), "user1234")
         # фраза про неизвестного человека уходит обычным путём: «не понял», а не ошибка
         self.assertIn("Не понял", self.send("я отдал всё незнакомцу"))
 
@@ -5569,15 +5573,15 @@ class PaidCommandTests(unittest.TestCase):
         self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
         self.debt(MEMBER_LEHA, MEMBER_MASHA, 4.0)
         reply = self.send("я вернул все деньги Диме")
-        self.assertIn("Закрыл ваш долг: Дмитрий Болт (@bdzmity)", reply)
+        self.assertIn("Закрыл ваш долг: Дмитрий Сидоров (@pearl_jolly92)", reply)
         self.assertIn("3.00 BYN", reply)
         self.assertNotIn("4.00 BYN", reply)              # долг Маше не трогали
 
     def test_phrase_by_username(self) -> None:
-        """Ник тоже годится: «я отдал всё @bdzmity» закрывает долг этому человеку."""
+        """Ник тоже годится: «я отдал всё @pearl_jolly92» закрывает долг этому человеку."""
         self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
         self.debt(MEMBER_LEHA, MEMBER_MASHA, 4.0)       # его долг остаётся
-        reply = self.send("я отдал всё @bdzmity")
+        reply = self.send("я отдал всё @pearl_jolly92")
         self.assertIn("Закрыл ваш долг:", reply)
         self.assertIn("3.00 BYN", reply)
 

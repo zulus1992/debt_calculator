@@ -296,14 +296,14 @@ class ChatMember:
     chat_id: int
     user_id: int
     username: str = ""                 # без @
-    display_name: str = ""             # «Леша Козлов»
+    display_name: str = ""             # «Леша Иванов»
     aliases: list[str] = field(default_factory=list)   # «Леша», «Лёха» — подсказки для сопоставления
     last_seen: str | None = None
     is_registered: bool = False         # отметка /reg: записи ведутся только на зарегистрированных
 
     @property
     def label(self) -> str:
-        """Как показывать участника в ответах: «Леша Козлов (@kozlovAlex)»."""
+        """Как показывать участника в ответах: «Леша Иванов (@clever_hazel66)»."""
         name = self.display_name.strip()
         if self.username:
             return f"{name} (@{self.username})" if name else f"@{self.username}"

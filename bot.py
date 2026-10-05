@@ -583,7 +583,7 @@ def _person_for_argument(argument: str, members: Sequence[ChatMember],
 
 
 def _member_by_label(members: Sequence[ChatMember], label: str) -> ChatMember | None:
-    """Участник по подписи из зачёта («Леша Козлов (@kozlovAlex)») — чтобы взять его user id."""
+    """Участник по подписи из зачёта («Леша Иванов (@clever_hazel66)») — чтобы взять его user id."""
     return next((member for member in members if member.label == label), None)
 
 
@@ -900,8 +900,8 @@ def _parse_aliases(rest: str) -> list[str]:
     Разделяем по запятым и точкам с запятой, а внутри куска — ещё и по пробелам: иначе
     «/reg Леша Лёха» (без запятой) превращалось в один бесполезный псевдоним «Леша Лёха»,
     и бот потом не узнавал человека по имени — со стороны это выглядело как «регистрация
-    не сработала». Многословный кусок сохраняем целиком («Леша Козлов») и добавляем слова
-    по отдельности: «Леша» и «Козлов» — так узнаётся и имя, и фамилия.
+    не сработала». Многословный кусок сохраняем целиком («Леша Иванов») и добавляем слова
+    по отдельности: «Леша» и «Иванов» — так узнаётся и имя, и фамилия.
     """
     aliases: list[str] = []
     for chunk in REG_ALIAS_SPLIT_RE.split(str(rest or "")):
@@ -1737,7 +1737,7 @@ class DebtBot:
 
         self._telegram.send_typing(chat_id)
         # Из автора сообщения собирается состав чата: по нему ИИ понимает, что «Лешак» — это
-        # Леша Козлов, и запись привязывается к его user id.
+        # Леша Иванов, и запись привязывается к его user id.
         author = member_from_telegram(int(chat_id), message.get("from") or {})
         members = self._remember_author(author)
         # Дополнительно запоминаем тех, кого видно в сообщении: того, кому отвечают, и
@@ -2297,13 +2297,13 @@ def check_services(settings: Settings) -> bool:
 DEMO_MESSAGES = (
     "/who",                                  # кто в чате и кто зарегистрирован
     "/login",                                # «кнопка входа»: пароль не задан — вход не нужен
-    "Лешак должен Диме 3 рубля",             # «Лешак» — это Леша Козлов, «Диме» — Дмитрий Болт
+    "Лешак должен Диме 3 рубля",             # «Лешак» — это Леша Иванов, «Диме» — Дмитрий Сидоров
     "/reg Лёха, Лешак",                      # автор (Леша) добавляет себе имена
     "Маша заняла у Пети 10$",
     "покажи долги",
     "валюта по умолчанию доллар",
     "Петя должен Маше 5 долларов",
-    "я должен Диме 2 рубля",                 # «я» — это автор сообщения (Леша Козлов)
+    "я должен Диме 2 рубля",                 # «я» — это автор сообщения (Леша Иванов)
     "покажи долги",
     "Леша вернул Диме 1 рубль",              # возврат: уменьшает сальдо
     "Дима заплатил 10 за всех",              # общий счёт: 10.00 делится на зарегистрированных
@@ -2323,12 +2323,12 @@ DEMO_MESSAGES = (
     "привет",
 )
 
-# Участники демо-чата: так бот понимает, что «Лешак» и «Лёха» — это @kozlovAlex.
+# Участники демо-чата: так бот понимает, что «Лешак» и «Лёха» — это @clever_hazel66.
 # Гоша специально без отметки /reg — на нём видно, как бот просит регистрацию.
 DEMO_MEMBERS = (
-    ChatMember(chat_id=1, user_id=101, username="kozlovAlex", display_name="Леша Козлов",
+    ChatMember(chat_id=1, user_id=101, username="clever_hazel66", display_name="Леша Иванов",
                aliases=["Леша"], is_registered=True),
-    ChatMember(chat_id=1, user_id=102, username="bdzmity", display_name="Дмитрий Болт",
+    ChatMember(chat_id=1, user_id=102, username="pearl_jolly92", display_name="Дмитрий Сидоров",
                aliases=["Дима", "Димон"], is_registered=True),
     ChatMember(chat_id=1, user_id=103, username="petrova_m", display_name="Маша Петрова",
                aliases=["Маша"], is_registered=True),
@@ -2354,7 +2354,7 @@ def run_demo() -> int:
     for member in DEMO_MEMBERS:
         storage.remember_member(member)
     demo_rates(storage, today)
-    author = DEMO_MEMBERS[0]          # сообщения пишет Леша Козлов: «я» = он
+    author = DEMO_MEMBERS[0]          # сообщения пишет Леша Иванов: «я» = он
     print("Демонстрация работы бота (без Telegram, DeepSeek и Supabase)")
     print("=" * 64)
     print("Участники чата: " + ", ".join(member.label for member in DEMO_MEMBERS))
@@ -2366,8 +2366,8 @@ def run_demo() -> int:
     print("Новичок без отметки /reg: бот дописывает подсказку с нажимаемой командой /reg")
     newcomer = ChatMember(chat_id=2, user_id=105, username="gosha_p",
                           display_name="Гоша Петров")
-    dima = ChatMember(chat_id=2, user_id=102, username="bdzmity",
-                      display_name="Дмитрий Болт", aliases=["Дима"], is_registered=True)
+    dima = ChatMember(chat_id=2, user_id=102, username="pearl_jolly92",
+                      display_name="Дмитрий Сидоров", aliases=["Дима"], is_registered=True)
     fresh = InMemoryStorage(default_currency="BYN")
     fresh.remember_member(newcomer)
     fresh.remember_member(dima)

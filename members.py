@@ -3,7 +3,7 @@
 
 Telegram присылает автора каждого сообщения (id, имя, @username) — из этих данных
 постепенно собирается состав чата. По нему бот понимает, что «Лешак» из сообщения
-«Лешак должен Диме 3» — это Леша Козлов (@kozlovAlex), и записывает долг на его user id.
+«Лешак должен Диме 3» — это Леша Иванов (@clever_hazel66), и записывает долг на его user id.
 Учёт идёт по пользователям, поэтому «Леша», «Лёха» и «Лешак» в одном чате — один человек.
 """
 
@@ -110,7 +110,7 @@ def resolve_member(value: str | None, members: Sequence[ChatMember],
         keys = {name_key(alias) for alias in aliases}
         score = 0.0
         if member.username and normalize(member.username) == handle:
-            score = 3.0                                  # явное «@kozlovAlex»
+            score = 3.0                                  # явное «@clever_hazel66»
         elif text in aliases:
             score = 2.0                                  # точное совпадение
         elif key and key in keys:
@@ -169,7 +169,7 @@ def with_aliases(member: ChatMember, extra: Sequence[str],
 
 
 def label_for(user_id: int | None, name: str, members: Sequence[ChatMember]) -> str:
-    """Человекочитаемое имя: «Леша Козлов (@kozlovAlex)», если участник узнан."""
+    """Человекочитаемое имя: «Леша Иванов (@clever_hazel66)», если участник узнан."""
     member = member_by_id(user_id, members)
     if member is not None:
         return member.label
@@ -177,7 +177,7 @@ def label_for(user_id: int | None, name: str, members: Sequence[ChatMember]) -> 
 
 
 def short_label(member: ChatMember) -> str:
-    """Короткое обращение для ответа о записи: «@kozlovAlex», иначе только имя."""
+    """Короткое обращение для ответа о записи: «@clever_hazel66», иначе только имя."""
     if member.username:
         return f"@{member.username}"
     parts = member.display_name.split()

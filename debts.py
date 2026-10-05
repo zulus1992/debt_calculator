@@ -78,7 +78,7 @@ def identity_of(user_id: int | None, name: str) -> str:
     """Ключ человека: user id, если он известен, иначе имя в нормальном виде.
 
     Именно поэтому «Лешак» и «Леша» в одном чате — один и тот же человек: оба сообщения
-    ссылаются на одного участника (@kozlovAlex), и учёт идёт по этому ключу, а не по строке.
+    ссылаются на одного участника (@clever_hazel66), и учёт идёт по этому ключу, а не по строке.
     """
     if user_id:
         return f"id:{int(user_id)}"
@@ -87,7 +87,7 @@ def identity_of(user_id: int | None, name: str) -> str:
 
 
 def person_labels(debts: Sequence[Debt], members: Sequence[ChatMember] = ()) -> dict[str, str]:
-    """Ключ человека -> подпись: «Леша Козлов (@kozlovAlex)» или просто «Леша»."""
+    """Ключ человека -> подпись: «Леша Иванов (@clever_hazel66)» или просто «Леша»."""
     labels: dict[str, str] = {}
     for debt in debts:
         sides = ((debt.from_user_id, debt.from_name), (debt.to_user_id, debt.to_name))
@@ -244,7 +244,7 @@ def person_balances(
     валюте и который должен в другой, попадёт в оба блока — в отличие от /settle,
     где валюты всё равно сводятся к валюте чата.
 
-    Ключи результата — подписи людей («Дмитрий Болт (@bdzmity)»), значения — суммы
+    Ключи результата — подписи людей («Дмитрий Сидоров (@pearl_jolly92)»), значения — суммы
     по валютам. Человек определяется по user id, а без него — по имени (`identity_of`).
     """
     labels = person_labels(debts, members)
@@ -430,7 +430,7 @@ def format_members_report(members: Sequence[ChatMember]) -> str:
 
 
 def _row_line(debt: Debt, labels: Mapping[str, str]) -> str:
-    """Строка записи для отчёта: «Леша Козлов → Дмитрий Болт: 3.00 BYN»."""
+    """Строка записи для отчёта: «Леша Иванов → Дмитрий Сидоров: 3.00 BYN»."""
     left = _label(labels, identity_of(debt.from_user_id, debt.from_name))
     right = _label(labels, identity_of(debt.to_user_id, debt.to_name))
     if debt.is_repayment:
@@ -597,7 +597,7 @@ def format_transfers(transfers: Sequence[Balance], target: str = "") -> str:
 
 def person_label(debts: Sequence[Debt], members: Sequence[ChatMember] = (),
                  person: ChatMember | None = None) -> str:
-    """Подпись человека в отчётах: «Леша Козлов (@kozlovAlex)» — как в переводах и итогах.
+    """Подпись человека в отчётах: «Леша Иванов (@clever_hazel66)» — как в переводах и итогах.
 
     Нужна там, где переводы из minimal_transfers надо отнести к конкретному человеку:
     список переводов говорит подписями, и без этой функции непонятно, какие строки про кого.
