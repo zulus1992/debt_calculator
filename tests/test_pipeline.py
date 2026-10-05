@@ -5564,6 +5564,15 @@ class PaidCommandTests(unittest.TestCase):
         # фраза про неизвестного человека уходит обычным путём: «не понял», а не ошибка
         self.assertIn("Не понял", self.send("я отдал всё незнакомцу"))
 
+    def test_phrase_i_returned_everything(self) -> None:
+        """«я вернул все деньги Диме» — то же, что «отдал всё Диме»: закрыт только его долг."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 4.0)
+        reply = self.send("я вернул все деньги Диме")
+        self.assertIn("Закрыл ваш долг: Дмитрий Болт (@bdzmity)", reply)
+        self.assertIn("3.00 BYN", reply)
+        self.assertNotIn("4.00 BYN", reply)              # долг Маше не трогали
+
     def test_phrase_by_username(self) -> None:
         """Ник тоже годится: «я отдал всё @bdzmity» закрывает долг этому человеку."""
         self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
