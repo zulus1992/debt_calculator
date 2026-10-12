@@ -92,6 +92,7 @@ from deepseek import (
     check_api_key,
     detect_currency,
     heuristic_paid_all,
+    heuristic_paid_everything,
     heuristic_parse,
     looks_like_debt_text,
 )
@@ -1373,6 +1374,10 @@ def handle_text(
         recipient = resolve_member(paid_to, members, author) if paid_to else None
         if recipient is not None:
             return with_buttons(repay_all_report(chat_id, storage, members, author, recipient))
+        # «Я вернул все долги» — имени получателя нет: закрываем всё, что автор должен, каждому.
+        # Суммы по валютам берём из записей, поэтому это та же операция, что /paid без аргумента.
+        if heuristic_paid_everything(raw):
+            return with_buttons(paid_report(chat_id, storage, members, author))
 
     parsed = parsed if parsed is not None else parser.parse(
         raw, default_currency, members=members, author=author)

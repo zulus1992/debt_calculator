@@ -99,6 +99,7 @@ from deepseek import (
     ParsedMessage,
     detect_currency,
     heuristic_paid_all,
+    heuristic_paid_everything,
     heuristic_parse,
     looks_like_debt_text,
 )
@@ -5606,6 +5607,58 @@ class PaidCommandTests(unittest.TestCase):
         reply = self.send("я отдал всё @pearl_jolly92")
         self.assertIn("Закрыл ваш долг:", reply)
         self.assertIn("3.00 BYN", reply)
+
+    def test_phrase_i_returned_all_debts_to_everyone(self) -> None:
+        """«я вернул все долги» — всё, что автор должен каждому, точными суммами по валютам."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 4.0)
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 2.0, "USD")
+        self.debt(MEMBER_MASHA, MEMBER_DIMA, 7.0)      # чужой долг — не трогаем
+        reply = self.send("я вернул все долги")
+        self.assertIn("Закрыл все долги", reply)
+        self.assertIn("• Дмитрий Сидоров (@pearl_jolly92) — 3.00 BYN", reply)
+        self.assertIn("• Маша Петрова (@petrova_m) — 4.00 BYN", reply)
+        self.assertIn("• Дмитрий Сидоров (@pearl_jolly92) — 2.00 USD", reply)
+        self.assertIn("Итого: 7.00 BYN, 2.00 USD (возвратов записано: 3)", reply)
+        self.assertEqual(                                    # остался только долг Маши
+            [(item.debtor, item.creditor, item.amount)
+             for item in net_balances(self.storage.list_debts(CHAT), self.members)],
+            [("Маша Петрова (@petrova_m)", "Дмитрий Сидоров (@pearl_jolly92)", 7.0)])
+
+    def test_phrase_all_debts_is_one_operation(self) -> None:
+        """Все возвраты идут одной операцией: /undo убирает их сразу, а не по одному."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 4.0)
+        self.send("я вернул все долги")
+        self.assertEqual(len(self.storage.list_debts(CHAT)), 4)      # 2 долга + 2 возврата
+        undo = self.send("/undo")
+        self.assertIn("операцию возвратов", undo)
+        self.assertEqual(len(self.storage.list_debts(CHAT)), 2)      # вернулись как были
+
+    def test_phrase_all_debts_when_nothing_owed(self) -> None:
+        """Долгов нет — честно говорим об этом и ничего не записываем."""
+        self.debt(MEMBER_DIMA, MEMBER_MASHA, 4.0)
+        reply = self.send("я вернул все долги")
+        self.assertIn("нет долгов", reply)
+        self.assertEqual(len(self.storage.list_debts(CHAT)), 1)
+
+    def test_phrase_all_debts_variants(self) -> None:
+        """Формулировки «всем» и «про всех» понимаем; чужого человека и суммы — нет."""
+        for text in ("я вернул все долги", "вернул все долги всем", "рассчитался со всеми",
+                     "я отдал все деньги", "закрыл все долги", "я вернул все свои долги"):
+            self.assertTrue(heuristic_paid_everything(text), text)
+        for text in ("я вернул все деньги Леше", "я отдал всё Диме", "Маша вернула все долги",
+                     "Леша вернул Диме 3 рубля", "привет", "покажи долги", ""):
+            self.assertFalse(heuristic_paid_everything(text), text)
+
+    def test_phrase_about_another_person_is_not_closed(self) -> None:
+        """«Маша вернула все долги» — про Машу: автора это не касается, ничего не закрываем."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        reply = self.send("Маша вернула все долги")
+        self.assertNotIn("Закрыл все долги", reply)          # ничего не закрыли
+        self.assertNotIn("Закрыл ваш долг", reply)
+        self.assertEqual(len(self.storage.list_debts(CHAT)), 1)      # только исходный долг
+        self.assertEqual(self.storage.list_debts(CHAT)[0].amount, 3.0)
 
     def test_phrase_when_nothing_is_owed(self) -> None:
         self.debt(MEMBER_DIMA, MEMBER_LEHA, 5.0)
