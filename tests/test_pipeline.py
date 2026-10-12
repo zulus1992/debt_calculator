@@ -45,6 +45,7 @@ from bot import (
     inline_commands,
     is_allowed,
     is_command_for_bot,
+    is_full_record,
     LOGIN_COMMANDS,
     LOGIN_DONE_REPLY,
     LOGIN_FREE_REPLY,
@@ -57,6 +58,8 @@ from bot import (
     set_webhook_mode,
     show_webhook_info,
     STALE_BUTTON_REPLY,
+    starts_like_command_line,
+    starts_with_foreign_handle,
     status_report,
     updates_report,
     with_buttons,
@@ -91,11 +94,13 @@ from debts import (
 from gmail_api import Attachment, GmailSender, MailError, SentMessage, build_raw_message
 from deepseek import (
     SYSTEM_PROMPT,
+    DeepSeekError,
     DeepSeekParser,
     ParsedMessage,
     detect_currency,
     heuristic_paid_all,
     heuristic_parse,
+    looks_like_debt_text,
 )
 from members import (
     format_roster,
@@ -1466,9 +1471,18 @@ class MentionOnlyTests(unittest.TestCase):
         bot.process_update(make_chat_update(10, "а покажи /debts"))
         self.assertEqual(telegram.sent, [])
 
-    def test_group_message_without_mention_is_ignored(self) -> None:
+    def test_group_message_without_mention_is_parsed_from_chat(self) -> None:
+        """Слова про долги без обращения: бот разбирает сообщение сам и записывает его."""
         bot, storage, telegram = self.build()
         bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля"))
+        assert_saved_debt(self, telegram.sent[0][1])        # та же строка, что по обращению
+        saved = storage.list_debts(GROUP)[0]
+        self.assertEqual((saved.from_user_id, saved.to_user_id, saved.amount), (101, 102, 3.0))
+
+    def test_group_message_without_debt_words_is_ignored(self) -> None:
+        """Обычная болтовня не трогает ни ИИ, ни чат: бот молчит."""
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "привет, как дела?"))
         self.assertEqual(telegram.sent, [])                 # молчим, в чат не лезем
         self.assertEqual(storage.list_debts(GROUP), [])
 
@@ -1568,6 +1582,14 @@ class MentionHelperTests(unittest.TestCase):
         self.assertFalse(load_settings({"REQUIRE_MENTION": "no"}, use_env_file=False).require_mention)
         self.assertTrue(load_settings({"REQUIRE_MENTION": "да"}, use_env_file=False).require_mention)
         self.assertTrue(load_settings({"REQUIRE_MENTION": "мусор"}, use_env_file=False).require_mention)
+        # Режим наблюдения за сообщениями про долги: по умолчанию включён, гаснет «0/нет».
+        self.assertTrue(load_settings({}, use_env_file=False).watch_debt_messages)
+        self.assertFalse(
+            load_settings({"WATCH_DEBT_MESSAGES": "0"}, use_env_file=False).watch_debt_messages)
+        self.assertFalse(
+            load_settings({"WATCH_DEBT_MESSAGES": "no"}, use_env_file=False).watch_debt_messages)
+        self.assertTrue(
+            load_settings({"WATCH_DEBT_MESSAGES": "да"}, use_env_file=False).watch_debt_messages)
         self.assertEqual(load_settings({"BOT_USERNAME": "@my_bot"}, use_env_file=False).bot_username,
                          "my_bot")
 
@@ -5590,6 +5612,249 @@ class PaidCommandTests(unittest.TestCase):
         reply = self.send("я отдал всё Диме")
         self.assertIn("Долгов перед ним нет", reply)
         self.assertIn("должны вам", reply)
+
+class RecordingParser:
+    """Подменяет ИИ: запоминает тексты, ушедшие на разбор, и отдаёт заданный ответ."""
+
+    def __init__(self, parsed: ParsedMessage) -> None:
+        self.parsed = parsed
+        self.seen: list[str] = []
+
+    def parse(self, text: str, default_currency: str = "BYN", **_kwargs) -> ParsedMessage:
+        """Отмечает текст как отправленный в ИИ и возвращает подготовленный разбор."""
+        self.seen.append(text)
+        return self.parsed
+
+
+class FailingParser:
+    """Подменяет ИИ, который упал: разбор не удался — бот должен просто молчать."""
+
+    def parse(self, text: str, default_currency: str = "BYN", **_kwargs) -> ParsedMessage:
+        """Имитация сбоя DeepSeek (нет сети, кончился лимит)."""
+        raise DeepSeekError("DeepSeek недоступен")
+
+
+class WatchDebtMessagesTests(unittest.TestCase):
+    """Режим наблюдения: сообщение чата со словами про долги уходит в ИИ без обращения.
+
+    Полный разбор («кто кому сколько и в какой валюте») превращается в обычную запись с
+    той же строкой-подтверждением, что и по обращению к боту. Не разобралось — в чат не
+    уходит ничего: ни записи, ни отказа, ни подсказок.
+    """
+
+    BOT = "test_bot"          # столько возвращает FakeTelegram.get_me()
+
+    def build(self, parser: Any = None, *, members: Sequence[ChatMember] = REGISTERED,
+              register: bool = True, **settings_kwargs):
+        """Бот с подменённым Telegram: разбор — офлайн-эвристики или заданная заглушка."""
+        settings = Settings(default_currency="BYN", **settings_kwargs)
+        storage = InMemoryStorage(default_currency="BYN")
+        seed_chat(storage, chat=GROUP, members=members, register=register)
+        telegram = FakeTelegram([])
+        return DebtBot(settings, storage, parser or HeuristicParser(), telegram), storage, telegram
+
+
+    def test_watched_message_is_saved_without_mention(self) -> None:
+        """«Маша заняла у Пети 10$» без обращения: разобралось — записали."""
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "Маша заняла у Пети 10$"))
+        assert_saved_debt(self, telegram.sent[0][1])
+        saved = storage.list_debts(GROUP)[0]
+        self.assertEqual((saved.from_user_id, saved.to_user_id, saved.currency, saved.amount),
+                         (103, 105, "USD", 10.0))
+
+    def test_watched_repayment_is_saved(self) -> None:
+        """Возврат из чата без обращения тоже записывается — строкой со «↩️»."""
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "Дима вернул Леше 5 рублей"))
+        self.assertIn("↩️", telegram.sent[0][1])
+        saved = storage.list_debts(GROUP)[0]
+        self.assertEqual((saved.kind, saved.from_user_id, saved.to_user_id, saved.amount),
+                         ("repayment", 102, 101, 5.0))
+
+    def test_watched_message_calls_ai_only_once(self) -> None:
+        """Разбор один: готовый результат уходит в запись, а не в новый запрос к модели."""
+        parsed = ParsedMessage(intent="debt", from_name="Леша", to_name="Дима",
+                               amount=3.0, currency="BYN")
+        parser = RecordingParser(parsed)
+        bot, storage, telegram = self.build(parser)
+        bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля"))
+        self.assertEqual(parser.seen, ["Леша должен Диме 3 рубля"])
+        assert_saved_debt(self, telegram.sent[0][1])
+        self.assertEqual(len(storage.list_debts(GROUP)), 1)
+
+    def test_no_debt_words_means_no_ai_call(self) -> None:
+        """Без слов про долги в ИИ не ходим и в чат не пишем."""
+        parser = RecordingParser(ParsedMessage(intent="debt", from_name="Леша",
+                                               to_name="Дима", amount=3.0))
+        bot, storage, telegram = self.build(parser)
+        bot.process_update(make_chat_update(10, "привет, как дела?"))
+        self.assertEqual(parser.seen, [])                  # предварительный фильтр сработал
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(storage.list_debts(GROUP), [])
+
+    def test_unparsed_message_stays_silent(self) -> None:
+        """Слова про долги есть, но ИИ не разобрал — в чат не уходит ничего."""
+        parser = RecordingParser(ParsedMessage(intent="none", note="не понял"))
+        bot, storage, telegram = self.build(parser)
+        bot.process_update(make_chat_update(10, "я должен подумать об этом"))
+        self.assertEqual(parser.seen, ["я должен подумать об этом"])   # в ИИ сходили
+        self.assertEqual(telegram.sent, [])                # но в чат — ни слова
+        self.assertEqual(storage.list_debts(GROUP), [])
+
+    def test_incomplete_parse_stays_silent(self) -> None:
+        """Записываем только полный формат: без стороны, суммы или «сам себе» — молчим."""
+        variants = {
+            "нет получателя": ParsedMessage(intent="debt", from_name="Леша", amount=3.0),
+            "нет суммы": ParsedMessage(intent="debt", from_name="Леша", to_name="Дима"),
+            "нулевая сумма": ParsedMessage(intent="debt", from_name="Леша", to_name="Дима",
+                                           amount=0.0),
+            "отчёт, а не запись": ParsedMessage(intent="debts"),
+            "общий счёт": ParsedMessage(intent="expense", from_name="Леша", amount=10.0),
+            "сам себе": ParsedMessage(intent="debt", from_name="Леша", to_name="Леша",
+                                      amount=3.0),
+        }
+        for title, parsed in variants.items():
+            with self.subTest(title):
+                bot, storage, telegram = self.build(RecordingParser(parsed))
+                bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля"))
+                self.assertEqual(telegram.sent, [])
+                self.assertEqual(storage.list_debts(GROUP), [])
+
+    def test_unknown_or_unregistered_person_stays_silent(self) -> None:
+        """Сторона не из чата или без /reg — разбор неполный: в чат ничего не пишем."""
+        outsider = ParsedMessage(intent="debt", from_name="Тимофей", to_name="Дима",
+                                 amount=3.0)
+        bot, storage, telegram = self.build(RecordingParser(outsider))
+        bot.process_update(make_chat_update(10, "Тимофей должен Диме 3 рубля"))
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(storage.list_debts(GROUP), [])
+
+        # Гоша есть в чате, но без отметки /reg — записи на него бот не ведёт.
+        unregistered = ParsedMessage(intent="debt", from_name="Гоша Петров",
+                                     to_name="Дима", amount=3.0)
+        bot, storage, telegram = self.build(
+            RecordingParser(unregistered),
+            members=(MEMBER_LEHA, MEMBER_DIMA, MEMBER_GOSHA), register=False)
+        bot.process_update(make_chat_update(10, "Гоша должен Диме 3 рубля"))
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(storage.list_debts(GROUP), [])
+
+
+    def test_parser_failure_stays_silent(self) -> None:
+        """ИИ упал (нет сети, кончился лимит) — бот молчит и сам не падает."""
+        bot, storage, telegram = self.build(FailingParser())
+        bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля"))
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(storage.list_debts(GROUP), [])
+
+    def test_watch_can_be_disabled(self) -> None:
+        """WATCH_DEBT_MESSAGES=0 — прежнее поведение: без обращения в чате молчим."""
+        parser = RecordingParser(ParsedMessage(intent="debt", from_name="Леша",
+                                               to_name="Дима", amount=3.0))
+        bot, storage, telegram = self.build(parser, watch_debt_messages=False)
+        bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля"))
+        self.assertEqual(parser.seen, [])
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(storage.list_debts(GROUP), [])
+
+    def test_commands_and_foreign_mentions_are_not_watched(self) -> None:
+        """Чужие команды, пути и обращения к другим ботам не подслушиваем."""
+        parser = RecordingParser(ParsedMessage(intent="debt", from_name="Леша",
+                                               to_name="Дима", amount=3.0))
+        bot, storage, telegram = self.build(parser)
+        for text in ("/usr/bin/ls Леша должен Диме 3 рубля",
+                     f"@{self.BOT}_super Леша должен Диме 3 рубля",
+                     "@other_bot Леша должен Диме 3 рубля"):
+            bot.process_update(make_chat_update(10, text))
+        self.assertEqual(parser.seen, [])                  # в ИИ не ходили
+        self.assertEqual(telegram.sent, [])                # и в чат не писали
+
+    def test_password_locked_chat_is_not_watched(self) -> None:
+        """Пока пароль чата не введён, бот не подслушивает — молчит и не тратит ИИ."""
+        parser = RecordingParser(ParsedMessage(intent="debt", from_name="Леша",
+                                               to_name="Дима", amount=3.0))
+        bot, storage, telegram = self.build(parser, chat_password="s3cret")
+        bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля"))
+        self.assertEqual(parser.seen, [])
+        self.assertEqual(telegram.sent, [])
+
+    def test_denied_user_is_not_watched(self) -> None:
+        """Сообщения недопущенных пользователей не разбираем и не комментируем."""
+        parser = RecordingParser(ParsedMessage(intent="debt", from_name="Леша",
+                                               to_name="Дима", amount=3.0))
+        bot, storage, telegram = self.build(parser, allowed_user_ids=frozenset({101}))
+        bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля", user=100))
+        self.assertEqual(parser.seen, [])
+        self.assertEqual(telegram.sent, [])
+
+    def test_addressed_message_is_parsed_once_too(self) -> None:
+        """Обращение к боту обрабатывается как раньше: один запрос к ИИ, одна запись."""
+        parsed = ParsedMessage(intent="debt", from_name="Леша", to_name="Дима", amount=3.0)
+        parser = RecordingParser(parsed)
+        bot, storage, telegram = self.build(parser)
+        bot.process_update(make_chat_update(10, f"@{self.BOT} Леша должен Диме 3 рубля"))
+        self.assertEqual(parser.seen, ["Леша должен Диме 3 рубля"])
+        assert_saved_debt(self, telegram.sent[0][1])
+
+    def test_status_shows_watch_mode(self) -> None:
+        """/status говорит, следит ли бот за сообщениями про долги без обращения."""
+        bot, storage, telegram = self.build()
+        bot.process_update(make_chat_update(10, "/status"))
+        self.assertIn("без обращения: разбираю сам", telegram.sent[0][1])
+
+        bot, storage, telegram = self.build(watch_debt_messages=False)
+        bot.process_update(make_chat_update(10, "/status"))
+        self.assertIn("без обращения: не трогаю", telegram.sent[0][1])
+
+
+class WatchHelperTests(unittest.TestCase):
+    """Правила режима наблюдения: фильтр слов, границы команд и полнота разбора."""
+
+    def test_debt_words_are_recognized(self) -> None:
+        """Слова про долги (и английские) — повод показать сообщение ИИ."""
+        for text in ("Леша должен Диме 3 рубля", "я вернул все деньги Леше",
+                     "Маша отдала Пете 10$", "я занял у Пети 5", "скинулись на подарок",
+                     "погасил долг", "рассчитался с Димой", "I owe him 5 dollars",
+                     "paid back yesterday"):
+            self.assertTrue(looks_like_debt_text(text), text)
+
+    def test_plain_talk_is_not_a_debt(self) -> None:
+        """Болтовня в ИИ не уходит: «долго» и «верно» не считаем словами про долги."""
+        for text in ("привет, как дела?", "долго ждать, верно?", "сегодня хорошая погода",
+                     "спасибо!", ""):
+            self.assertFalse(looks_like_debt_text(text), text)
+
+    def test_command_lines_and_foreign_handles(self) -> None:
+        """Наблюдение не трогает команды, пути и обращения к другим ботам."""
+        self.assertTrue(starts_like_command_line(" /debts"))
+        self.assertTrue(starts_like_command_line("/usr/bin/ls Леша должен Диме 3"))
+        self.assertFalse(starts_like_command_line("Леша должен Диме 3"))
+        self.assertTrue(starts_with_foreign_handle("@other_bot Леша должен Диме 3", "test_bot"))
+        self.assertFalse(starts_with_foreign_handle("@test_bot Леша должен Диме 3", "test_bot"))
+        self.assertFalse(starts_with_foreign_handle("Леша должен Диме 3", "test_bot"))
+
+    def test_is_full_record(self) -> None:
+        """Полный формат — обе стороны из чата, разные люди и сумма: только тогда записываем."""
+        members = list(REGISTERED)
+        full = ParsedMessage(intent="debt", from_name="Леша", to_name="Дима", amount=3.0)
+        self.assertTrue(is_full_record(full, members, MEMBER_LEHA))
+        self.assertTrue(is_full_record(                       # «я» — это автор сообщения
+            ParsedMessage(intent="debt", from_name="я", to_name="Дима", amount=3.0),
+            members, MEMBER_LEHA))
+        self.assertFalse(is_full_record(ParsedMessage(intent="debts"), members, MEMBER_LEHA))
+        self.assertFalse(is_full_record(
+            ParsedMessage(intent="debt", from_name="Леша", to_name="Дима"),
+            members, MEMBER_LEHA))
+        self.assertFalse(is_full_record(                      # человека нет в чате
+            ParsedMessage(intent="debt", from_name="Гоша", to_name="Дима", amount=3.0),
+            members, MEMBER_LEHA))
+        self.assertFalse(is_full_record(                      # есть, но без отметки /reg
+            ParsedMessage(intent="debt", from_name="Леша", to_name="Гоша", amount=3.0),
+            [MEMBER_LEHA, MEMBER_GOSHA], MEMBER_LEHA))
+        self.assertFalse(is_full_record(                      # один и тот же человек
+            ParsedMessage(intent="debt", from_name="Леша", to_name="Лёха", amount=3.0),
+            members, MEMBER_LEHA))
 
 
 if __name__ == "__main__":

@@ -127,6 +127,11 @@ class Settings:
     # Пусто — берётся webhook_secret: на хостинге он уже задан, второй секрет не обязателен.
     cron_secret: str = ""
     require_mention: bool = True
+    # Следить за сообщениями чата без обращения: если в тексте есть слова про долги
+    # («должен», «отдал», «вернул»…), сообщение уходит в ИИ. Разобралось в формат
+    # «кто кому сколько и в какой валюте» — записываем как обычную запись, не
+    # разобралось — бот молчит. WATCH_DEBT_MESSAGES=0 выключает этот режим.
+    watch_debt_messages: bool = True
     bot_username: str = ""
     # Ежемесячный отчёт на почту (Gmail API): кому отправлять и доступы OAuth-приложения.
     report_email: str = ""
@@ -503,6 +508,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         webhook_secret=get("WEBHOOK_SECRET"),
         cron_secret=get("CRON_SECRET"),
         require_mention=_parse_bool(get("REQUIRE_MENTION"), True),
+        watch_debt_messages=_parse_bool(get("WATCH_DEBT_MESSAGES"), True),
         bot_username=get("BOT_USERNAME").lstrip("@"),
         report_email=get("REPORT_EMAIL"),
         gmail_client_id=get("GMAIL_CLIENT_ID"),

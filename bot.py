@@ -93,6 +93,7 @@ from deepseek import (
     detect_currency,
     heuristic_paid_all,
     heuristic_parse,
+    looks_like_debt_text,
 )
 from members import (
     member_from_telegram,
@@ -811,6 +812,9 @@ def status_report(chat_id: int, storage: Storage, settings: Settings,
     lines.append(f"• валюта записей: {chat_currency.upper()}")
     lines.append("• в группах: отвечаю только на обращение" if settings.require_mention
                  else "• в группах: отвечаю на любое сообщение")
+    lines.append("• сообщения про долги без обращения: разбираю сам и записываю"
+                 if settings.watch_debt_messages
+                 else "• сообщения про долги без обращения: не трогаю")
     lines.append("• пароль чата: задан — этот чат его подтвердил" if settings.password_required
                  else "• пароль чата: не задан")
     lines.append("")
@@ -1263,6 +1267,7 @@ def handle_text(
     members: Sequence[ChatMember] | None = None,
     author: ChatMember | None = None,
     replied: ChatMember | None = None,
+    parsed: ParsedMessage | None = None,
 ) -> str | CsvReport:
     """Обрабатывает одно сообщение и формирует ответ бота.
 
@@ -1270,6 +1275,8 @@ def handle_text(
     `members` и `author` — состав чата и автор сообщения: по ним ИИ (и локальный
     резолвер) понимают, кто такой «Лешак» из текста, и запись привязывается к user id.
     `replied` — тот, кому адресован ответ: «/reg Имя» в ответе регистрирует его.
+    `parsed` — готовый разбор от ИИ: его передаёт режим наблюдения за чатом
+    (сообщение без обращения), чтобы не платить за второй запрос к модели.
 
     Обычный ответ — строка; команда выгрузки (/export) отвечает объектом CsvReport:
     Telegram не умеет отправлять файл сообщением, поэтому решение «файл или текст»
@@ -1367,7 +1374,8 @@ def handle_text(
         if recipient is not None:
             return with_buttons(repay_all_report(chat_id, storage, members, author, recipient))
 
-    parsed = parser.parse(raw, default_currency, members=members, author=author)
+    parsed = parsed if parsed is not None else parser.parse(
+        raw, default_currency, members=members, author=author)
     explicit_currency = detect_currency(raw)
 
     if parsed.intent in ("debt", "repayment"):
@@ -1484,6 +1492,48 @@ def addressing(message: Mapping[str, Any], bot_username: str,
     if mentions_bot(message, handle):
         return True, cleaned
     return is_command_for_bot(cleaned, handle), cleaned
+
+
+def starts_like_command_line(text: str) -> bool:
+    """Начинается ли сообщение со «/» (команда или путь).
+
+    В режиме наблюдения такие тексты не трогаем: своя команда придёт боту и так, а
+    «/usr/bin/ls …» — не про долги, хотя внутри и может встретиться фраза про них.
+    """
+    return bool(re.match(r"\s*/", str(text or "")))
+
+
+def starts_with_foreign_handle(text: str, bot_username: str) -> bool:
+    """Начинается ли сообщение с @ника, который не наш.
+
+    «@другой_бот Леша должен Диме 3» — обращение к другому боту: подслушивать и
+    записывать такое не нужно. Своё «@наш_бот» сюда не попадает, его обрабатывает
+    обычный путь (addressing).
+    """
+    match = re.match(r"\s*@([A-Za-z0-9_]+)", str(text or ""))
+    if not match:
+        return False
+    handle = str(bot_username or "").lstrip("@").lower()
+    return match.group(1).lower() != handle
+
+
+def is_full_record(parsed: ParsedMessage, members: Sequence[ChatMember],
+                   author: ChatMember | None) -> bool:
+    """Полный ли разбор: «кто кому сколько и в какой валюте» — и обе стороны из чата.
+
+    Только такой разбор режим наблюдения записывает: нужны обе стороны, обе
+    зарегистрированы, и это разные люди. Всё остальное считается обычной болтовнёй —
+    тогда бот в чат не пишет вообще.
+    """
+    if not (parsed.is_debt or parsed.is_repayment):
+        return False
+    member_from = resolve_side(parsed.from_name, parsed.from_user_id, members, author)
+    member_to = resolve_side(parsed.to_name, parsed.to_user_id, members, author)
+    if member_from is None or member_to is None:
+        return False
+    if not (member_from.is_registered and member_to.is_registered):
+        return False
+    return member_from.user_id != member_to.user_id
 
 
 def configure_logging(level: str = "INFO") -> None:
@@ -1724,18 +1774,25 @@ class DebtBot:
             return
 
         # В группе отвечаем только на обращение («@бот …», «/команда@бот», ответ на наше
-        # сообщение), иначе — молчим, чтобы не комментировать весь чат.
+        # сообщение). Исключение — режим наблюдения: сообщение без обращения, но со словами
+        # про долги («должен», «отдал», «вернул»), сначала уходит в ИИ. Если он привёл текст
+        # к виду «кто кому сколько и в какой валюте» — обрабатываем как обычную запись,
+        # если нет — молчим и в чат ничего не пишем.
         should_handle, text = addressing(message, self.bot_username, self._settings)
+        watched = False
         if not should_handle:
-            logger.info("Сообщение %s не адресовано боту — пропускаю.", message.get("message_id"))
-            return
+            if not self._watch_candidate(text, int(chat_id), user_id):
+                logger.info("Сообщение %s не адресовано боту — пропускаю.",
+                            message.get("message_id"))
+                return
+            watched = True
 
         if not is_allowed(user_id, self._settings):
             logger.warning("Сообщение от недопущенного пользователя id=%s", user_id)
-            self._send(chat_id, DENIED_REPLY, message)
+            if not watched:                       # на «подслушанное» не отвечаем даже отказом
+                self._send(chat_id, DENIED_REPLY, message)
             return
 
-        self._telegram.send_typing(chat_id)
         # Из автора сообщения собирается состав чата: по нему ИИ понимает, что «Лешак» — это
         # Леша Иванов, и запись привязывается к его user id.
         author = member_from_telegram(int(chat_id), message.get("from") or {})
@@ -1749,11 +1806,20 @@ class DebtBot:
         for seen in _mentioned_members(int(chat_id), message):
             members = self._remember_author(seen) or members
         replied = author_from_members(replied_user, members) if replied_user else None
+
+        prepared: ParsedMessage | None = None
+        if watched:
+            prepared = self._parse_watched(text, int(chat_id), members, author)
+            if prepared is None:
+                logger.info("Сообщение %s похоже на долг, но разбор не удался — молчу.",
+                            message.get("message_id"))
+                return
+        self._telegram.send_typing(chat_id)
         try:
             reply = handle_text(
                 text, int(chat_id),
                 storage=self._storage, parser=self._parser, settings=self._settings,
-                members=members, author=author, replied=replied,
+                members=members, author=author, replied=replied, parsed=prepared,
             )
         except StorageError as exc:
             logger.error("Хранилище: %s", exc)
@@ -1762,6 +1828,47 @@ class DebtBot:
             logger.exception("Ошибка обработки сообщения: %s", exc)
             reply = "⚠️ Внутренняя ошибка, попробуйте ещё раз."
         self._send_reply(chat_id, reply, message)
+
+    def _watch_candidate(self, text: str, chat_id: int, user_id: Any) -> bool:
+        """Стоит ли отдать неадресованное сообщение в ИИ (режим наблюдения).
+
+        Проверяем только дешёвое и без сети: включён ли режим, есть ли в тексте слова про
+        долги, не обращение ли это к другому боту, не команда ли это, не выключено ли
+        действие бота в этом чате (пароль, список допущенных). Иначе — сообщение обычное,
+        и в чат писать нечего.
+        """
+        if not self._settings.watch_debt_messages:
+            return False
+        if not looks_like_debt_text(text):
+            return False
+        if starts_like_command_line(text) or starts_with_foreign_handle(text, self.bot_username):
+            return False
+        if not is_allowed(user_id, self._settings):
+            return False
+        if self._settings.password_required and not _chat_authorized(self._storage, chat_id):
+            return False
+        return True
+
+    def _parse_watched(self, text: str, chat_id: int, members: Sequence[ChatMember],
+                       author: ChatMember | None) -> ParsedMessage | None:
+        """Разбор «подслушанного» сообщения: полный результат или None (тогда молчим).
+
+        Строгость тут важнее вежливости: записываем только когда ИИ привёл сообщение к
+        формату «кто кому сколько и в какой валюте» и обе стороны — зарегистрированные
+        участники чата. Ошибка ИИ или пустой ответ — тоже None: бот просто не отвечает.
+        """
+        try:
+            default_currency = self._storage.get_default_currency(
+                chat_id, self._settings.default_currency)
+            parsed = self._parser.parse(text, default_currency, members=members, author=author)
+        except Exception as exc:  # noqa: BLE001 — разбор не удался, это не повод падать
+            logger.warning("Разбор сообщения из чата не удался: %s", exc)
+            return None
+        if not is_full_record(parsed, members, author):
+            return None
+        logger.info("Сообщение %s разобрано из чата: %s %s",
+                    text[:40], parsed.intent, parsed.amount)
+        return parsed
 
     def _handle_membership(self, membership: Mapping[str, Any]) -> None:
         """Реакция на добавление и удаление бота: просит пароль, сбрасывает доступ.
