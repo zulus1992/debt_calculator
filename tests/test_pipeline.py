@@ -1413,13 +1413,16 @@ GROUP = -100500
 
 def make_chat_update(update_id: int, text: str, *, chat: int = GROUP,
                      chat_type: str = "supergroup", user: int = 100,
-                     username: str = "vasya",
+                     username: str = "vasya", first_name: str = "",
                      reply_from_username: str | None = None) -> dict:
     """Апдейт с типом чата и (опционально) ответом — для проверки правил обращения к боту."""
+    user_info: dict[str, Any] = {"id": user, "username": username}
+    if first_name:
+        user_info["first_name"] = first_name
     message: dict[str, Any] = {
         "message_id": update_id,
         "chat": {"id": chat, "type": chat_type},
-        "from": {"id": user, "username": username},
+        "from": user_info,
         "text": text,
     }
     if reply_from_username is not None:
@@ -5704,8 +5707,91 @@ class WatchDebtMessagesTests(unittest.TestCase):
         storage = InMemoryStorage(default_currency="BYN")
         seed_chat(storage, chat=GROUP, members=members, register=register)
         telegram = FakeTelegram([])
-        return DebtBot(settings, storage, parser or HeuristicParser(), telegram), storage, telegram
+        self.bot = DebtBot(settings, storage, parser or HeuristicParser(), telegram)
+        self.storage, self.telegram = storage, telegram
+        return self.bot, self.storage, self.telegram
 
+
+    def debt(self, debtor: ChatMember, creditor: ChatMember, amount: float,
+             currency: str = "BYN") -> None:
+        """Записывает долг между участниками чата (как это делает бот)."""
+        self.storage.add_debt(GROUP, debtor.display_name, creditor.display_name, currency,
+                              amount, from_user_id=debtor.user_id,
+                              to_user_id=creditor.user_id)
+
+    def watch(self, text: str, *, user: int = 101, username: str = "clever_hazel66",
+              first_name: str = "Леша") -> None:
+        """Отправляет в группу сообщение от Леши — без обращения к боту."""
+        self.bot.process_update(make_chat_update(10, text, user=user, username=username,
+                                                 first_name=first_name))
+
+    def leftovers(self) -> list[tuple[str, str, float]]:
+        """Что осталось в записях чата после взаимозачёта — (кто, кому, сумма)."""
+        return sorted((item.debtor, item.creditor, item.amount)
+                      for item in net_balances(self.storage.list_debts(GROUP),
+                                               self.storage.list_members(GROUP)))
+
+    def test_watched_paid_all_to_person(self) -> None:
+        """«я вернул все деньги Диме» без обращения: закрываем долг сами, без запроса к ИИ."""
+        parser = RecordingParser(ParsedMessage(intent="none"))
+        bot, storage, telegram = self.build(parser)
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 4.0)
+        self.watch("я вернул все деньги Диме")
+        self.assertEqual(parser.seen, [])                  # суммы берём из записей, не из ИИ
+        reply = telegram.sent[0][1]
+        self.assertIn("Закрыл ваш долг", reply)
+        self.assertIn("3.00 BYN", reply)
+        self.assertEqual(self.leftovers(),                 # долг Маше остался
+                         [("Леша (@clever_hazel66)", "Маша Петрова (@petrova_m)", 4.0)])
+
+    def test_watched_all_debts_to_everyone(self) -> None:
+        """«я вернул все долги» в группе без обращения: закрываем всё, что должен автор."""
+        bot, storage, telegram = self.build()
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 4.0)
+        self.debt(MEMBER_MASHA, MEMBER_DIMA, 7.0)          # чужой долг не трогаем
+        self.watch("я вернул все долги")
+        reply = telegram.sent[0][1]
+        self.assertIn("Закрыл все долги", reply)
+        self.assertIn("3.00 BYN", reply)
+        self.assertIn("4.00 BYN", reply)
+        self.assertIn("возвратов записано: 2", reply)
+        self.assertEqual(self.leftovers(),
+                         [("Маша Петрова (@petrova_m)", "Дмитрий Сидоров (@pearl_jolly92)", 7.0)])
+
+    def test_watched_paid_all_when_nothing_owed_is_silent(self) -> None:
+        """Автор ничего не должен — в чат не пишем, хотя слова про долги и есть."""
+        bot, storage, telegram = self.build()
+        self.debt(MEMBER_MASHA, MEMBER_DIMA, 7.0)
+        self.watch("я вернул все долги")
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(len(storage.list_debts(GROUP)), 1)
+
+    def test_watched_paid_all_to_person_without_debt_is_silent(self) -> None:
+        """Должен Маше, а написал про Диму — закрывать нечего, молчим."""
+        bot, storage, telegram = self.build()
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 4.0)
+        self.watch("я вернул все деньги Диме")
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(len(storage.list_debts(GROUP)), 1)
+
+    def test_watched_paid_all_unknown_person_is_silent(self) -> None:
+        """Человека из фразы нет в чате — ничего не закрываем и не отвечаем."""
+        bot, storage, telegram = self.build()
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+        self.watch("я вернул все деньги Тимофею")
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(len(storage.list_debts(GROUP)), 1)
+
+    def test_watched_paid_all_without_registration_is_silent(self) -> None:
+        """Автор без /reg — записи на него не ведутся, закрывать нечего: молчим."""
+        bot, storage, telegram = self.build(
+            members=(MEMBER_GOSHA, MEMBER_DIMA), register=False)
+        self.debt(MEMBER_GOSHA, MEMBER_DIMA, 3.0)
+        self.watch("я вернул все долги", user=106, username="gosha_p", first_name="Гоша")
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(len(storage.list_debts(GROUP)), 1)
 
     def test_watched_message_is_saved_without_mention(self) -> None:
         """«Маша заняла у Пети 10$» без обращения: разобралось — записали."""

@@ -1813,15 +1813,21 @@ class DebtBot:
         replied = author_from_members(replied_user, members) if replied_user else None
 
         prepared: ParsedMessage | None = None
+        phrase_reply: str | ChatReply | None = None
         if watched:
-            prepared = self._parse_watched(text, int(chat_id), members, author)
-            if prepared is None:
-                logger.info("Сообщение %s похоже на долг, но разбор не удался — молчу.",
-                            message.get("message_id"))
-                return
+            # Сначала фразы «вернул всё Леше» и «вернул все долги»: в них не названа сумма,
+            # поэтому ИИ не приведёт их к формату «кто кому сколько», — а суммы уже лежат
+            # в записях, и закрыть долги можно тем же кодом, что и по обращению.
+            phrase_reply = self._watch_paid_all(text, int(chat_id), members, author)
+            if phrase_reply is None:
+                prepared = self._parse_watched(text, int(chat_id), members, author)
+                if prepared is None:
+                    logger.info("Сообщение %s похоже на долг, но разбор не удался — молчу.",
+                                message.get("message_id"))
+                    return
         self._telegram.send_typing(chat_id)
         try:
-            reply = handle_text(
+            reply = phrase_reply if phrase_reply is not None else handle_text(
                 text, int(chat_id),
                 storage=self._storage, parser=self._parser, settings=self._settings,
                 members=members, author=author, replied=replied, parsed=prepared,
@@ -1853,6 +1859,48 @@ class DebtBot:
         if self._settings.password_required and not _chat_authorized(self._storage, chat_id):
             return False
         return True
+
+    def _watch_paid_all(self, text: str, chat_id: int, members: Sequence[ChatMember],
+                        author: ChatMember | None) -> str | ChatReply | None:
+        """«Вернул всё Леше» и «вернул все долги» без обращения — закрываем долги сами.
+
+        В таких фразах не названа сумма, поэтому ИИ не приведёт их к формату «кто кому
+        сколько и в какой валюте». Но суммы уже лежат в записях, и закрыть долги можно тем же
+        кодом, что и по обращению: `repay_all_report` — одному человеку, `paid_report` — всем.
+
+        В чат пишем только когда есть что закрывать: если долгов нет (или человеку из фразы
+        автор ничего не должен), сообщение остаётся болтовнёй и бот молчит. Записи ведутся
+        только на отмеченных через `/reg` — незарегистрированный автор тоже молчит.
+        """
+        # Автор из апдейта Telegram про /reg ничего не знает: берём его версию из состава
+        # чата — иначе отчёты откажутся писать «на незарегистрированного» (так же, как это
+        # делает handle_text для сообщений с обращением).
+        author = author_from_members(author, members)
+        if author is None or not author.is_registered:
+            return None
+        try:
+            debts = self._storage.list_debts(chat_id)
+        except StorageError as exc:
+            logger.warning("Не удалось прочитать записи чата %s: %s", chat_id, exc)
+            return None
+        outgoing, _ = person_transfers(net_balances(debts, members),
+                                       person_label(debts, members, author))
+        if not outgoing:
+            return None                      # закрывать нечего — в чат не пишем
+        paid_to = heuristic_paid_all(text)
+        recipient = resolve_member(paid_to, members, author) if paid_to else None
+        if recipient is not None and recipient.is_registered \
+                and recipient.user_id != author.user_id:
+            target = person_label(debts, members, recipient)
+            if not any(item.creditor == target for item in outgoing):
+                return None                  # перед этим человеком долгов нет — молчим
+            logger.info("Фраза из чата %s закрывает долг автора перед %s", text[:40], target)
+            return with_buttons(repay_all_report(
+                chat_id, self._storage, members, author, recipient))
+        if heuristic_paid_everything(text):
+            logger.info("Фраза из чата %s закрывает все долги автора", text[:40])
+            return with_buttons(paid_report(chat_id, self._storage, members, author))
+        return None
 
     def _parse_watched(self, text: str, chat_id: int, members: Sequence[ChatMember],
                        author: ChatMember | None) -> ParsedMessage | None:
