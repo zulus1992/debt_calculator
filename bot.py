@@ -1632,6 +1632,18 @@ def _expense_is_full_record(parsed: ParsedMessage, members: Sequence[ChatMember]
     return bool(debtors)
 
 
+def is_paid_all_phrase(text: str) -> bool:
+    """Фраза «вернул всё» — себе, одному человеку или всем: её разбирает `_watch_paid_all`.
+
+    В таких фразах суммы нет, а она уже лежит в записях (`paid_report` / `repay_all_report`),
+    поэтому обычным разбором их подменять нельзя. Нужно режиму наблюдения: если `_watch_paid_all`
+    ничего не закрыл (закрывать нечего), сообщение остаётся без ответа, а не уходит в парсер.
+    """
+    return (heuristic_paid_all(text) is not None
+            or heuristic_paid_everything(text)
+            or heuristic_paid_named(text) is not None)
+
+
 def configure_logging(level: str = "INFO") -> None:
     """Включает логи с таймстампами.
 
@@ -1848,11 +1860,13 @@ class DebtBot:
         prepared: ParsedMessage | None = None
         phrase_reply: str | ChatReply | None = None
         if watched:
-            # Сначала фразы «вернул всё Леше» и «вернул все долги»: в них не названа сумма,
-            # поэтому ИИ не приведёт их к формату «кто кому сколько», — а суммы уже лежат
-            # в записях, и закрыть долги можно тем же кодом, что и по обращению.
+            # Фразы «вернул всё …» разбираем сами (суммы уже в записях). Всё остальное —
+            # как обычное сообщение: возврат и добавление долга работают одинаково с
+            # обращением и без него, включая подсказки и ошибки (см. _parse_watched).
             phrase_reply = self._watch_paid_all(text, int(chat_id), members, author)
             if phrase_reply is None:
+                if is_paid_all_phrase(text):
+                    return                       # «вернул всё», но закрывать нечего — молчим
                 prepared = self._parse_watched(text, int(chat_id), members, author)
                 if prepared is None:
                     # Понятный общий счёт, которому не хватает данных (нет суммы или кто-то
@@ -1999,12 +2013,16 @@ class DebtBot:
 
     def _parse_watched(self, text: str, chat_id: int, members: Sequence[ChatMember],
                        author: ChatMember | None) -> ParsedMessage | None:
-        """Разбор «подслушанного» сообщения: полный результат или None (тогда молчим).
+        """Разбор «подслушанного» сообщения: результат или None (тогда молчим).
 
-        Строгость тут важнее вежливости: записываем только когда ИИ привёл сообщение к
-        формату «кто кому сколько и в какой валюте» (долг/возврат) или к общему счёту
-        («заплатил за всех»), и все участники — зарегистрированные. Ошибка ИИ или пустой
-        ответ — тоже None: бот просто не отвечает.
+        Разбираем так же, как сообщение с обращением, и результат отдаём обычной обработке:
+        полная запись сохраняется, а неполная (нет суммы, сторона не из чата) — отвечает той
+        же подсказкой или ошибкой, что и по обращению. Так возврат и добавление долга работают
+        одинаково с обращением и без него.
+
+        Молчим только на болтовню: если разбора вовсе нет или в неполной фразе без суммы
+        стороны не узнаются («я должен подумать» — «подумать» не человек из чата). Ошибка ИИ
+        или пустой ответ — тоже None.
 
         Автора приводим к составу чата (`author_from_members`): в апдейте Telegram он
         всегда выглядит незарегистрированным, а «я» в тексте — это именно автор, и без
@@ -2018,11 +2036,23 @@ class DebtBot:
         except Exception as exc:  # noqa: BLE001 — разбор не удался, это не повод падать
             logger.warning("Разбор сообщения из чата не удался: %s", exc)
             return None
-        if not is_full_record(parsed, members, author):
-            return None
-        logger.info("Сообщение %s разобрано из чата: %s %s",
-                    text[:40], parsed.intent, parsed.amount)
-        return parsed
+        if is_full_record(parsed, members, author):
+            logger.info("Сообщение %s разобрано из чата: %s %s",
+                        text[:40], parsed.intent, parsed.amount)
+            return parsed
+        # Неполный долг/возврат ведём как по обращению — ответит подсказкой или ошибкой.
+        # Чтобы не сыпать «не понял» на болтовню, без суммы требуем узнаваемые стороны из чата.
+        if parsed.intent in ("debt", "repayment"):
+            member_from = resolve_side(parsed.from_name, parsed.from_user_id, members, author)
+            member_to = resolve_side(parsed.to_name, parsed.to_user_id, members, author)
+            same_person = (member_from is not None and member_to is not None
+                           and member_from.user_id == member_to.user_id)
+            if not same_person and (parsed.amount
+                                    or (member_from is not None and member_to is not None)):
+                logger.info("Неполный разбор из чата %s (%s) — отвечаю как по обращению.",
+                            text[:40], parsed.intent)
+                return parsed
+        return None
 
     def _handle_membership(self, membership: Mapping[str, Any]) -> None:
         """Реакция на добавление и удаление бота: просит пароль, сбрасывает доступ.

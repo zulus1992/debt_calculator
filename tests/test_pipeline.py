@@ -6170,15 +6170,30 @@ class WatchDebtMessagesTests(unittest.TestCase):
         self.assertEqual(telegram.sent, [])                # но в чат — ни слова
         self.assertEqual(storage.list_debts(GROUP), [])
 
-    def test_incomplete_parse_stays_silent(self) -> None:
-        """Записываем только полный формат: без стороны, суммы или «сам себе» — молчим."""
+    def test_incomplete_debt_answers_like_addressed(self) -> None:
+        """Без обращения неполный долг отвечает так же, как по обращению — подсказкой.
+
+        Паритет: раньше режим наблюдения молчал на неполный разбор, а по обращению давал
+        подсказку «не хватает данных». Теперь поведение одинаковое.
+        """
         variants = {
             "нет получателя": ParsedMessage(intent="debt", from_name="Леша", amount=3.0),
             "нет суммы": ParsedMessage(intent="debt", from_name="Леша", to_name="Дима"),
             "нулевая сумма": ParsedMessage(intent="debt", from_name="Леша", to_name="Дима",
                                            amount=0.0),
+        }
+        for title, parsed in variants.items():
+            with self.subTest(title):
+                bot, storage, telegram = self.build(RecordingParser(parsed))
+                bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля"))
+                self.assertIn("Похоже на долг", telegram.sent[0][1])
+                self.assertEqual(storage.list_debts(GROUP), [])   # ничего не записали
+
+    def test_non_record_parses_stay_silent(self) -> None:
+        """Отчёт, общий счёт без суммы и «сам себе» — не запись: в чат ничего не пишем."""
+        variants = {
             "отчёт, а не запись": ParsedMessage(intent="debts"),
-            # Общий счёт без суммы записать нельзя; с суммой — можно, см. ниже.
+            # Общий счёт без суммы разбирает _watch_expense_reply — там своя проверка слов.
             "общий счёт без суммы": ParsedMessage(intent="expense", from_name="Леша"),
             "сам себе": ParsedMessage(intent="debt", from_name="Леша", to_name="Леша",
                                       amount=3.0),
@@ -6190,13 +6205,13 @@ class WatchDebtMessagesTests(unittest.TestCase):
                 self.assertEqual(telegram.sent, [])
                 self.assertEqual(storage.list_debts(GROUP), [])
 
-    def test_unknown_or_unregistered_person_stays_silent(self) -> None:
-        """Сторона не из чата или без /reg — разбор неполный: в чат ничего не пишем."""
+    def test_watched_unknown_or_unregistered_person_answers_to_register(self) -> None:
+        """Сторона не из чата или без /reg: без обращения объясняем и просим /reg, как по обращению."""
         outsider = ParsedMessage(intent="debt", from_name="Тимофей", to_name="Дима",
                                  amount=3.0)
         bot, storage, telegram = self.build(RecordingParser(outsider))
         bot.process_update(make_chat_update(10, "Тимофей должен Диме 3 рубля"))
-        self.assertEqual(telegram.sent, [])
+        self.assertIn("Не записал", telegram.sent[0][1])
         self.assertEqual(storage.list_debts(GROUP), [])
 
         # Гоша есть в чате, но без отметки /reg — записи на него бот не ведёт.
@@ -6206,7 +6221,7 @@ class WatchDebtMessagesTests(unittest.TestCase):
             RecordingParser(unregistered),
             members=(MEMBER_LEHA, MEMBER_DIMA, MEMBER_GOSHA), register=False)
         bot.process_update(make_chat_update(10, "Гоша должен Диме 3 рубля"))
-        self.assertEqual(telegram.sent, [])
+        self.assertIn("Не записал", telegram.sent[0][1])
         self.assertEqual(storage.list_debts(GROUP), [])
 
 
