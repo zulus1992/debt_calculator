@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hmac
 import json
 import logging
@@ -465,16 +466,17 @@ def _env_port(default: int = 8080) -> int:
         return default
 
 
-def serve(host: str = "", port: int = 0) -> int:
+def serve(host: str = "", port: int = 0, *, settings: Settings | None = None) -> int:
     """Поднимает вебхук-сервер (WSGI): его запускает `python bot.py` и хостинг.
 
     Адрес берётся из аргументов, иначе из окружения HOST/PORT (панели обычно дают PORT),
     иначе 0.0.0.0:8080 — так процесс по умолчанию доступен снаружи контейнера.
+    `settings` можно передать снаружи — так сервер проверяется в тестах.
     """
     host = host or os.environ.get("HOST") or "0.0.0.0"
     port = port or _env_port()
 
-    settings = load_settings()
+    settings = settings or load_settings()
     problems = settings.problems()
     secret_problem = webhook_secret_problem(settings.webhook_secret)
     if problems or secret_problem:
@@ -487,7 +489,19 @@ def serve(host: str = "", port: int = 0) -> int:
     configure_logging(settings.log_level)
     # Маршрутизация та же, что в бою: /api/report — отчёт на почту, остальное — вебхук.
     local_app = RoutesApp()
-    with make_server(host, port, local_app, server_class=ThreadingWSGIServer) as server:
+    try:
+        server = make_server(host, port, local_app, server_class=ThreadingWSGIServer)
+    except OSError as exc:
+        # Чаще всего это занятый порт: панель хостинга сама держит процесс бота,
+        # поэтому второй `python bot.py` не запускается — нужен только один экземпляр.
+        print(f"✗ Не удалось занять {host}:{port}: {exc}", file=sys.stderr)
+        if getattr(exc, "errno", None) == errno.EADDRINUSE:
+            print("  Порт уже занят — вероятно, бот уже запущен (процессом хостинга).",
+                  file=sys.stderr)
+            print("  Второй экземпляр не нужен: для перезапуска используйте Restart "
+                  "в панели хостинга.", file=sys.stderr)
+        return 1
+    with server:
         print(f"Вебхук-сервер слушает: http://{host}:{port}  (проверка живости — GET /)")
         print(f"Апдейты Telegram: POST /api/telegram, заголовок {SECRET_HEADER_NAME}")
         print("Отчёт на почту: GET /api/report?token=<секрет> "

@@ -10,6 +10,7 @@ import argparse
 import base64
 import contextlib
 import csv
+import errno
 import io
 import json
 import re
@@ -181,6 +182,7 @@ from webhook import (
     WebhookApp,
     build_app,
     report_path,
+    serve,
 )
 
 CHAT = 555
@@ -800,6 +802,33 @@ class LazyWebhookAppTests(unittest.TestCase):
         self.assertEqual(len(storage.list_debts(7)), 1)
         assert_saved_debt(self, telegram.sent[0][1])
         self.assertIn("Итог с взаимозачётом", telegram.sent[1][1])
+
+
+class WebhookServeTests(unittest.TestCase):
+    """Запуск вебхук-сервера: занятый порт — понятная ошибка, а не голый traceback.
+
+    На панелях хостинга (Bothost и подобные) процесс бота уже запущен и держит порт;
+    второй `python bot.py` падает с «Address already in use». Объясняем это словами.
+    """
+
+    def settings(self) -> Settings:
+        """Полные настройки: иначе serve() выйдет раньше проверки порта."""
+        return Settings(
+            telegram_token="123:abc", deepseek_key="sk-test",
+            supabase_url="https://example.supabase.co", supabase_key="sb_secret_test_key",
+            webhook_secret="s3cret",
+        )
+
+    def test_port_in_use_gives_clear_message(self) -> None:
+        error = OSError(errno.EADDRINUSE, "Address already in use")
+        with mock.patch("webhook.make_server", side_effect=error):
+            with contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                code = serve("0.0.0.0", 8000, settings=self.settings())
+        self.assertEqual(code, 1)
+        message = out.getvalue() + err.getvalue()
+        self.assertIn("Порт уже занят", message)
+        self.assertIn("Restart", message)
 
 
 class WebhookSecretTests(unittest.TestCase):
