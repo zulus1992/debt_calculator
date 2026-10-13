@@ -21,6 +21,19 @@ DEFAULT_ALLOWED_UPDATES = ("message", "my_chat_member", "callback_query")
 CALLBACK_ANSWER_LIMIT = 200
 
 
+def proxy_mapping(proxy: str) -> dict[str, str]:
+    """Превращает адрес прокси в словарь для requests (поле `proxies`).
+
+    Один адрес используется и для http, и для https — так устроен прокси PythonAnywhere
+    (http://proxy.server:3128) и это самый частый случай. Пусто — пустой словарь: запрос
+    идёт напрямую, а requests сам учитывает HTTP_PROXY/HTTPS_PROXY из окружения.
+    """
+    value = str(proxy or "").strip().strip("'\"")
+    if not value:
+        return {}
+    return {"http": value, "https": value}
+
+
 class TelegramError(RuntimeError):
     """Ошибка обращения к Telegram Bot API."""
 
@@ -28,13 +41,23 @@ class TelegramError(RuntimeError):
 class TelegramBot:
     """Клиент Bot API: длинный опрос (long polling) и отправка сообщений."""
 
-    def __init__(self, token: str, *, timeout: float = 30.0, session: Any = None) -> None:
+    def __init__(self, token: str, *, timeout: float = 30.0, session: Any = None,
+                 proxy: str = "") -> None:
+        """Создаёт клиент.
+
+        `proxy` — адрес прокси для общения с Telegram (например, http://proxy.server:3128
+        на PythonAnywhere). На serverless-хостингах без прокси api.telegram.org недоступен;
+        пусто — соединение напрямую.
+        """
         token = str(token or "").strip().strip("'\"").strip()
         if not token:
             raise TelegramError("Не задан TELEGRAM_BOT_TOKEN.")
         self._token = token
         self._timeout = timeout
         self._session = session or requests
+        # Пусто — None: requests пойдёт напрямую. Прокси передаём тем же словарём, что
+        # просит requests ('http'/'https'), и только когда он задан.
+        self._proxies: dict[str, str] | None = proxy_mapping(proxy) or None
 
     def call(self, method: str, *, http_timeout: float | None = None, **payload: Any) -> Any:
         """Вызывает метод Bot API и возвращает поле result.
@@ -52,12 +75,16 @@ class TelegramBot:
         (`data` + `files`): так работает sendDocument.
         """
         url = TELEGRAM_API.format(token=self._token, method=method)
+        # Прокси добавляем в запрос только когда он задан: пустое значение оставляем requests,
+        # чтобы он мог сам взять HTTP_PROXY/HTTPS_PROXY из окружения.
+        extra: dict[str, Any] = {"proxies": self._proxies} if self._proxies else {}
         try:
             if files is None:
-                response = self._session.post(url, json=json, timeout=http_timeout or self._timeout)
+                response = self._session.post(url, json=json,
+                                              timeout=http_timeout or self._timeout, **extra)
             else:
                 response = self._session.post(url, data=data, files=files,
-                                              timeout=http_timeout or self._timeout)
+                                              timeout=http_timeout or self._timeout, **extra)
         except requests.RequestException as exc:
             raise TelegramError(f"Telegram недоступен: {exc}") from exc
 

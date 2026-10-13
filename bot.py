@@ -1620,7 +1620,8 @@ def build_runtime(settings: Settings) -> tuple[Storage, DeepSeekParser, Telegram
         model=settings.deepseek_model,
         timeout=settings.request_timeout,
     )
-    telegram = TelegramBot(settings.telegram_token, timeout=settings.request_timeout)
+    telegram = TelegramBot(settings.telegram_token, timeout=settings.request_timeout,
+                           proxy=settings.telegram_proxy)
     return storage, parser, telegram
 
 
@@ -2143,7 +2144,8 @@ def _telegram_for(settings: Settings) -> TelegramBot:
     problems = settings.problems()
     if problems:
         raise ConfigError("Проверьте настройки:\n- " + "\n- ".join(problems))
-    return TelegramBot(settings.telegram_token, timeout=settings.request_timeout)
+    return TelegramBot(settings.telegram_token, timeout=settings.request_timeout,
+                       proxy=settings.telegram_proxy)
 
 
 # Признак «у клиента нет метода setMyCommands» (тесты, чужая обёртка): это не сбой —
@@ -2357,7 +2359,8 @@ def repair_webhook_mode(settings: Settings, *, telegram: Any = None) -> int:
         # команду можно запустить и с ПК, где полного .env нет (важно лишь то, что секрет
         # совпадает с тем, что настроен у вебхука на хостинге).
         client = telegram if telegram is not None else TelegramBot(
-            settings.telegram_token, timeout=settings.request_timeout)
+            settings.telegram_token, timeout=settings.request_timeout,
+            proxy=settings.telegram_proxy)
         info = client.get_webhook_info()
     except (ConfigError, TelegramError) as exc:
         print("Ошибка:", exc, file=sys.stderr)
@@ -2428,7 +2431,8 @@ def check_services(settings: Settings) -> bool:
 
     ok = True
     try:
-        telegram = TelegramBot(settings.telegram_token, timeout=settings.request_timeout)
+        telegram = TelegramBot(settings.telegram_token, timeout=settings.request_timeout,
+                               proxy=settings.telegram_proxy)
         me = telegram.get_me()
         print(f"✓ Telegram: @{me.get('username')} (id {me.get('id')})")
         if settings.require_mention:

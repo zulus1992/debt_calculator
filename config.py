@@ -124,6 +124,10 @@ class Settings:
     default_currency: str = DEFAULT_CURRENCY
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)
     request_timeout: float = 30.0
+    # Прокси для общения с Telegram (TELEGRAM_PROXY). На хостингах вроде PythonAnywhere
+    # исходящий трафик идёт только через их прокси (http://proxy.server:3128) — без него
+    # api.telegram.org недоступен. Пусто — соединение напрямую.
+    telegram_proxy: str = ""
     log_level: str = "INFO"
     webhook_secret: str = ""
     # Секрет эндпоинта отчёта (/api/report) для внешнего планировщика вроде cron-job.org.
@@ -529,6 +533,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         default_currency=get("DEFAULT_CURRENCY", DEFAULT_CURRENCY).upper(),
         allowed_user_ids=_parse_user_ids(get("ALLOWED_USER_IDS")),
         request_timeout=timeout,
+        telegram_proxy=get("TELEGRAM_PROXY"),
         log_level=get("LOG_LEVEL", "INFO").upper(),
         webhook_secret=get("WEBHOOK_SECRET"),
         cron_secret=get("CRON_SECRET"),

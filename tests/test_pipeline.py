@@ -168,7 +168,7 @@ from telegram_api import (
     MAX_CAPTION_LENGTH,
     TelegramBot,
     TelegramError,
-    TelegramError,
+    proxy_mapping,
     split_message,
 )
 from webhook import (
@@ -511,6 +511,13 @@ class AccessAndConfigTests(unittest.TestCase):
         self.assertEqual(load_settings(
             {"SUPABASE_RETRIES": "99"}, use_env_file=False).supabase_retries, 2)
 
+    def test_telegram_proxy_setting(self) -> None:
+        """TELEGRAM_PROXY читается из окружения; по умолчанию прокси не используется."""
+        self.assertEqual(load_settings({}, use_env_file=False).telegram_proxy, "")
+        settings = load_settings(
+            {"TELEGRAM_PROXY": " 'http://proxy.server:3128' "}, use_env_file=False)
+        self.assertEqual(settings.telegram_proxy, "http://proxy.server:3128")
+
 
 class TelegramHelpersTests(unittest.TestCase):
     """Вспомогательные функции Telegram-клиента."""
@@ -524,6 +531,15 @@ class TelegramHelpersTests(unittest.TestCase):
         self.assertGreater(len(parts), 1)
         self.assertTrue(all(len(part) <= 4096 for part in parts))
         self.assertEqual("".join(parts), text)
+
+    def test_proxy_mapping(self) -> None:
+        """Один адрес уходит и в http, и в https; пусто — без прокси (прямое соединение)."""
+        self.assertEqual(proxy_mapping("http://proxy.server:3128"),
+                         {"http": "http://proxy.server:3128", "https": "http://proxy.server:3128"})
+        self.assertEqual(proxy_mapping(" http://proxy.server:3128 "),
+                         {"http": "http://proxy.server:3128", "https": "http://proxy.server:3128"})
+        self.assertEqual(proxy_mapping(""), {})
+        self.assertEqual(proxy_mapping("   "), {})
 
 
 class FakeTelegram:
@@ -833,6 +849,7 @@ class FakeSession:
         """
         self.calls.append({"method": "POST", "url": url, "payload": json,
                            "data": data, "files": files, "timeout": timeout,
+                           "proxies": kwargs.get("proxies"),
                            "headers": dict(kwargs.get("headers") or {})})
         return self._next()
 
@@ -925,6 +942,19 @@ class TelegramClientTests(unittest.TestCase):
     def test_get_me(self) -> None:
         self.session.responses = [FakeResponse({"ok": True, "result": {"id": 1, "username": "bot"}})]
         self.assertEqual(self.bot.get_me()["username"], "bot")
+
+    def test_proxy_is_passed_to_requests(self) -> None:
+        """Прокси уходит в requests полем proxies и для http, и для https (PythonAnywhere)."""
+        bot = TelegramBot("123:abc", session=self.session, proxy="http://proxy.server:3128")
+        bot.get_me()
+        call = self.session.calls[0]
+        self.assertEqual(call["proxies"],
+                         {"http": "http://proxy.server:3128", "https": "http://proxy.server:3128"})
+
+    def test_without_proxy_requests_go_directly(self) -> None:
+        """Без TELEGRAM_PROXY поле proxies не отправляем: requests сам учтёт окружение."""
+        self.bot.get_me()
+        self.assertIsNone(self.session.calls[0]["proxies"])
 
     def test_send_message_splits_and_replies_only_once(self) -> None:
         self.session.responses = [
