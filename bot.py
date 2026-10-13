@@ -360,10 +360,11 @@ class HeuristicParser:
               members: Sequence[Any] = (), author: Any = None) -> ParsedMessage:
         """Разбирает текст регулярными выражениями.
 
-        Состав чата здесь не нужен: имена из текста сопоставляются с участниками
-        уже в handle_text (resolve_side), поэтому параметры принимаются и игнорируются.
+        Состав чата нужен общему счёту: по нему «за олю» — человек, а «за ужин» — нет.
+        Остальные фразы разбираются без него, а имена сопоставляются в handle_text
+        (resolve_side), поэтому параметры больше нигде не используются.
         """
-        parsed = heuristic_parse(text, default_currency)
+        parsed = heuristic_parse(text, default_currency, members, author)
         if parsed is not None:
             return parsed
         return ParsedMessage(
@@ -1052,6 +1053,28 @@ def _resolve_group_names(names: Sequence[str], members: Sequence[ChatMember],
     return found, unknown
 
 
+def expense_amount_hint(parsed: ParsedMessage) -> str:
+    """Подсказка, когда общий счёт понят, а суммы в нём нет: «я заплатил за всех».
+
+    Взять сумму неоткуда — в отличие от «вернул всё», её нет и в записях, — поэтому просто
+    просим назвать число и показываем готовый пример: человек допишет его и повторит
+    сообщение. За кого счёт, берём из разбора, чтобы пример был про то же самое.
+    """
+    if parsed.participants == ["я"]:
+        scope = " за себя"
+    elif parsed.participants:
+        scope = " за " + " и ".join(str(name).strip() for name in parsed.participants)
+    elif parsed.exclude:
+        scope = " за всех кроме " + " и ".join(str(name).strip() for name in parsed.exclude)
+    else:
+        scope = " за всех"
+    return (
+        f"🧾 Понял: общий счёт{scope}, но не хватает суммы.\n"
+        f"Напишите её в сообщении — например «я заплатил 500{scope}» — "
+        "и я разделю её между всеми, кто в счёте."
+    )
+
+
 def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage,
                  members: Sequence[ChatMember], author: ChatMember | None,
                  currency: str = "BYN") -> str:
@@ -1062,8 +1085,11 @@ def save_expense(parsed: ParsedMessage, raw: str, chat_id: int, storage: Storage
     Оригинал сообщения сохраняется в каждой доле (raw_text), а все доли получают
     один group_id: благодаря ему /undo убирает общий счёт целиком, а не строку.
     """
-    if not parsed.is_expense:
+    if parsed.intent != "expense" or not (parsed.from_name or parsed.from_user_id):
         return NOT_AN_EXPENSE_REPLY
+    if not parsed.amount:
+        # «я заплатил за всех»: фразу поняли, а суммы в ней нет — просим её назвать.
+        return expense_amount_hint(parsed)
     payer = resolve_side(parsed.from_name, parsed.from_user_id, members, author)
     problem = _not_registered_reply([(payer, parsed.from_name)])
     if problem or payer is None:

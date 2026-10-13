@@ -2454,6 +2454,46 @@ class ExpenseFlowTests(unittest.TestCase):
         self.assertEqual(len(rows), 4)
         self.assertTrue(all(row.to_user_id == 102 for row in rows))
 
+    def test_we_paid_means_the_author_paid(self) -> None:
+        """«мы заплатили 100 за всех»: пишет один человек — плативший это автор сообщения."""
+        self.send("мы заплатили 100 за всех")
+        rows = self.rows()
+        self.assertEqual(len(rows), 4)                                  # все, кроме платившего
+        self.assertTrue(all(row.to_user_id == 102 for row in rows))     # автор — Дима
+        self.assertTrue(all(row.amount == 20.0 for row in rows))        # 100 / 5
+
+    def test_phrase_without_amount_asks_for_it(self) -> None:
+        """«я заплатил за всех» — суммы нет, поэтому бот просит её назвать и показывает пример."""
+        reply = self.send("я заплатил за всех")
+        self.assertIn("не хватает суммы", reply)
+        self.assertIn("«я заплатил 500 за всех»", reply)
+        self.assertEqual(self.rows(), [])                # ничего не записали
+
+    def test_phrase_without_amount_keeps_the_scope(self) -> None:
+        """В подсказке видно, за кого счёт: «за Машу и Олю» и «кроме Оли» не превращаются в «за всех»."""
+        self.assertIn("«я заплатил 500 за Машу и Олю»", self.send("я заплатил за Машу и Олю"))
+        self.assertIn("«я заплатил 500 за всех кроме Оли»",
+                      self.send("я заплатил за всех кроме Оли"))
+        self.assertEqual(self.rows(), [])
+
+    def test_bare_verb_splits_like_self_phrase(self) -> None:
+        """«заплатил за всех 10» без «я» — тот же счёт, что «я заплатил 10 за всех»."""
+        reply = self.send("заплатил за всех 10")
+        rows = self.rows()
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row.to_user_id == 102 for row in rows))     # платил автор — Дима
+        self.assertTrue(all(row.amount == 2.0 for row in rows))
+        self.assertIn("по 2.00 BYN с", reply)
+
+    def test_lowercase_names_split_only_those_people(self) -> None:
+        """«я заплатил 300 за машу и олю»: счёт только на них и на платившего — по 100."""
+        reply = self.send("я заплатил 300 за машу и олю")
+        rows = self.rows()
+        self.assertEqual({row.from_user_id for row in rows}, {103, 104})   # Маша и Оля
+        self.assertTrue(all(row.to_user_id == 102 for row in rows))
+        self.assertTrue(all(row.amount == 100.0 for row in rows))          # 300 / 3
+        self.assertIn("@petrova_m, @olga_s", reply)
+
     def test_excluded_person_is_not_charged(self) -> None:
         reply = self.send("Дима заплатил 12 за всех кроме Оли")
         rows = self.rows()
@@ -2684,8 +2724,27 @@ class HeuristicExpenseTests(unittest.TestCase):
         parsed = heuristic_parse("Дима заплатил 10 за ужин")
         self.assertIsNone(parsed.participants)
 
-    def test_amount_is_required(self) -> None:
-        self.assertIsNone(heuristic_parse("Дима заплатил за всех"))
+    def test_prompt_without_amount_is_recognized(self) -> None:
+        """«Дима заплатил за всех» — фраза понята, суммы нет: is_expense False, но разбор есть."""
+        parsed = heuristic_parse("Дима заплатил за всех")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.intent, "expense")
+        self.assertFalse(parsed.is_expense)              # записывать нечего: суммы нет
+        self.assertEqual((parsed.from_name, parsed.amount), ("Дима", None))
+
+    def test_bare_verb_means_the_author_paid(self) -> None:
+        """«Заплатил за всех 10» без «я»: платил автор сообщения, как в «я заплатил 10»."""
+        parsed = heuristic_parse("заплатил за всех 10")
+        self.assertEqual((parsed.intent, parsed.from_name, parsed.amount), ("expense", "я", 10.0))
+        self.assertIsNone(parsed.participants)
+
+    def test_lowercase_names_are_people_with_roster(self) -> None:
+        """Состав чата отличает людей от блюд: «за олю и машу» — люди, «за ужин» — нет."""
+        members = [MEMBER_DIMA, MEMBER_MASHA, MEMBER_OLYA]
+        parsed = heuristic_parse("я заплатил 300 за олю и машу", members=members)
+        self.assertEqual(parsed.participants, ["олю", "машу"])
+        dish = heuristic_parse("я заплатил 300 за ужин", members=members)
+        self.assertIsNone(dish.participants)              # «ужин» не человек — платили за всех
 
 
 class AiExpenseTests(unittest.TestCase):
@@ -5652,6 +5711,13 @@ class PaidCommandTests(unittest.TestCase):
             self.assertTrue(heuristic_paid_everything(text), text)
         for text in ("я вернул все деньги Леше", "я отдал всё Диме", "Маша вернула все долги",
                      "Леша вернул Диме 3 рубля", "привет", "покажи долги", ""):
+            self.assertFalse(heuristic_paid_everything(text), text)
+        # «заплатил за …» — это общий счёт (кто-то платил за других), а не «закрыть мои долги»:
+        # такие фразы разбирает общий счёт, и закрывать по ним долги нельзя.
+        for text in ("я заплатил за всех", "я заплатил за всех 10", "я заплатил за Машу",
+                     "я заплатил за машу и олю 300", "оплатил за всех 100 рублей",
+                     "я заплатил за себя 10"):
+            self.assertIsNone(heuristic_paid_all(text), text)
             self.assertFalse(heuristic_paid_everything(text), text)
 
     def test_phrase_about_another_person_is_not_closed(self) -> None:

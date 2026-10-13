@@ -19,6 +19,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from members import resolve_member
+
 import requests
 
 from members import format_roster
@@ -131,6 +133,9 @@ EXPENSE_VERBS = (
     r"paid\s+for|paid|cashed\s+out)"
 )
 EXPENSE_RE = re.compile(rf"(?P<payer>{NAME_TOKEN})\s+{EXPENSE_VERBS}\b(?P<tail>[^\n]*)", re.IGNORECASE)
+# «Заплатил за всех 10» — имени перед глаголом нет: платил автор сообщения (как в «я заплатил 10»).
+# Глагол должен стоять в начале сообщения, иначе «Леша сказал, что заплатил…» попадёт сюда зря.
+EXPENSE_SELF_RE = re.compile(rf"^\s*(?:{EXPENSE_VERBS})\b(?P<tail>[^\n]*)", re.IGNORECASE)
 # «за всех», «на всех», «поровну» — платили за весь чат.
 ALL_RE = re.compile(r"\b(?:за|на)\s+(?:всех|все|всю|нас|всём|всем)\b|\bпоровну\b", re.IGNORECASE)
 # «за себя» — платил только за себя, делить не с кем.
@@ -288,7 +293,7 @@ class DeepSeekParser:
         if parsed is not None and parsed.intent != "none":
             return parsed
 
-        heuristic = heuristic_parse(text, default_currency)
+        heuristic = heuristic_parse(text, default_currency, members, author)
         if heuristic is not None:
             return heuristic
         if parsed is not None:
@@ -480,6 +485,10 @@ def _paid_all_tail(text: str) -> str | None:
     if NUMBER_RE.search(PAID_ALL_HANDLE_RE.sub(" ", value)):
         return None
     lowered = value.lower().replace("ё", "е")
+    # «Я заплатил за всех» и «я заплатил за Машу» — это общий счёт (кто-то платил за других),
+    # а не «вернул всё»: такие фразы разбирает общий счёт, подменять их закрытием долгов нельзя.
+    if ALL_RE.search(lowered) or SELF_ONLY_RE.search(lowered) or FOR_SOMEONE_RE.search(lowered):
+        return None
     payer = PAID_ALL_PAYER_RE.search(lowered)
     if payer and payer.group("payer").lower() not in PAID_ALL_SELF:
         return None                      # «Маша вернула все долги» — речь о другом человеке
@@ -554,24 +563,50 @@ def _parse_repayment(raw: str, default_currency: str = "BYN") -> ParsedMessage |
     )
 
 
-def _parse_expense(raw: str, default_currency: str = "BYN") -> ParsedMessage | None:
+def _expense_people(names: Sequence[str], members: Sequence[Any],
+                    author: Any = None) -> list[str] | None:
+    """Кого назвали в «за …»: сперва ищем их в составе чата, потом — по большой букве.
+
+    Состав чата решает главное: «за олю и машу» — это люди, хотя и написаны строчными,
+    а «за ужин» и «за такси» — не люди, даже если стоят рядом с глаголом. Без состава
+    (демо, старые вызовы) остаётся прежнее правило: человек — только слово с большой буквы.
+    """
+    if not names:
+        return None
+    if members:
+        known = [name for name in names if resolve_member(name, members, author) is not None]
+        if known:
+            return known
+    proper = [name for name in names if name[:1].isupper()]
+    return proper or None
+
+
+def _parse_expense(raw: str, default_currency: str = "BYN",
+                   members: Sequence[Any] = (), author: Any = None) -> ParsedMessage | None:
     """Пытается распознать общий счёт: «Дима заплатил 10 за всех кроме Оли».
 
-    Возвращает None, если фразы про оплату нет или не нашлась сумма. Кого делить —
-    разбирается так: «за всех» (или вообще ничего не сказано) — на весь чат,
-    «кроме Оли» — исключение, «за Машу и Петю» — платили за конкретных людей.
+    Возвращает None, если фразы про оплату нет вообще. Если фраза есть, а сумму не назвали
+    («я заплатил за всех»), результат всё равно возвращается — по нему бот попросит сумму,
+    а не ответит «не понял»: `is_expense` при этом False, потому что суммы нет.
+
+    Кого делить, разбирается так: «за всех» (или вообще ничего не сказано) — на весь чат,
+    «кроме Оли» — исключение, «за Машу и Петю» (и строчными: «за машу») — платили за них.
     """
     match = EXPENSE_RE.search(raw)
-    if not match:
-        return None
-    payer = match.group("payer")
-    if detect_currency(payer) is not None:
-        return None                     # «рублями заплатил»: слово похоже на имя, но это валюта
-    tail = match.group("tail") or ""
+    if match:
+        payer = match.group("payer")
+        if detect_currency(payer) is not None:
+            return None                 # «рублями заплатил»: слово похоже на имя, но это валюта
+        tail = match.group("tail") or ""
+    else:
+        # «Заплатил за всех 10» — имени перед глаголом нет: платил автор сообщения.
+        self_match = EXPENSE_SELF_RE.match(raw)
+        if not self_match:
+            return None
+        payer = "я"
+        tail = self_match.group("tail") or ""
     numbers = NUMBER_RE.findall(tail[:80]) or NUMBER_RE.findall(raw)
     amount = _to_amount(numbers[0]) if numbers else None
-    if not amount:
-        return None
 
     exclude_match = EXCLUDE_RE.search(raw)
     exclude = _segment_names(exclude_match.group("names")) if exclude_match else []
@@ -581,11 +616,8 @@ def _parse_expense(raw: str, default_currency: str = "BYN") -> ParsedMessage | N
         participants = ["я"]
     elif not ALL_RE.search(raw):
         someone = FOR_SOMEONE_RE.search(raw)
-        # Именем считаем только слово с большой буквы: «за ужин» — это не человек,
-        # а «за Машу» — человек (в офлайне без ИИ иначе не отличить).
         names = _segment_names(someone.group("names")) if someone else []
-        proper = [name for name in names if name[:1].isupper()]
-        participants = proper or None
+        participants = _expense_people(names, members, author)
 
     return ParsedMessage(
         intent="expense",
@@ -598,11 +630,14 @@ def _parse_expense(raw: str, default_currency: str = "BYN") -> ParsedMessage | N
     )
 
 
-def heuristic_parse(text: str, default_currency: str = "BYN") -> ParsedMessage | None:
+def heuristic_parse(text: str, default_currency: str = "BYN",
+                    members: Sequence[Any] = (), author: Any = None) -> ParsedMessage | None:
     """Разбор сообщения без внешних сервисов (регулярные выражения).
 
     Понимает «Леша должен Диме 3 рубля», «3 рубля: Леша должен Диме», «Леша вернул Диме 3»,
     «Дима заплатил 10 за всех кроме Оли», «покажи долги», «валюта по умолчанию доллар».
+    `members` и `author` — состав чата и автор: по ним «за олю» в общем счёте узнаётся как
+    человек, а «за ужин» — как что-то неодушевлённое.
     """
     raw = (text or "").strip()
     if not raw:
@@ -618,7 +653,7 @@ def heuristic_parse(text: str, default_currency: str = "BYN") -> ParsedMessage |
 
     # Общий счёт («Дима заплатил 10 за всех») проверяем раньше возврата и отчёта:
     # в таких фразах тоже встречается слово «долг», но это не просьба показать долги.
-    expense = _parse_expense(raw, default_currency)
+    expense = _parse_expense(raw, default_currency, members, author)
     if expense is not None:
         return expense
 
