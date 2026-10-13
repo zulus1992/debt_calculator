@@ -1909,29 +1909,28 @@ class DebtBot:
 
         В чат пишем только когда есть что закрывать: если долгов нет (или человеку из фразы
         автор ничего не должен), сообщение остаётся болтовнёй и бот молчит. Записи ведутся
-        только на отмеченных через `/reg` — незарегистрированный автор тоже молчит.
+        только на отмеченных через `/reg`: для фразы про самого автора («я вернул все долги»)
+        нужна его отметка, а для «Андрей вернул все деньги» — отметка названного человека,
+        автор же может быть любым (как и у записи «Маша заняла у Пети 10$»).
         """
         # Автор из апдейта Telegram про /reg ничего не знает: берём его версию из состава
         # чата — иначе отчёты откажутся писать «на незарегистрированного» (так же, как это
         # делает handle_text для сообщений с обращением).
         author = author_from_members(author, members)
-        if author is None or not author.is_registered:
-            logger.debug("Фраза %s: автор не отмечен через /reg — долги не закрываю", text[:40])
-            return None
         try:
             debts = self._storage.list_debts(chat_id)
         except StorageError as exc:
             logger.warning("Не удалось прочитать записи чата %s: %s", chat_id, exc)
             return None
 
-        # «Андрей вернул все долги»: плательщик назван по имени — закрываем долги ЕМУ, а не
-        # автору. Проверять «есть ли долги у автора» тут нельзя: автор может быть вообще
-        # никому не должен. В чат пишем только если названному есть что закрывать.
+        # «Андрей вернул все деньги»: плательщик назван по имени — закрываем долги ЕМУ, а не
+        # автору. Проверять тут долги/отметку автора нельзя: фразу может написать кто угодно,
+        # а запись ведётся на названного человека. В чат пишем, только если ему есть что закрывать.
         named = heuristic_paid_named(text)
         if named is not None:
             payer = resolve_member(named, members, author)
             if payer is None or not payer.is_registered:
-                return None                  # незнакомый человек — молчим
+                return None                  # незнакомый/неотмеченный — молчим
             payer_outgoing, _ = person_transfers(
                 net_balances(debts, members), person_label(debts, members, payer))
             if not payer_outgoing:
@@ -1939,7 +1938,10 @@ class DebtBot:
             logger.info("Фраза из чата %s закрывает все долги %s", text[:40], payer.label)
             return with_buttons(paid_report(chat_id, self._storage, members, payer))
 
-        # Дальше речь о долгах самого автора — без них закрывать нечего.
+        # Дальше речь о долгах самого автора: без отметки /reg и без долгов закрывать нечего.
+        if author is None or not author.is_registered:
+            logger.debug("Фраза %s: автор не отмечен через /reg — долги не закрываю", text[:40])
+            return None
         outgoing, _ = person_transfers(net_balances(debts, members),
                                        person_label(debts, members, author))
         if not outgoing:

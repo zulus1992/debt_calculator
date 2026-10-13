@@ -6004,6 +6004,22 @@ class WatchDebtMessagesTests(unittest.TestCase):
         self.assertIn("4.00 BYN", reply)
         self.assertEqual(self.leftovers(), [])
 
+    def test_watched_named_person_ignores_author_registration(self) -> None:
+        """Автор без /reg, но названный человек отмечен — полный возврат ему делаем.
+
+        «Андрей вернул все деньги» — фраза про Андрея, а не про автора: отметка через /reg
+        нужна названному человеку, как и у записи «Маша заняла у Пети 10$».
+        """
+        bot, storage, telegram = self.build(
+            members=(MEMBER_LEHA, MEMBER_GOSHA, MEMBER_DIMA, MEMBER_MASHA), register=False)
+        for member in (MEMBER_DIMA, MEMBER_MASHA):        # названный и кредитор — с /reg
+            storage.register_member(member)
+        self.debt(MEMBER_DIMA, MEMBER_MASHA, 4.0)
+        self.watch("Дима вернул все деньги", user=106, username="gosha_p", first_name="Гоша")
+        reply = telegram.sent[0][1]
+        self.assertIn("Закрыл все долги: Дмитрий Сидоров", reply)
+        self.assertIn("4.00 BYN", reply)
+
     def test_watched_named_person_without_debts_is_silent(self) -> None:
         """У названного человека долгов нет — в чат не пишем."""
         bot, storage, telegram = self.build()
