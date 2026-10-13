@@ -5990,6 +5990,20 @@ class WatchDebtMessagesTests(unittest.TestCase):
                          sorted([("Леша (@clever_hazel66)", "Маша Петрова (@petrova_m)", 5.0),
                                  ("Оля Смирнова (@olga_s)", "Петя Кузнецов (@petya_k)", 6.0)]))
 
+    def test_watched_named_person_closes_debts_even_if_author_owes_nothing(self) -> None:
+        """Автор никому не должен, но долги названного человека всё равно закрываем.
+
+        Регрессия: ветка «Имя вернул все долги» стояла после проверки «есть ли долги у
+        автора», и при пустых долгах автора фраза молча терялась (а через /add работала).
+        """
+        bot, storage, telegram = self.build()
+        self.debt(MEMBER_DIMA, MEMBER_MASHA, 4.0)          # долг есть только у Димы
+        self.watch("Дима вернул все долги")
+        reply = telegram.sent[0][1]
+        self.assertIn("Закрыл все долги: Дмитрий Сидоров", reply)
+        self.assertIn("4.00 BYN", reply)
+        self.assertEqual(self.leftovers(), [])
+
     def test_watched_named_person_without_debts_is_silent(self) -> None:
         """У названного человека долгов нет — в чат не пишем."""
         bot, storage, telegram = self.build()

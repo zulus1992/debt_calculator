@@ -1923,6 +1923,23 @@ class DebtBot:
         except StorageError as exc:
             logger.warning("Не удалось прочитать записи чата %s: %s", chat_id, exc)
             return None
+
+        # «Андрей вернул все долги»: плательщик назван по имени — закрываем долги ЕМУ, а не
+        # автору. Проверять «есть ли долги у автора» тут нельзя: автор может быть вообще
+        # никому не должен. В чат пишем только если названному есть что закрывать.
+        named = heuristic_paid_named(text)
+        if named is not None:
+            payer = resolve_member(named, members, author)
+            if payer is None or not payer.is_registered:
+                return None                  # незнакомый человек — молчим
+            payer_outgoing, _ = person_transfers(
+                net_balances(debts, members), person_label(debts, members, payer))
+            if not payer_outgoing:
+                return None                  # закрывать нечего — в чат не пишем
+            logger.info("Фраза из чата %s закрывает все долги %s", text[:40], payer.label)
+            return with_buttons(paid_report(chat_id, self._storage, members, payer))
+
+        # Дальше речь о долгах самого автора — без них закрывать нечего.
         outgoing, _ = person_transfers(net_balances(debts, members),
                                        person_label(debts, members, author))
         if not outgoing:
@@ -1941,19 +1958,6 @@ class DebtBot:
         if heuristic_paid_everything(text):
             logger.info("Фраза из чата %s закрывает все долги автора", text[:40])
             return with_buttons(paid_report(chat_id, self._storage, members, author))
-        # «Андрей вернул все долги»: плательщик назван по имени — закрываем долги ему.
-        # В чат пишем только если этому человеку есть что закрывать.
-        named = heuristic_paid_named(text)
-        if named is not None:
-            payer = resolve_member(named, members, author)
-            if payer is None or not payer.is_registered:
-                return None                  # незнакомый человек — молчим
-            payer_outgoing, _ = person_transfers(
-                net_balances(debts, members), person_label(debts, members, payer))
-            if not payer_outgoing:
-                return None                  # закрывать нечего — в чат не пишем
-            logger.info("Фраза из чата %s закрывает все долги %s", text[:40], payer.label)
-            return with_buttons(paid_report(chat_id, self._storage, members, payer))
         return None
 
     def _watch_expense_reply(self, raw: str, chat_id: int, members: Sequence[ChatMember],
