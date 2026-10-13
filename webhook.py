@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """Режим вебхука: Telegram сам присылает апдейты на наш HTTPS-эндпоинт (WSGI).
 
-Зачем: serverless-хостинги (Vercel, PythonAnywhere и любой WSGI) не держат постоянный
-процесс, поэтому long polling там невозможен или «засыпает». В режиме вебхука каждое
-сообщение приходит отдельным HTTP-запросом, бот разбирает его через DeepSeek и отвечает —
-ответ приходит за 1–3 секунды, «усыпление» контейнера не мешает.
+Зачем: Telegram сам присылает апдейты POST-ом на наш HTTPS-эндпоинт; постоянный слушатель
+не нужен (нет длинного опроса getUpdates). В режиме вебхука каждое сообщение приходит
+отдельным HTTP-запросом, бот разбирает его через DeepSeek и отвечает — ответ приходит
+за 1–3 секунды.
 
 Адреса:
     /api/telegram   апдейты Telegram (секрет — WEBHOOK_SECRET, заголовок от Telegram);
@@ -13,11 +13,12 @@
     /report         то же, что /api/report (короткий адрес для планировщика);
     /               проверка живости (GET) — отвечает «ok» и обновляет курсы по расписанию.
 
-Запуск и переключение режимов:
-    python webhook.py --serve                                   # локальная проверка (wsgiref)
+Запуск:
+    python bot.py                                               # вебхук-сервер (HOST/PORT или 0.0.0.0:8080)
+    python webhook.py --serve                                   # то же вручную (wsgiref, локальная проверка)
     python bot.py --set-webhook https://<домен>/api/telegram    # Telegram шлёт апдейты сюда
     python bot.py --webhook-info                                # что настроено сейчас
-    python bot.py --delete-webhook                              # вернуться на long polling
+    python bot.py --delete-webhook                              # выключить вебхук
 
 Размещение:
     Vercel          — api/telegram.py делает `from webhook import app` → адрес /api/telegram
@@ -36,11 +37,15 @@ import argparse
 import hmac
 import json
 import logging
+import os
+import socketserver
 import sys
 import threading
 from typing import Any, Callable
 
 from urllib.parse import parse_qs
+
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from bot import DebtBot, build_runtime, configure_logging, configure_stdout
 from config import (
@@ -444,9 +449,30 @@ application = app
 reports_app = LazyReportApp()
 
 
-def serve(host: str = "127.0.0.1", port: int = 8080) -> int:
-    """Локальный сервер на wsgiref — проверить маршруты и секрет без хостинга."""
-    from wsgiref.simple_server import make_server  # стандартная библиотека, только для проверки
+class ThreadingWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
+    """Многопоточный WSGI-сервер: один апдейт (разбор через DeepSeek) не ждёт остальных."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def _env_port(default: int = 8080) -> int:
+    """Порт из окружения (панели хостинга дают PORT) — для запуска без аргументов."""
+    raw = (os.environ.get("PORT") or "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+def serve(host: str = "", port: int = 0) -> int:
+    """Поднимает вебхук-сервер (WSGI): его запускает `python bot.py` и хостинг.
+
+    Адрес берётся из аргументов, иначе из окружения HOST/PORT (панели обычно дают PORT),
+    иначе 0.0.0.0:8080 — так процесс по умолчанию доступен снаружи контейнера.
+    """
+    host = host or os.environ.get("HOST") or "0.0.0.0"
+    port = port or _env_port()
 
     settings = load_settings()
     problems = settings.problems()
@@ -461,14 +487,15 @@ def serve(host: str = "127.0.0.1", port: int = 8080) -> int:
     configure_logging(settings.log_level)
     # Маршрутизация та же, что в бою: /api/report — отчёт на почту, остальное — вебхук.
     local_app = RoutesApp()
-    with make_server(host, port, local_app) as server:
-        print(f"Локально: http://{host}:{port}  (проверка живости — GET /)")
+    with make_server(host, port, local_app, server_class=ThreadingWSGIServer) as server:
+        print(f"Вебхук-сервер слушает: http://{host}:{port}  (проверка живости — GET /)")
         print(f"Апдейты Telegram: POST /api/telegram, заголовок {SECRET_HEADER_NAME}")
-        print(f"Отчёт на почту: GET /api/report?token=<секрет> "
+        print("Отчёт на почту: GET /api/report?token=<секрет> "
               f"(kind=week|month, force=1, dry=1, to=адрес, period=2026-W40)")
-        print("Telegram требует HTTPS, доступный из интернета:",
+        print("Укажите Telegram адрес (снаружи нужен HTTPS):",
+              "python bot.py --set-webhook https://<домен>/api/telegram")
+        print("Локально HTTPS даёт туннель:",
               "ngrok http 8080 / cloudflared tunnel --url http://127.0.0.1:8080")
-        print("Затем: python bot.py --set-webhook https://<адрес туннеля>/api/telegram")
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -497,7 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.serve:
         return serve(args.host, args.port)
     print("Это модуль вебхука: его подключает хостинг (WSGI: webhook:app).")
-    print("Локальная проверка:  python webhook.py --serve")
+    print("Вебхук-сервер:       python bot.py            (или: python webhook.py --serve)")
     print("Включить вебхук:     python bot.py --set-webhook https://<домен>/api/telegram")
     return 0
 

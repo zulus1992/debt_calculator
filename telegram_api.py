@@ -14,8 +14,8 @@ TEXT_DOCUMENT_TYPE = "text/plain; charset=utf-8"
 CSV_DOCUMENT_TYPE = "text/csv; charset=utf-8"   # выгрузка /export: копия таблицы debts
 # Какие апдейты просим у Telegram: сообщения, изменения состава чата (по ним бот здоровается
 # и просит пароль при добавлении) и нажатия inline-кнопок. Telegram присылает ТОЛЬКО
-# перечисленное, поэтому список общий для long polling и вебхука: без callback_query кнопки
-# под сообщением не работают, а без my_chat_member не приходит приветствие с просьбой о пароле.
+# перечисленное, поэтому список уходит в setWebhook: без callback_query кнопки под сообщением
+# не работают, а без my_chat_member не приходит приветствие с просьбой о пароле.
 DEFAULT_ALLOWED_UPDATES = ("message", "my_chat_member", "callback_query")
 # Текст всплывающей подсказки у кнопки (answerCallbackQuery) — не длиннее 200 символов.
 CALLBACK_ANSWER_LIMIT = 200
@@ -39,7 +39,7 @@ class TelegramError(RuntimeError):
 
 
 class TelegramBot:
-    """Клиент Bot API: длинный опрос (long polling) и отправка сообщений."""
+    """Клиент Bot API: отправка сообщений и настройка вебхука (апдейты Telegram сам шлёт POST-ом)."""
 
     def __init__(self, token: str, *, timeout: float = 30.0, session: Any = None,
                  proxy: str = "") -> None:
@@ -57,7 +57,8 @@ class TelegramBot:
         self._session = session or requests
         # Пусто — None: requests пойдёт напрямую. Прокси передаём тем же словарём, что
         # просит requests ('http'/'https'), и только когда он задан.
-        self._proxies: dict[str, str] | None = proxy_mapping(proxy) or None
+        self._proxy = str(proxy or "").strip().strip("'\"")
+        self._proxies: dict[str, str] | None = proxy_mapping(self._proxy) or None
 
     def call(self, method: str, *, http_timeout: float | None = None, **payload: Any) -> Any:
         """Вызывает метод Bot API и возвращает поле result.
@@ -85,17 +86,21 @@ class TelegramBot:
             else:
                 response = self._session.post(url, data=data, files=files,
                                               timeout=http_timeout or self._timeout, **extra)
+        except requests.exceptions.ProxyError as exc:
+            # Отдельный текст для сбоя прокси: он самый частый, а причина — почти всегда
+            # в самом прокси (домен не разрешён/прокси недоступен), а не в токене бота.
+            raise TelegramError(
+                f"Telegram недоступен через прокси {self._proxy!r}: {exc}. "
+                "Проверьте, что прокси разрешает домен api.telegram.org (allowlist хостинга) "
+                "и что адрес в TELEGRAM_PROXY верный; если прямое соединение работает — "
+                "очистите TELEGRAM_PROXY."
+            ) from exc
         except requests.RequestException as exc:
             raise TelegramError(f"Telegram недоступен: {exc}") from exc
 
         status = response.status_code
         if status == 401:
             raise TelegramError("Telegram отклонил токен бота (HTTP 401): проверьте TELEGRAM_BOT_TOKEN.")
-        if status == 409:
-            raise TelegramError(
-                "Конфликт getUpdates (HTTP 409): этот бот уже запущен где-то ещё "
-                "или работает webhook. Остановите второй экземпляр."
-            )
         if status == 429:
             raise TelegramError("Слишком много запросов к Telegram (HTTP 429): подождите пару минут.")
         if status != 200:
@@ -145,30 +150,6 @@ class TelegramBot:
             for item in result or []
         ]
 
-    def get_updates(
-        self,
-        offset: int | None = None,
-        *,
-        poll_timeout: int = 30,
-        limit: int = 20,
-        allowed_updates: Sequence[str] = DEFAULT_ALLOWED_UPDATES,
-    ) -> list[dict[str, Any]]:
-        """Забирает новые апдейты методом длинного опроса (long polling).
-
-        В `allowed_updates` по умолчанию входят и нажатия кнопок, и изменение состава
-        чата: без них Telegram эти апдейты просто не пришлёт.
-        """
-        payload: dict[str, Any] = {
-            "timeout": poll_timeout,
-            "limit": limit,
-            "allowed_updates": list(allowed_updates),
-        }
-        if offset is not None:
-            payload["offset"] = offset
-        # HTTP-таймаут должен быть больше времени ожидания на стороне Telegram
-        result = self.call("getUpdates", http_timeout=max(self._timeout, poll_timeout + 10), **payload)
-        return list(result or [])
-
     def set_webhook(
         self,
         url: str,
@@ -197,7 +178,7 @@ class TelegramBot:
         return bool(self.call("setWebhook", **payload))
 
     def delete_webhook(self, *, drop_pending_updates: bool = False) -> bool:
-        """Убирает вебхук — бот снова готов к long polling."""
+        """Убирает вебхук — Telegram перестаёт присылать апдейты на наш адрес."""
         return bool(self.call("deleteWebhook", drop_pending_updates=drop_pending_updates))
 
     def get_webhook_info(self) -> dict[str, Any]:

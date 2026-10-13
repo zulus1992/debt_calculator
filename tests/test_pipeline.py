@@ -23,6 +23,7 @@ from typing import Any, Sequence
 from unittest import mock
 
 import httpx
+import requests
 from supabase import ClientOptions, create_client
 
 import bot as bot_module
@@ -550,18 +551,12 @@ class FakeTelegram:
         self.sent: list[tuple[int, str]] = []
         self.documents: list[tuple[int, str, str]] = []
         self.document_types: list[str] = []
-        self.offsets: list[int | None] = []
         self.markups: list[Any] = []                 # клавиатуры отправленных сообщений
         self.callbacks: list[tuple[str, str]] = []   # ответы на нажатия кнопок
 
     def get_me(self) -> dict:
         """Имя бота для логов."""
         return {"id": 1, "username": "test_bot"}
-
-    def get_updates(self, offset=None, *, poll_timeout: int = 30, limit: int = 20) -> list[dict]:
-        """Отдаёт подготовленные апдейты и запоминает запрошенное смещение."""
-        self.offsets.append(offset)
-        return self.updates
 
     def send_message(self, chat_id, text: str, *, reply_to=None, silent: bool = False,
                      reply_markup: Any = None) -> list[dict]:
@@ -601,6 +596,21 @@ def make_update(update_id: int, text: str, chat: int = 7, user: int = 100) -> di
     }
 
 
+def process_updates(bot: DebtBot, telegram: FakeTelegram) -> int:
+    """Прогоняет накопленные апдейты через бота — как это делает вебхук.
+
+    Замена прежнему `bot.run(poll_timeout=0, max_updates=N)` (long polling в проекте нет):
+    сначала объявляет список команд (как делал старт бота), затем обрабатывает апдейты
+    через `process_update`. Возвращает число обработанных апдейтов.
+    """
+    bot._register_commands()
+    processed = 0
+    for update in list(telegram.updates):
+        if bot.process_update(update):
+            processed += 1
+    return processed
+
+
 class BotRunTests(unittest.TestCase):
     """Проверка доступа: недопущенному пользователю бот отвечает отказом."""
 
@@ -617,7 +627,7 @@ class BotRunTests(unittest.TestCase):
             [make_update(5, "Леша должен Диме 3 рубля", user=999)],
             allowed_user_ids=frozenset({100}),
         )
-        bot.run(poll_timeout=0, max_updates=1)
+        process_updates(bot, telegram)
         self.assertEqual(storage.list_debts(7), [])
         self.assertIn("настроен только", telegram.sent[0][1])
 
@@ -793,9 +803,9 @@ class LazyWebhookAppTests(unittest.TestCase):
 
 
 class WebhookSecretTests(unittest.TestCase):
-    """Секрет вебхука: формат проверяется заранее, для long polling он не нужен."""
+    """Секрет вебхука: формат проверяется заранее, в общих настройках он необязателен."""
 
-    def test_secret_is_not_required_for_polling(self) -> None:
+    def test_secret_is_optional_in_settings(self) -> None:
         settings = load_settings({}, use_env_file=False)
         self.assertEqual(settings.webhook_secret, "")
         self.assertEqual(len(settings.problems()), 4)   # те же 4 проблемы, что и раньше
@@ -919,25 +929,11 @@ class FakeRestApi:
 
 
 class TelegramClientTests(unittest.TestCase):
-    """Сетевой слой Telegram: проверяем содержимое запросов.
-
-    Регрессия: раньше get_updates падал с TypeError, потому что HTTP-таймаут и
-    параметр Telegram timeout передавались в call() под одним именем.
-    """
+    """Сетевой слой Telegram: проверяем содержимое запросов."""
 
     def setUp(self) -> None:
         self.session = FakeSession()
         self.bot = TelegramBot("123:abc", session=self.session)
-
-    def test_get_updates_payload(self) -> None:
-        self.session.responses = [FakeResponse({"ok": True, "result": [{"update_id": 1}]})]
-        updates = self.bot.get_updates(5, poll_timeout=25)
-        self.assertEqual(updates, [{"update_id": 1}])
-        call = self.session.calls[0]
-        self.assertTrue(call["url"].endswith("/getUpdates"))
-        self.assertEqual(call["payload"]["timeout"], 25)
-        self.assertEqual(call["payload"]["offset"], 5)
-        self.assertGreater(call["timeout"], 25)  # HTTP-таймаут больше ожидания Telegram
 
     def test_get_me(self) -> None:
         self.session.responses = [FakeResponse({"ok": True, "result": {"id": 1, "username": "bot"}})]
@@ -956,6 +952,22 @@ class TelegramClientTests(unittest.TestCase):
         self.bot.get_me()
         self.assertIsNone(self.session.calls[0]["proxies"])
 
+    def test_proxy_error_has_actionable_message(self) -> None:
+        """Сбой прокси (503 Tunnel) — понятный текст с адресом и подсказкой про TELEGRAM_PROXY."""
+
+        class FailingSession:
+            def post(self, *args: Any, **kwargs: Any):
+                raise requests.exceptions.ProxyError(
+                    "Tunnel connection failed: 503 Service Unavailable")
+
+        bot = TelegramBot("123:abc", session=FailingSession(),
+                          proxy="http://proxy.server:3128")
+        with self.assertRaises(TelegramError) as ctx:
+            bot.get_me()
+        message = str(ctx.exception)
+        self.assertIn("http://proxy.server:3128", message)
+        self.assertIn("TELEGRAM_PROXY", message)
+
     def test_send_message_splits_and_replies_only_once(self) -> None:
         self.session.responses = [
             FakeResponse({"ok": True, "result": {"message_id": 1}}),
@@ -971,11 +983,6 @@ class TelegramClientTests(unittest.TestCase):
         with self.assertRaises(TelegramError) as ctx:
             self.bot.get_me()
         self.assertIn("401", str(ctx.exception))
-
-        self.session.responses = [FakeResponse({"ok": False, "description": "conflict"}, status=409)]
-        with self.assertRaises(TelegramError) as ctx:
-            self.bot.get_updates()
-        self.assertIn("409", str(ctx.exception))
 
         self.session.responses = [FakeResponse({"ok": False, "description": "bad"}, status=400)]
         with self.assertRaises(TelegramError):
@@ -1001,15 +1008,6 @@ class TelegramWebhookApiTests(unittest.TestCase):
         # нажатия кнопок не приходят, без my_chat_member — приветствие с просьбой о пароле.
         self.assertEqual(call["payload"]["allowed_updates"], list(DEFAULT_ALLOWED_UPDATES))
         self.assertFalse(call["payload"]["drop_pending_updates"])
-
-    def test_get_updates_asks_for_buttons_and_membership(self) -> None:
-        """Long polling просит те же типы апдейтов, что и вебхук."""
-        self.session.responses = [FakeResponse({"ok": True, "result": []})]
-        self.bot.get_updates(0, poll_timeout=1)
-        self.assertEqual(self.session.calls[0]["payload"]["allowed_updates"],
-                         list(DEFAULT_ALLOWED_UPDATES))
-        self.assertIn("callback_query", DEFAULT_ALLOWED_UPDATES)
-        self.assertIn("my_chat_member", DEFAULT_ALLOWED_UPDATES)
 
     def test_set_webhook_drop_pending_and_connections(self) -> None:
         self.session.responses = [FakeResponse({"ok": True, "result": True})]
@@ -1395,8 +1393,8 @@ class SupabaseKeyValidationTests(unittest.TestCase):
         self.assertIn("SUPABASE_KEY_HEADER", problems)
 
 
-class LongPollingTests(unittest.TestCase):
-    """Постоянный режим (хостинг): старт с сохранённого смещения и его запись при выходе."""
+class OffsetHandlingTests(unittest.TestCase):
+    """Смещение апдейтов (bot_state.last_update_id): запись при обработке и защита от повторов."""
 
     def build(self, updates: list[dict]):
         """Бот с хранилищем в памяти и фейковым Telegram."""
@@ -1406,26 +1404,22 @@ class LongPollingTests(unittest.TestCase):
         telegram = FakeTelegram(updates)
         return DebtBot(settings, storage, HeuristicParser(), telegram), storage, telegram
 
-    def test_run_uses_saved_offset_and_persists_it(self) -> None:
+    def test_offset_persisted_after_processing(self) -> None:
         bot, storage, telegram = self.build([make_update(20, "Леша должен Диме 3 рубля")])
         storage.set_state("last_update_id", "15")
-        bot.run(poll_timeout=5, max_updates=1)
-        self.assertEqual(telegram.offsets[0], 15)               # старт с сохранённого смещения
+        process_updates(bot, telegram)
         self.assertEqual(storage.get_state("last_update_id"), "21")  # записал после обработки
         self.assertEqual(len(storage.list_debts(7)), 1)
         assert_saved_debt(self, telegram.sent[0][1])
 
-    def test_run_without_saved_offset_requests_everything(self) -> None:
-        bot, storage, telegram = self.build([make_update(1, "/help")])
-        bot.run(poll_timeout=0, max_updates=1)
-        self.assertIsNone(telegram.offsets[0])                  # обработать всё, что накопилось
+    def test_repeat_update_is_skipped(self) -> None:
+        """Повторная доставка апдейта (update_id меньше смещения) не дублирует запись."""
+        bot, storage, telegram = self.build([make_update(20, "Леша должен Диме 3 рубля")])
+        process_updates(bot, telegram)
+        self.assertFalse(bot.process_update(make_update(20, "Леша должен Диме 3 рубля")))
+        self.assertEqual(len(storage.list_debts(7)), 1)
 
-    def test_run_with_limit_stops_on_empty_batch(self) -> None:
-        bot, storage, telegram = self.build([])
-        self.assertEqual(bot.run(poll_timeout=0, max_updates=5), 0)   # без бесконечного цикла
-        self.assertEqual(len(telegram.offsets), 1)
-
-    def test_run_survives_broken_state_storage(self) -> None:
+    def test_survives_broken_state_storage(self) -> None:
         class BrokenState(InMemoryStorage):
             """Хранилище, у которого не работает bot_state."""
 
@@ -1440,7 +1434,7 @@ class LongPollingTests(unittest.TestCase):
         storage = BrokenState()
         seed_chat(storage, chat=7)
         bot = DebtBot(settings, storage, HeuristicParser(), telegram)
-        self.assertEqual(bot.run(poll_timeout=5, max_updates=1), 1)   # не падает из-за состояния
+        process_updates(bot, telegram)                  # не падает из-за состояния
         assert_saved_debt(self, telegram.sent[0][1])
 
 
@@ -3712,7 +3706,7 @@ class ExportThroughBotTests(unittest.TestCase):
             make_update(5, "Леша должен Диме 3 рубля"),
             make_update(6, "/export"),
         ])
-        bot.run(poll_timeout=0, max_updates=2)
+        process_updates(bot, telegram)
         self.assertEqual(len(telegram.documents), 1)
         chat_id, filename, content = telegram.documents[0]
         self.assertEqual(chat_id, 7)
@@ -3726,7 +3720,7 @@ class ExportThroughBotTests(unittest.TestCase):
 
     def test_nothing_to_export_goes_as_message(self) -> None:
         bot, _, telegram = self.build([make_update(5, "/export")])
-        bot.run(poll_timeout=0, max_updates=1)
+        process_updates(bot, telegram)
         self.assertEqual(telegram.documents, [])
         self.assertIn("выгружать нечего", telegram.sent[0][1])
 
@@ -3735,7 +3729,7 @@ class ExportThroughBotTests(unittest.TestCase):
             make_update(5, "Леша должен Диме 3 рубля"),
             make_update(6, "/export"),
         ], telegram_class=BrokenDocumentTelegram)
-        bot.run(poll_timeout=0, max_updates=2)
+        process_updates(bot, telegram)
         self.assertEqual(telegram.documents, [])
         self.assertIn("Не удалось отправить файл", telegram.sent[-1][1])
 
@@ -4000,14 +3994,14 @@ class RegisterCommandsTests(unittest.TestCase):
 
     def test_commands_are_declared_on_start(self) -> None:
         bot, telegram = self.build()
-        bot.run(poll_timeout=0, max_updates=1)
+        process_updates(bot, telegram)
         self.assertEqual(telegram.commands, list(BOT_COMMANDS))
         self.assertIn("Долгов нет", telegram.sent[0][1])      # ответ чату не изменился
 
     def test_client_without_command_list_does_not_break_start(self) -> None:
         """Подменённый клиент без setMyCommands: бот работает как обычно."""
         bot, telegram = self.build(telegram_class=FakeTelegram)
-        bot.run(poll_timeout=0, max_updates=1)
+        process_updates(bot, telegram)
         self.assertIn("Долгов нет", telegram.sent[0][1])
 
     def test_settle_mydebts_and_status_are_declared(self) -> None:
@@ -4869,7 +4863,7 @@ class ChatButtonsTests(unittest.TestCase):
     def run_bot(self, settings: Settings, storage: InMemoryStorage,
                 telegram: FakeTelegram) -> None:
         """Прогоняет один апдейт через бота."""
-        DebtBot(settings, storage, HeuristicParser(), telegram).run(poll_timeout=0, max_updates=1)
+        process_updates(DebtBot(settings, storage, HeuristicParser(), telegram), telegram)
 
     def test_report_comes_with_command_buttons(self) -> None:
         """Под отчётом — кнопки команд чата, среди них /settle и /open."""
@@ -5926,6 +5920,28 @@ class WatchDebtMessagesTests(unittest.TestCase):
         self.assertEqual((saved.kind, saved.from_user_id, saved.to_user_id, saved.amount),
                          ("repayment", 102, 101, 5.0))
 
+    def test_watched_expense_is_saved_without_mention(self) -> None:
+        """«я заплатил 100 за всех» без обращения: общий счёт записывается долями.
+
+        Регрессия: режим наблюдения принимал только долг/возврат, а общий счёт молча
+        отбрасывал — «заплатил за всех» без обращения не записывался вовсе.
+        """
+        bot, storage, telegram = self.build()
+        self.watch("я заплатил 100 за всех")
+        reply = telegram.sent[0][1]
+        self.assertIn("заплатил", reply)
+        saved = storage.list_debts(GROUP)
+        self.assertTrue(saved)
+        self.assertTrue(all(debt.kind == "expense" for debt in saved))
+        self.assertTrue(all(debt.to_user_id == 101 for debt in saved))   # платил автор (Леша)
+
+    def test_watched_expense_with_unknown_person_is_silent(self) -> None:
+        """«я заплатил 100 за Тимофея» — Тимофея нет в чате: молчим и ничего не пишем."""
+        bot, storage, telegram = self.build()
+        self.watch("я заплатил 100 за Тимофея")
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(storage.list_debts(GROUP), [])
+
     def test_watched_message_calls_ai_only_once(self) -> None:
         """Разбор один: готовый результат уходит в запись, а не в новый запрос к модели."""
         parsed = ParsedMessage(intent="debt", from_name="Леша", to_name="Дима",
@@ -5964,7 +5980,8 @@ class WatchDebtMessagesTests(unittest.TestCase):
             "нулевая сумма": ParsedMessage(intent="debt", from_name="Леша", to_name="Дима",
                                            amount=0.0),
             "отчёт, а не запись": ParsedMessage(intent="debts"),
-            "общий счёт": ParsedMessage(intent="expense", from_name="Леша", amount=10.0),
+            # Общий счёт без суммы записать нельзя; с суммой — можно, см. ниже.
+            "общий счёт без суммы": ParsedMessage(intent="expense", from_name="Леша"),
             "сам себе": ParsedMessage(intent="debt", from_name="Леша", to_name="Леша",
                                       amount=3.0),
         }

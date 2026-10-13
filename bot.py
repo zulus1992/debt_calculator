@@ -1,34 +1,38 @@
 # -*- coding: utf-8 -*-
 """Телеграм-бот «калькулятор долгов»: DeepSeek разбирает сообщение, Supabase хранит долги.
 
-Режимы:
-    python bot.py            # постоянный процесс (long polling), ответы мгновенно — для хостинга
+Режим работы: ТОЛЬКО вебхук. Бот поднимает WSGI-сервер и принимает апдейты POST-ом от
+Telegram; длинного опроса (getUpdates) нет. Telegram-у сообщаем адрес эндпоинта один раз:
+    python bot.py --set-webhook https://<домен>/api/telegram   # Telegram шлёт апдейты нам
+
+Прочее:
+    python bot.py            # вебхук-сервер (адрес/порт: --host/--port, HOST/PORT или 0.0.0.0:8080)
     python bot.py --check    # проверить настройки, сервисы и объявленный список команд
     python bot.py --demo     # демонстрация без Telegram (в памяти, офлайн-разбор)
     python bot.py --rates    # обновить курсы валют вручную (--rates --force — заново за сегодня)
     python bot.py --set-commands  # объявить в Telegram список команд (меню «/»)
 
-Список команд уходит в Telegram при запуске (setMyCommands), при --set-webhook и вручную
+Список команд уходит в Telegram при --set-webhook, --repair-webhook и вручную
 (--set-commands): команды видны в меню «/» (в личном чате кнопка у поля ввода, в группе
 список появляется после «/»), а те, что бот советует в ответах (/reg и /login), нажимаемые.
 Что именно Telegram уже знает о командах, показывает --check.
 
-Курсы валют подтягиваются сами раз в день в 12:00 по Минску (RATES_HOUR): постоянный процесс
-проверяет расписание сам, а режим вебхука — при первом апдейте после назначенного часа.
+Курсы валют подтягиваются сами раз в день в 12:00 по Минску (RATES_HOUR) — при первом
+апдейте после назначенного часа (см. webhook.py, автообновление в начале запроса).
 
 Ежемесячный отчёт по долгам уходит на почту из отдельного скрипта — его вызывает cron
 хостинга (см. reports.py): письмо отправляется через Gmail API на адрес из секрета
 REPORT_EMAIL, месяц последней отправки хранится в bot_state (reports_sent), поэтому
 повторный запуск за тот же месяц письма не продублирует.
 
-Вебхук (мгновенные ответы на serverless-хостингах — Vercel, PythonAnywhere, WSGI):
+Управление вебхуком:
     python bot.py --set-webhook https://<домен>/api/telegram   # Telegram шлёт апдейты нам
     python bot.py --repair-webhook                             # переставить на тот же адрес (кнопки)
     python bot.py --webhook-info                               # что сейчас настроено
-    python bot.py --delete-webhook                             # вернуться на long polling
+    python bot.py --delete-webhook                             # выключить вебхук (апдейты не приходят)
 
-Важно: одновременно должен работать только ОДИН режим — Telegram отдаёт апдейты
-одному «слушателю», второй получит HTTP 409 Conflict или потеряет сообщения.
+Важно: на апдейты должен смотреть ОДИН адрес — Telegram отдаёт их единственному вебхуку,
+поэтому не держите второй процесс/сервер с тем же ботом.
 Если задан CHAT_PASSWORD, бот просит пароль при добавлении в чат и работает только
 в тех чатах, где пароль введён верно. Пароль принимается командой /login (или
 /password ваш-пароль, или просто сообщением с паролем); /login и /reg — нажимаемые
@@ -47,7 +51,6 @@ import argparse
 import hmac
 import logging
 import re
-import signal
 import sys
 import time
 import uuid
@@ -1572,9 +1575,12 @@ def is_full_record(parsed: ParsedMessage, members: Sequence[ChatMember],
     """Полный ли разбор: «кто кому сколько и в какой валюте» — и обе стороны из чата.
 
     Только такой разбор режим наблюдения записывает: нужны обе стороны, обе
-    зарегистрированы, и это разные люди. Всё остальное считается обычной болтовнёй —
-    тогда бот в чат не пишет вообще.
+    зарегистрированы, и это разные люди. Общий счёт («заплатил 100 за всех») — тоже
+    полная запись: плативший и все участники должны быть зарегистрированы, иначе
+    неадресованное сообщение считается болтовнёй и бот в чат не пишет.
     """
+    if parsed.is_expense:
+        return _expense_is_full_record(parsed, members, author)
     if not (parsed.is_debt or parsed.is_repayment):
         return False
     member_from = resolve_side(parsed.from_name, parsed.from_user_id, members, author)
@@ -1584,6 +1590,37 @@ def is_full_record(parsed: ParsedMessage, members: Sequence[ChatMember],
     if not (member_from.is_registered and member_to.is_registered):
         return False
     return member_from.user_id != member_to.user_id
+
+
+def _expense_is_full_record(parsed: ParsedMessage, members: Sequence[ChatMember],
+                            author: ChatMember | None) -> bool:
+    """Хватает ли данных, чтобы записать общий счёт из неадресованного сообщения.
+
+    Повторяет проверки save_expense: плативший зарегистрирован, названные участники
+    и исключения распознаны и зарегистрированы, и после исключений остаётся хотя бы
+    один должник. Если да — режим наблюдения записывает счёт; если нет — молчит,
+    чтобы не отвечать в чат ошибкой на случайную болтовню.
+    """
+    payer = resolve_side(parsed.from_name, parsed.from_user_id, members, author)
+    if payer is None or not payer.is_registered:
+        return False
+    if parsed.participants:
+        participants, unknown = _resolve_group_names(parsed.participants, members, payer)
+        if unknown or not participants:
+            return False
+    else:
+        participants = registered_members(members)
+    excluded_ids: set[Any] = set()
+    if parsed.exclude:
+        excluded, unknown_excluded = _resolve_group_names(parsed.exclude, members, payer)
+        if unknown_excluded:
+            return False
+        excluded_ids = {member.user_id for member in excluded}
+    debtors = [
+        member for member in participants
+        if member.user_id != payer.user_id and member.user_id not in excluded_ids
+    ]
+    return bool(debtors)
 
 
 def configure_logging(level: str = "INFO") -> None:
@@ -1626,7 +1663,7 @@ def build_runtime(settings: Settings) -> tuple[Storage, DeepSeekParser, Telegram
 
 
 class DebtBot:
-    """Длинный опрос Telegram и обработка входящих сообщений."""
+    """Обработка апдейтов Telegram, приходящих вебхуком (POST на наш WSGI-эндпоинт)."""
 
     def __init__(self, settings: Settings, storage: Storage, parser: Any,
                  telegram: TelegramBot, *, bot_username: str | None = None) -> None:
@@ -1634,7 +1671,6 @@ class DebtBot:
         self._storage = storage
         self._parser = parser
         self._telegram = telegram
-        self._stop = False
         # Имя бота без @ нужно, чтобы понимать обращения «@бот …» в группах.
         self._bot_username = str(bot_username or settings.bot_username or "").lstrip("@")
 
@@ -1692,62 +1728,6 @@ class DebtBot:
         else:
             logger.warning("Не удалось обновить список команд в Telegram: %s", problem)
 
-    def run(self, poll_timeout: int = 25, max_updates: int | None = None) -> int:
-        """Постоянный режим (long polling): ответы приходят мгновенно.
-
-        Используется на хостинге: процесс живёт всё время, при остановке контейнера
-        (SIGTERM/SIGINT) корректно завершается и сохраняет смещение в bot_state,
-        чтобы после перезапуска повторно доставленные апдейты не записались дважды.
-        """
-        me = self._telegram.get_me()
-        self._bot_username = self._bot_username or str(me.get("username") or "").lstrip("@")
-        offset = self._load_offset()
-        logger.info(
-            "Бот @%s (id %s) запущен (long polling). Стартовое смещение: %s",
-            me.get("username"), me.get("id"), offset,
-        )
-        self._install_signal_handlers()
-        self._register_commands()                 # меню «/» и нажимаемые команды в ответах
-        processed = 0
-        try:
-            while not self._stop:
-                self._refresh_rates_if_due()      # 12:00 по Минску — курсы обновляются сами
-                try:
-                    updates = self._telegram.get_updates(offset, poll_timeout=poll_timeout)
-                except TelegramError as exc:
-                    logger.error("getUpdates: %s", exc)
-                    time.sleep(5)
-                    continue
-                for update in updates:
-                    offset = int(update.get("update_id") or 0) + 1
-                    self._process(update)
-                    processed += 1
-                    if max_updates is not None and processed >= max_updates:
-                        return processed
-                if not updates and max_updates is not None:
-                    # Тестовый/отладочный режим: не крутимся вхолостую на пустой пачке
-                    # (в обычном режиме getUpdates ждёт сообщения до poll_timeout секунд).
-                    break
-        finally:
-            self._save_offset(offset)
-        logger.info("Остановлено. Обработано сообщений за сессию: %d", processed)
-        return processed
-
-    def _install_signal_handlers(self) -> None:
-        """SIGTERM/SIGINT -> мягкая остановка (контейнеры хостинга гасят процесс именно так)."""
-        def handler(signum: int, _frame: Any) -> None:
-            logger.info("Получен сигнал %s — останавливаюсь.", signum)
-            self._stop = True
-
-        for name in ("SIGTERM", "SIGINT"):
-            signum = getattr(signal, name, None)
-            if signum is None:
-                continue
-            try:
-                signal.signal(signum, handler)
-            except (ValueError, OSError):  # не главный поток — просто пропускаем
-                pass
-
     def _save_offset(self, offset: int | None) -> None:
         """Сохраняет смещение апдейтов; ошибки только логируются.
 
@@ -1755,8 +1735,7 @@ class DebtBot:
         «опоздавший» запрос не должен откатить смещение — иначе уже обработанное
         сообщение прилетит повторно и долг запишется дважды.
 
-        В постоянном режиме это ещё и «удобство для переезда»: если сохранение не удалось,
-        цикл опроса не должен из-за этого падать.
+        Сбой сохранения не должен ломать обработку апдейта: пишем в лог и продолжаем.
         """
         if offset is None:
             return
@@ -1772,9 +1751,8 @@ class DebtBot:
         """Обрабатывает один апдейт с защитой от повторов — режим вебхука.
 
         Telegram повторяет доставку, если эндпоинт ответил ошибкой или не успел ответить,
-        поэтому апдейты с уже пройденным update_id отбрасываются. Смещение хранится там же,
-        где его использует long polling (`bot_state.last_update_id`), так что переключение
-        между режимами не теряет и не дублирует сообщения.
+        поэтому апдейты с уже пройденным update_id отбрасываются. Пройденный update_id
+        хранится в `bot_state.last_update_id`, поэтому повторная доставка не дублирует записи.
 
         Возвращает True, если апдейт был обработан (False — это повтор).
         """
@@ -1954,9 +1932,15 @@ class DebtBot:
         """Разбор «подслушанного» сообщения: полный результат или None (тогда молчим).
 
         Строгость тут важнее вежливости: записываем только когда ИИ привёл сообщение к
-        формату «кто кому сколько и в какой валюте» и обе стороны — зарегистрированные
-        участники чата. Ошибка ИИ или пустой ответ — тоже None: бот просто не отвечает.
+        формату «кто кому сколько и в какой валюте» (долг/возврат) или к общему счёту
+        («заплатил за всех»), и все участники — зарегистрированные. Ошибка ИИ или пустой
+        ответ — тоже None: бот просто не отвечает.
+
+        Автора приводим к составу чата (`author_from_members`): в апдейте Telegram он
+        всегда выглядит незарегистрированным, а «я» в тексте — это именно автор, и без
+        этого «я заплатил за всех» из чата не распозналось бы.
         """
+        author = author_from_members(author, members)
         try:
             default_currency = self._storage.get_default_currency(
                 chat_id, self._settings.default_currency)
@@ -2245,9 +2229,9 @@ def set_webhook_mode(settings: Settings, url: str, *, drop_pending: bool = False
     else:
         print(f"✓ Команды (меню «/») объявлены: {len(BOT_COMMANDS)}")
     print("  Теперь напишите боту — ответ придёт за 1–3 секунды (задержка = запрос к DeepSeek).")
-    print("  Вернуться на long polling: python bot.py --delete-webhook")
-    print("  ⚠ Постоянный процесс (`python bot.py`) должен быть остановлен:")
-    print("    по одному адресу Telegram шлёт апдейты только одним способом.")
+    print("  Выключить вебхук: python bot.py --delete-webhook")
+    print("  ⚠ На апдейты должен смотреть только этот адрес: второй процесс или сервер,")
+    print("    который тоже слушает бота, будет мешать (Telegram шлёт апдейты одному адресату).")
     return 0
 
 
@@ -2277,7 +2261,7 @@ def update_rates_mode(settings: Settings, *, force: bool = False) -> int:
 
 
 def delete_webhook_mode(settings: Settings, *, drop_pending: bool = False) -> int:
-    """Команда --delete-webhook: снова long polling."""
+    """Команда --delete-webhook: отвязать адрес, Telegram перестаёт присылать апдейты."""
     try:
         telegram = _telegram_for(settings)
         telegram.delete_webhook(drop_pending_updates=drop_pending)
@@ -2289,7 +2273,8 @@ def delete_webhook_mode(settings: Settings, *, drop_pending: bool = False) -> in
     if info.get("url"):
         print("⚠ Telegram всё ещё сообщает адрес вебхука:", info.get("url"), file=sys.stderr)
         return 1
-    print("✓ Вебхук снят — бот снова работает через getUpdates (python bot.py).")
+    print("✓ Вебхук снят — Telegram больше не присылает апдейты на наш адрес.")
+    print("  Включить обратно: python bot.py --set-webhook https://<домен>/api/telegram")
     return 0
 
 
@@ -2331,7 +2316,7 @@ def show_webhook_info(settings: Settings, *, telegram: Any = None) -> int:
         return 1
 
     url = str(info.get("url") or "")
-    print("Режим:", f"вебхук {url}" if url else "long polling (вебхук не установлен)")
+    print("Режим:", f"вебхук {url}" if url else "вебхук не установлен (апдейты не приходят)")
     print("Ожидает апдейтов:", info.get("pending_update_count", 0))
     for line in updates_report(info):
         print(line)
@@ -2459,7 +2444,7 @@ def check_services(settings: Settings) -> bool:
             for line in updates_report(info):
                 print("  " + line)
         else:
-            print("• Telegram: вебхук не установлен — режим: python bot.py (long polling)")
+            print("• Telegram: вебхук не установлен — апдейты боту не приходят")
             print("  включить вебхук: python bot.py --set-webhook https://<домен>/api/telegram")
         for line in commands_report(telegram):
             # Меню «/» и нажимаемые команды в ответах существуют ровно по этому списку.
@@ -2655,7 +2640,7 @@ def clear_offset(storage: Storage) -> bool:
 
     Смещение — это «докуда я всё прочитал». Если оно оказалось впереди реальных update_id
     (сменился токен бота, база приехала из другого проекта, старый бот шумел апдейтами),
-    бот молчит на всё: и long polling, и вебхук считают апдейты уже обработанными.
+    бот молчит на всё: апдейты считаются уже обработанными.
     Сброс возвращает к «читай всё, что придёт».
     """
     try:
@@ -2674,7 +2659,7 @@ def reset_offset_mode(settings: Settings) -> int:
         print("✗ Не удалось сбросить смещение — смотрите лог и права базы.")
         return 1
     print(f"✓ Смещение апдейтов сброшено (было: {before or 'не задано'}).")
-    print("  Теперь и long polling, и вебхук читают все новые сообщения.")
+    print("  Теперь бот снова обрабатывает все новые сообщения.")
     print("  Если сообщения не приходят и после этого — смотрите /status и "
           "python bot.py --webhook-info.")
     return 0
@@ -2710,7 +2695,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="вместе с --rates: обновить курсы, даже если за сегодня они уже есть",
     )
-    parser.add_argument("--poll-timeout", type=int, default=25, help="время ожидания апдейтов, сек")
+    parser.add_argument(
+        "--host",
+        default="",
+        help="адрес вебхук-сервера по умолчанию (иначе берётся из HOST или 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="порт вебхук-сервера по умолчанию (иначе берётся из PORT или 8080)",
+    )
     parser.add_argument(
         "--set-webhook",
         metavar="URL",
@@ -2719,12 +2714,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--delete-webhook",
         action="store_true",
-        help="выключить вебхук и вернуться на long polling",
+        help="выключить вебхук — Telegram перестаёт присылать апдейты на наш адрес",
     )
     parser.add_argument(
         "--webhook-info",
         action="store_true",
-        help="показать, как Telegram доставляет апдейты (вебхук или getUpdates)",
+        help="показать, как Telegram доставляет апдейты (адрес вебхука и его состояние)",
     )
     parser.add_argument(
         "--set-commands",
@@ -2781,22 +2776,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return reset_offset_mode(settings)
 
-    try:
-        require_settings(settings)
-        storage, parser, telegram = build_runtime(settings)
-    except (ConfigError, StorageError, TelegramError) as exc:
-        print(f"Ошибка: {exc}", file=sys.stderr)
-        return 1
-
-    bot = DebtBot(settings, storage, parser, telegram)
-    try:
-        bot.run(poll_timeout=max(5, args.poll_timeout))
-    except (TelegramError, StorageError) as exc:
-        logger.error("Сбой: %s", exc)
-        return 1
-    except KeyboardInterrupt:
-        logger.info("Остановлено пользователем (Ctrl+C).")
-    return 0
+    # По умолчанию — вебхук: поднимаем WSGI-сервер, Telegram шлёт апдейты на наш адрес.
+    # Импорт отложенный: webhook.py сам импортирует этот модуль (иначе получился бы цикл).
+    from webhook import serve as serve_webhook
+    return serve_webhook(args.host, args.port)
 
 
 if __name__ == "__main__":
