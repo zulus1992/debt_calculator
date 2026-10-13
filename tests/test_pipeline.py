@@ -68,6 +68,7 @@ from bot import (
     starts_with_foreign_handle,
     status_report,
     updates_report,
+    watch_privacy_lines,
     with_buttons,
 )
 from config import (
@@ -107,8 +108,10 @@ from deepseek import (
     detect_currency,
     heuristic_paid_all,
     heuristic_paid_everything,
+    heuristic_paid_named,
     heuristic_parse,
     looks_like_debt_text,
+    looks_like_group_expense,
 )
 from members import (
     format_roster,
@@ -4303,6 +4306,34 @@ class WebhookUpdatesReportTests(unittest.TestCase):
         self.assertIn("не ограничены", updates_report({})[0])
 
 
+class WatchPrivacyDiagnosticsTests(unittest.TestCase):
+    """--check показывает, видит ли бот обычные сообщения групп (privacy mode)."""
+
+    def test_warns_when_privacy_on_and_watching_enabled(self) -> None:
+        """Обычные сообщения не придут, а режим наблюдения включён — говорим об этом прямо."""
+        me = {"username": "test_bot", "can_read_all_group_messages": False}
+        lines = " ".join(watch_privacy_lines(me, Settings(watch_debt_messages=True)))
+        self.assertIn("privacy mode", lines)
+        self.assertIn("/setprivacy", lines)
+        self.assertIn("я вернул все долги", lines)
+
+    def test_reports_ok_when_bot_reads_all_group_messages(self) -> None:
+        """privacy mode выключен (бот читает всё) — так и пишем."""
+        me = {"username": "test_bot", "can_read_all_group_messages": True}
+        lines = " ".join(watch_privacy_lines(me, Settings(watch_debt_messages=True)))
+        self.assertIn("читает все сообщения", lines)
+
+    def test_privacy_line_when_watching_and_any_message_are_off(self) -> None:
+        """Наблюдение выключено и обращение обязательно — просто отмечаем, что privacy включён."""
+        me = {"can_read_all_group_messages": False}
+        quiet = watch_privacy_lines(me, Settings(watch_debt_messages=False, require_mention=True))
+        self.assertEqual(len(quiet), 1)
+        self.assertIn("только на обращения", quiet[0])
+        # REQUIRE_MENTION=0 ждёт любое сообщение — privacy mode снова мешает работе.
+        urgent = watch_privacy_lines(me, Settings(watch_debt_messages=False, require_mention=False))
+        self.assertIn("privacy mode", " ".join(urgent))
+
+
 class TelegramCommandsApiTests(unittest.TestCase):
     """setMyCommands: список команд уходит одним JSON-запросом с описаниями."""
 
@@ -5792,14 +5823,61 @@ class PaidCommandTests(unittest.TestCase):
             self.assertIsNone(heuristic_paid_all(text), text)
             self.assertFalse(heuristic_paid_everything(text), text)
 
-    def test_phrase_about_another_person_is_not_closed(self) -> None:
-        """«Маша вернула все долги» — про Машу: автора это не касается, ничего не закрываем."""
-        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)
+    def test_phrase_about_another_person_closes_their_debts(self) -> None:
+        """«Маша вернула все долги» — закрываем долги Маши (её назвали), а не автора."""
+        self.debt(MEMBER_LEHA, MEMBER_DIMA, 3.0)     # долг автора (Леши) — не трогаем
+        self.debt(MEMBER_MASHA, MEMBER_DIMA, 7.0)    # долг Маши — закрываем
         reply = self.send("Маша вернула все долги")
-        self.assertNotIn("Закрыл все долги", reply)          # ничего не закрыли
-        self.assertNotIn("Закрыл ваш долг", reply)
-        self.assertEqual(len(self.storage.list_debts(CHAT)), 1)      # только исходный долг
-        self.assertEqual(self.storage.list_debts(CHAT)[0].amount, 3.0)
+        self.assertIn("Закрыл все долги: Маша", reply)
+        self.assertIn("7.00 BYN", reply)
+        self.assertNotIn("3.00 BYN", reply)
+        self.assertEqual(                                   # долг Леши остался нетронутым
+            [(item.debtor, item.creditor, item.amount)
+             for item in net_balances(self.storage.list_debts(CHAT), self.members)],
+            [("Леша Иванов (@clever_hazel66)", "Дмитрий Сидоров (@pearl_jolly92)", 3.0)])
+
+    def test_phrase_named_person_variants(self) -> None:
+        """«Имя вернул все долги» — берём имя плательщика; получатель и сумма — нет."""
+        self.assertEqual(heuristic_paid_named("Андрей вернул все долги"), "андрей")
+        self.assertEqual(heuristic_paid_named("Дима отдал все свои долги"), "дима")
+        self.assertEqual(heuristic_paid_named("Маша рассчиталась со всеми"), "маша")
+        for text in ("я вернул все долги", "мы вернули все долги всём", "вернул все долги всем",
+                     "Андрей вернул всё Диме", "Леша вернул Диме 3 рубля",
+                     "Андрей вернул все долги 5 рублей", "привет", "покажи долги", ""):
+            self.assertIsNone(heuristic_paid_named(text), text)
+
+    def test_phrase_named_person_closes_only_their_debts(self) -> None:
+        """«Дима вернул все долги» — закрываем долги Димы (то же, что /paid Дима)."""
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 5.0)      # долг автора — не трогаем
+        self.debt(MEMBER_DIMA, MEMBER_MASHA, 4.0)      # долг Димы — закрываем
+        reply = self.send("Дима вернул все долги")
+        self.assertIn("Закрыл все долги: Дмитрий Сидоров", reply)
+        self.assertIn("4.00 BYN", reply)
+        self.assertNotIn("5.00 BYN", reply)
+        record = self.storage.list_debts(CHAT)[-1]
+        self.assertEqual((record.from_user_id, record.to_user_id, record.kind),
+                         (MEMBER_DIMA.user_id, MEMBER_MASHA.user_id, "repayment"))
+
+    def test_phrase_named_unknown_person_is_not_understood(self) -> None:
+        """Имени нет в чате — долги не закрываем (обычный путь: это не запись)."""
+        self.debt(MEMBER_DIMA, MEMBER_MASHA, 4.0)
+        reply = self.send("Тимофей вернул все долги")
+        self.assertNotIn("Закрыл все долги", reply)
+        self.assertEqual(len(self.storage.list_debts(CHAT)), 1)
+
+    def test_phrase_named_unregistered_person_is_ignored(self) -> None:
+        """Плательщик назван, но без отметки /reg — долги не закрываем."""
+        storage = InMemoryStorage(default_currency="BYN")
+        members = seed_chat(storage, members=(MEMBER_GOSHA, MEMBER_DIMA), register=False)
+        storage.add_debt(CHAT, MEMBER_GOSHA.display_name, MEMBER_DIMA.display_name, "BYN", 3.0,
+                         from_user_id=MEMBER_GOSHA.user_id, to_user_id=MEMBER_DIMA.user_id)
+        author = next(item for item in storage.list_members(CHAT)
+                      if item.user_id == MEMBER_DIMA.user_id)
+        reply = handle_text("Гоша вернул все долги", CHAT, storage=storage,
+                            parser=HeuristicParser(), settings=Settings(default_currency="BYN"),
+                            members=storage.list_members(CHAT), author=author)
+        self.assertNotIn("Закрыл все долги", reply)
+        self.assertEqual(len(storage.list_debts(CHAT)), 1)
 
     def test_phrase_when_nothing_is_owed(self) -> None:
         self.debt(MEMBER_DIMA, MEMBER_LEHA, 5.0)
@@ -5898,6 +5976,37 @@ class WatchDebtMessagesTests(unittest.TestCase):
         self.assertEqual(self.leftovers(),
                          [("Маша Петрова (@petrova_m)", "Дмитрий Сидоров (@pearl_jolly92)", 7.0)])
 
+    def test_watched_named_person_closes_their_debts(self) -> None:
+        """«Дима вернул все долги» без обращения: закрываем долги Димы, а не автора."""
+        bot, storage, telegram = self.build()
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 5.0)          # долг автора (Леши) — не трогаем
+        self.debt(MEMBER_DIMA, MEMBER_MASHA, 4.0)          # долг Димы — закрываем
+        self.debt(MEMBER_OLYA, MEMBER_PETYA, 6.0)          # чужой долг не трогаем
+        self.watch("Дима вернул все долги")
+        reply = telegram.sent[0][1]
+        self.assertIn("Закрыл все долги: Дмитрий Сидоров", reply)
+        self.assertIn("4.00 BYN", reply)
+        self.assertEqual(self.leftovers(),
+                         sorted([("Леша (@clever_hazel66)", "Маша Петрова (@petrova_m)", 5.0),
+                                 ("Оля Смирнова (@olga_s)", "Петя Кузнецов (@petya_k)", 6.0)]))
+
+    def test_watched_named_person_without_debts_is_silent(self) -> None:
+        """У названного человека долгов нет — в чат не пишем."""
+        bot, storage, telegram = self.build()
+        self.debt(MEMBER_LEHA, MEMBER_MASHA, 5.0)
+        self.watch("Дима вернул все долги")
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(len(storage.list_debts(GROUP)), 1)
+
+    def test_watched_named_unregistered_person_is_silent(self) -> None:
+        """Названный человек без /reg — долги не закрываем и в чат не пишем."""
+        bot, storage, telegram = self.build(
+            members=(MEMBER_GOSHA, MEMBER_DIMA), register=False)
+        self.debt(MEMBER_GOSHA, MEMBER_DIMA, 3.0)
+        self.watch("Гоша вернул все долги", user=106, username="gosha_p", first_name="Гоша")
+        self.assertEqual(telegram.sent, [])
+        self.assertEqual(len(storage.list_debts(GROUP)), 1)
+
     def test_watched_paid_all_when_nothing_owed_is_silent(self) -> None:
         """Автор ничего не должен — в чат не пишем, хотя слова про долги и есть."""
         bot, storage, telegram = self.build()
@@ -5969,6 +6078,36 @@ class WatchDebtMessagesTests(unittest.TestCase):
         bot, storage, telegram = self.build()
         self.watch("я заплатил 100 за Тимофея")
         self.assertEqual(telegram.sent, [])
+        self.assertEqual(storage.list_debts(GROUP), [])
+
+    def test_watched_group_expense_excludes_named_person(self) -> None:
+        """«…за всех кроме Димы» с суммой: Дима в делёж не входит, остальные — да."""
+        bot, storage, telegram = self.build()
+        self.watch("я заплатил 100 за всех кроме Димы")
+        reply = telegram.sent[0][1]
+        self.assertIn("без @pearl_jolly92", reply)
+        saved = storage.list_debts(GROUP)
+        self.assertTrue(saved)
+        self.assertTrue(all(debt.kind == "expense" for debt in saved))
+        self.assertTrue(all(debt.to_user_id == 101 for debt in saved))     # платил Леша
+        self.assertNotIn(102, [debt.from_user_id for debt in saved])       # Дима исключён
+
+    def test_watched_group_expense_without_amount_asks_for_sum(self) -> None:
+        """«я заплатил за всех кроме Димы» без суммы: не молчим — просим назвать сумму."""
+        bot, storage, telegram = self.build()
+        self.watch("я заплатил за всех кроме Димы")
+        reply = telegram.sent[0][1]
+        self.assertIn("не хватает суммы", reply)
+        self.assertIn("кроме Димы", reply)
+        self.assertEqual(storage.list_debts(GROUP), [])       # записывать нечего
+
+    def test_watched_group_expense_unknown_person_asks_to_register(self) -> None:
+        """«…за всех кроме Тимофея»: кого исключить — непонятно, объясняем и просим /reg."""
+        bot, storage, telegram = self.build()
+        self.watch("я заплатил 10 за всех кроме Тимофея")
+        reply = telegram.sent[0][1]
+        self.assertIn("Не понял, кого исключить", reply)
+        self.assertIn("/reg", reply)
         self.assertEqual(storage.list_debts(GROUP), [])
 
     def test_watched_message_calls_ai_only_once(self) -> None:
@@ -6124,6 +6263,14 @@ class WatchHelperTests(unittest.TestCase):
         for text in ("привет, как дела?", "долго ждать, верно?", "сегодня хорошая погода",
                      "спасибо!", ""):
             self.assertFalse(looks_like_debt_text(text), text)
+
+    def test_group_expense_words_are_recognized(self) -> None:
+        """Общий счёт на компанию: «за всех» и «кроме …» — да; «за пиццу» — нет."""
+        for text in ("я заплатил 10 за всех кроме Андрея", "я заплатил за всех",
+                     "скинулись на подарок поровну", "я заплатил 500 кроме Оли"):
+            self.assertTrue(looks_like_group_expense(text), text)
+        for text in ("я заплатил за пиццу", "я заплатил 100 за Тимофея", "привет", ""):
+            self.assertFalse(looks_like_group_expense(text), text)
 
     def test_command_lines_and_foreign_handles(self) -> None:
         """Наблюдение не трогает команды, пути и обращения к другим ботам."""

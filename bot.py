@@ -97,8 +97,10 @@ from deepseek import (
     detect_currency,
     heuristic_paid_all,
     heuristic_paid_everything,
+    heuristic_paid_named,
     heuristic_parse,
     looks_like_debt_text,
+    looks_like_group_expense,
 )
 from members import (
     member_from_telegram,
@@ -1426,6 +1428,13 @@ def handle_text(
         # Суммы по валютам берём из записей, поэтому это та же операция, что /paid без аргумента.
         if heuristic_paid_everything(raw):
             return with_buttons(paid_report(chat_id, storage, members, author))
+        # «Андрей вернул все долги» — плательщик назван по имени: закрываем долги ему,
+        # а не автору сообщения (то же, что /paid Андрей). Долги берём из записей.
+        named = heuristic_paid_named(raw)
+        if named is not None:
+            payer = resolve_member(named, members, author)
+            if payer is not None and payer.is_registered:
+                return with_buttons(paid_report(chat_id, storage, members, payer))
 
     parsed = parsed if parsed is not None else parser.parse(
         raw, default_currency, members=members, author=author)
@@ -1846,6 +1855,11 @@ class DebtBot:
             if phrase_reply is None:
                 prepared = self._parse_watched(text, int(chat_id), members, author)
                 if prepared is None:
+                    # Понятный общий счёт, которому не хватает данных (нет суммы или кто-то
+                    # из названных не из чата): не запись, но и не болтовня — отвечаем
+                    # подсказкой, как по обращению (см. _watch_expense_reply).
+                    phrase_reply = self._watch_expense_reply(text, int(chat_id), members, author)
+                if prepared is None and phrase_reply is None:
                     logger.info("Сообщение %s похоже на долг, но разбор не удался — молчу.",
                                 message.get("message_id"))
                     return
@@ -1902,6 +1916,7 @@ class DebtBot:
         # делает handle_text для сообщений с обращением).
         author = author_from_members(author, members)
         if author is None or not author.is_registered:
+            logger.debug("Фраза %s: автор не отмечен через /reg — долги не закрываю", text[:40])
             return None
         try:
             debts = self._storage.list_debts(chat_id)
@@ -1911,6 +1926,7 @@ class DebtBot:
         outgoing, _ = person_transfers(net_balances(debts, members),
                                        person_label(debts, members, author))
         if not outgoing:
+            logger.debug("Фраза %s: у автора нет долгов — закрывать нечего", text[:40])
             return None                      # закрывать нечего — в чат не пишем
         paid_to = heuristic_paid_all(text)
         recipient = resolve_member(paid_to, members, author) if paid_to else None
@@ -1925,7 +1941,55 @@ class DebtBot:
         if heuristic_paid_everything(text):
             logger.info("Фраза из чата %s закрывает все долги автора", text[:40])
             return with_buttons(paid_report(chat_id, self._storage, members, author))
+        # «Андрей вернул все долги»: плательщик назван по имени — закрываем долги ему.
+        # В чат пишем только если этому человеку есть что закрывать.
+        named = heuristic_paid_named(text)
+        if named is not None:
+            payer = resolve_member(named, members, author)
+            if payer is None or not payer.is_registered:
+                return None                  # незнакомый человек — молчим
+            payer_outgoing, _ = person_transfers(
+                net_balances(debts, members), person_label(debts, members, payer))
+            if not payer_outgoing:
+                return None                  # закрывать нечего — в чат не пишем
+            logger.info("Фраза из чата %s закрывает все долги %s", text[:40], payer.label)
+            return with_buttons(paid_report(chat_id, self._storage, members, payer))
         return None
+
+    def _watch_expense_reply(self, raw: str, chat_id: int, members: Sequence[ChatMember],
+                             author: ChatMember | None) -> str | ChatReply | None:
+        """Понятный общий счёт из чата, которому не хватает данных — отвечаем подсказкой.
+
+        Режим наблюдения молчит на неполный разбор, но общий счёт на всю компанию — исключение:
+        если отмеченный через `/reg` человек написал «я заплатил 10 за всех кроме Андрея», бот
+        не может записать запись (кто-то из названных не зарегистрирован), однако ясно, что от
+        него хотят. Тогда в чат уходит та же подсказка, что и по обращению: назвать сумму
+        (если её нет) или зарегистрировать названного человека (`/reg`). Незнакомец — молчит.
+
+        Срабатываем только на фразы, где явно сказано «за всех» или «кроме …»
+        (`looks_like_group_expense`), иначе обычное «я заплатил за пиццу» получало бы подсказку.
+        """
+        if not looks_like_group_expense(raw):
+            return None
+        author = author_from_members(author, members)
+        try:
+            default_currency = self._storage.get_default_currency(
+                chat_id, self._settings.default_currency)
+            parsed = self._parser.parse(raw, default_currency, members=members, author=author)
+        except Exception as exc:  # noqa: BLE001 — разбор не удался, это не повод падать
+            logger.warning("Разбор общего счёта из чата не удался: %s", exc)
+            return None
+        if parsed.intent != "expense" or not (parsed.from_name or parsed.from_user_id):
+            return None
+        payer = resolve_side(parsed.from_name, parsed.from_user_id, members, author)
+        if payer is None or not payer.is_registered:
+            return None                       # незнакомый/неотмеченный — молчим, как и раньше
+        if is_full_record(parsed, members, author):
+            return None                       # полный разбор записывается обычным путём
+        logger.info("Общий счёт из чата %s без полных данных — отвечаю подсказкой", raw[:40])
+        return with_buttons(save_expense(
+            parsed, raw, chat_id, self._storage, members, author,
+            currency=(parsed.currency or default_currency).upper()))
 
     def _parse_watched(self, text: str, chat_id: int, members: Sequence[ChatMember],
                        author: ChatMember | None) -> ParsedMessage | None:
@@ -2303,6 +2367,26 @@ def updates_report(info: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def watch_privacy_lines(me: Mapping[str, Any], settings: Settings) -> list[str]:
+    """Строки про приём обычных сообщений групп (privacy mode) для `python bot.py --check`.
+
+    `getMe` отдаёт `can_read_all_group_messages`: True — бот читает все сообщения групп
+    (privacy mode выключен). False означает, что Telegram присылает боту только обращения
+    и команды, поэтому сообщения без обращения («я вернул все долги») до него не доходят —
+    и режим наблюдения (`WATCH_DEBT_MESSAGES`) работать не может, хотя включён. Строку
+    возвращаем всегда: и когда всё хорошо, и когда нужен `/setprivacy` → Disable.
+    """
+    if me.get("can_read_all_group_messages"):
+        return ["  ✓ бот читает все сообщения групп (privacy mode выключен)"]
+    if settings.watch_debt_messages or not settings.require_mention:
+        return [
+            "  ⚠ privacy mode включён: Telegram не отдаёт боту обычные сообщения группы,",
+            "    поэтому фразы без обращения («я вернул все долги») до бота не доходят.",
+            "    Отключите в @BotFather: /setprivacy → Disable (или сделайте бота админом).",
+        ]
+    return ["  • privacy mode включён: в группах бот приходит только на обращения и команды"]
+
+
 def show_webhook_info(settings: Settings, *, telegram: Any = None) -> int:
     """Команда --webhook-info: что сейчас настроено в Telegram.
 
@@ -2420,11 +2504,22 @@ def check_services(settings: Settings) -> bool:
                                proxy=settings.telegram_proxy)
         me = telegram.get_me()
         print(f"✓ Telegram: @{me.get('username')} (id {me.get('id')})")
+        for line in watch_privacy_lines(me, settings):
+            print(line)
         if settings.require_mention:
             print(f"• В группах отвечаю только на обращение: «@{me.get('username')} …», "
                   "«/debts@...» или ответ на моё сообщение")
         else:
             print("• REQUIRE_MENTION=0 — в группах отвечаю на любое сообщение")
+        print("• Сообщения про долги без обращения: "
+              + ("разбираю сам (WATCH_DEBT_MESSAGES)" if settings.watch_debt_messages
+                 else "не трогаю (WATCH_DEBT_MESSAGES=0)"))
+        if settings.allowed_user_ids:
+            print("• ALLOWED_USER_IDS: отвечаю только этим id — "
+                  + ", ".join(str(item) for item in settings.allowed_user_ids)
+                  + "; остальным в группе не отвечаю даже на фразы про долги")
+        else:
+            print("• ALLOWED_USER_IDS не задан — в группе отвечаю всем её участникам")
         if settings.reply_delay:
             print(f"• Пауза перед ответом: {settings.reply_delay:.1f} с "
                   "(REPLY_DELAY_SECONDS) — на serverless-хостинге это съедает время функции")

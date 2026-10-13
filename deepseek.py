@@ -87,8 +87,9 @@ PAID_ALL_MARKS = ("все", "весь", "вся", "всю", "полностью"
 PAID_ALL_STOP_WORDS = ("я", "мы", "ему", "ей", "им", "с", "со", "за", "по", "на", "до", "и", "а",
                        "всем", "всеми", "всему", "всех", "каждому", "обоим",
                        "свои", "свой", "свою", "своё", "мои", "мой", "мою", "моё")
-# Кто вернул: «Маша вернула все долги» — это про Машу, а не про автора сообщения,
-# поэтому такие фразы наш разбор не трогает (ими занимается основной парсер и ИИ).
+# Кто вернул: «Маша вернула все долги» — это про Машу, а не про автора сообщения.
+# «Я/мы» (PAID_ALL_SELF) — автор фразы; иначе плательщик назван по имени, и его разбирает
+# heuristic_paid_named (закрываем долги именно этого человека).
 PAID_ALL_PAYER_RE = re.compile(
     rf"(?P<payer>{NAME_TOKEN})\s+(?:{'|'.join(PAID_ALL_VERBS)})\b", re.IGNORECASE)
 PAID_ALL_SELF = ("я", "мы")
@@ -147,6 +148,17 @@ EXCLUDE_RE = re.compile(
     r"(?:кроме|без|исключая|не\s+считая|за\s+исключением)\s+(?P<names>[^\n]*)",
     re.IGNORECASE,
 )
+
+
+def looks_like_group_expense(text: str) -> bool:
+    """Явно ли фраза про общий счёт на всю компанию: «за всех», «на всех», «… кроме Оли».
+
+    Нужно режиму наблюдения: подсказкой («не хватает суммы») бот отвечает только на
+    распознанный общий счёт, а не на любое «я заплатил …». Так «я заплатил за всех кроме
+    Димы» получает ответ, а «я заплатил за пиццу» остаётся обычной болтовнёй.
+    """
+    lowered = str(text or "").lower().replace("ё", "е")
+    return bool(ALL_RE.search(lowered) or EXCLUDE_RE.search(lowered))
 
 
 class DeepSeekError(RuntimeError):
@@ -468,13 +480,15 @@ def _segment_names(segment: str) -> list[str]:
     ]
 
 
-def _paid_all_tail(text: str) -> str | None:
-    """Хвост фразы «отдал всё <кому>»; None — это вообще не фраза про «всё целиком».
+def _paid_all_parts(text: str) -> tuple[str | None, str] | None:
+    """Разбор фразы «вернул всё»: (кто вернул, остаток текста); None — это не она.
 
-    Общая часть для двух разборов: «вернул всё Леше» (человеку) и «вернул все долги» (всем).
-    Проверяем глагол, маркер «всё целиком», отсутствие суммы и вырезаем служебные слова —
-    в остатке либо имя получателя, либо ничего (значит, речь про всех).
+    Общая часть трёх разборов: «вернул всё Леше» (одному человеку), «вернул все долги» (всем)
+    и «Андрей вернул все долги» (плательщик назван по имени). Проверяем глагол, маркер «всё
+    целиком», отсутствие суммы и вырезаем служебные слова — в остатке остаются только имена
+    получателей.
 
+    Плательщик — None, когда он не назван («я/мы»); иначе — имя из текста («Андрей»).
     Если в тексте есть число, это обычный возврат с суммой: его разбирает основной парсер,
     и трогать фразу не нужно. Цифры внутри ника («@user1234») за сумму не считаются — в никах
     они встречаются постоянно.
@@ -489,19 +503,20 @@ def _paid_all_tail(text: str) -> str | None:
     # а не «вернул всё»: такие фразы разбирает общий счёт, подменять их закрытием долгов нельзя.
     if ALL_RE.search(lowered) or SELF_ONLY_RE.search(lowered) or FOR_SOMEONE_RE.search(lowered):
         return None
-    payer = PAID_ALL_PAYER_RE.search(lowered)
-    if payer and payer.group("payer").lower() not in PAID_ALL_SELF:
-        return None                      # «Маша вернула все долги» — речь о другом человеке
     words = re.findall(r"[а-яa-z]+", lowered)
     if not any(word in PAID_ALL_VERBS for word in words):
         return None
     if not any(word in PAID_ALL_STRONG_VERBS for word in words) \
             and not any(mark in lowered for mark in PAID_ALL_MARKS):
         return None
+    payer_match = PAID_ALL_PAYER_RE.search(lowered)
+    payer: str | None = None
+    if payer_match and payer_match.group("payer").lower() not in PAID_ALL_SELF:
+        payer = payer_match.group("payer")            # «Маша вернула все долги» — речь о Маше
     tail = lowered
     for word in (*PAID_ALL_VERBS, *PAID_ALL_MARKS, *PAID_ALL_STOP_WORDS):
         tail = re.sub(rf"\b{re.escape(word)}\b", " ", tail)
-    return tail
+    return payer, tail
 
 
 def heuristic_paid_all(text: str) -> str | None:
@@ -509,10 +524,14 @@ def heuristic_paid_all(text: str) -> str | None:
 
     Возвращает имя получателя («Леше») или None. Имя может не найтись в чате — тогда бот
     просто пойдёт обычным путём (скажет «не понял»), поэтому лишних «я не знаю такого»
-    на посторонние фразы не будет.
+    на посторонние фразы не будет. Фразы про третье лицо («Маша вернула все долги») сюда
+    не попадают — их разбирает heuristic_paid_named.
     """
-    tail = _paid_all_tail(text)
-    if tail is None:
+    parts = _paid_all_parts(text)
+    if parts is None:
+        return None
+    payer, tail = parts
+    if payer is not None:
         return None
     names = NAME_TOKEN_RE.findall(tail)
     return names[0] if names else None
@@ -521,15 +540,43 @@ def heuristic_paid_all(text: str) -> str | None:
 def heuristic_paid_everything(text: str) -> bool:
     """«Я вернул все долги» — закрыть каждому всё, что я ему должен.
 
-    True только когда во фразе нет имени получателя: «я вернул все деньги Леше» — это про
-    одного человека (его разбирает heuristic_paid_all), а «я вернул все долги», «рассчитался
-    со всеми» — про всех. Суммы и валюты берутся из записей, поэтому такая фраза закрывает
-    долги точно так же, как команда /paid без аргумента.
+    True только когда во фразе нет ни имени получателя, ни плательщика-третьего лица:
+    «я вернул все деньги Леше» — это про одного человека (его разбирает heuristic_paid_all),
+    «я вернул все долги», «рассчитался со всеми» — про всех, а «Маша вернула все долги» —
+    про Машу (heuristic_paid_named). Суммы и валюты берутся из записей, поэтому такая фраза
+    закрывает долги точно так же, как команда /paid без аргумента.
     """
-    tail = _paid_all_tail(text)
-    if tail is None:
+    parts = _paid_all_parts(text)
+    if parts is None:
+        return False
+    payer, tail = parts
+    if payer is not None:
         return False
     return not NAME_TOKEN_RE.findall(tail)
+
+
+def heuristic_paid_named(text: str) -> str | None:
+    """«Андрей вернул все долги» — закрыть все долги человека, названного по имени.
+
+    Возвращает имя плательщика («Андрей»), если фраза значит «закрыть все долги ЭТОГО
+    человека»: плательщик назван именем, а получатель — нет. Обычный разбор такие фразы
+    не понимает (в них нет суммы), но суммы уже лежат в записях, поэтому бот закрывает
+    долги тем же кодом, что команда `/paid <имя>`.
+
+    None — если это не фраза «всё целиком», если плательщик не назван (это случай «я/мы»:
+    его разбирают heuristic_paid_all / heuristic_paid_everything) или если назван получатель
+    («Андрей вернул всё Диме» — это «всё одному человеку», а не «всем»).
+    """
+    parts = _paid_all_parts(text)
+    if parts is None:
+        return None
+    payer, tail = parts
+    if payer is None:
+        return None
+    tail = re.sub(rf"\b{re.escape(payer)}\b", " ", tail, count=1)
+    if NAME_TOKEN_RE.search(tail):
+        return None                      # получатель назван — это «всё одному человеку»
+    return payer
 
 
 def _parse_repayment(raw: str, default_currency: str = "BYN") -> ParsedMessage | None:
