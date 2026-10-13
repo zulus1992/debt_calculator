@@ -20,10 +20,12 @@ from decimal import Decimal, ROUND_HALF_UP
 from email import policy
 from email.parser import BytesParser
 from typing import Any, Sequence
+from unittest import mock
 
 import httpx
 from supabase import ClientOptions, create_client
 
+import bot as bot_module
 from bot import (
     ADD_HELP,
     BOT_COMMANDS,
@@ -38,6 +40,7 @@ from bot import (
     author_from_members,
     button_command,
     clean_bot_mention,
+    clear_offset,
     commands_report,
     declare_commands,
     demo_rates,
@@ -54,6 +57,7 @@ from bot import (
     PASSWORD_REPLY,
     REGISTER_SELF_HINT,
     repair_webhook_mode,
+    retry_after_seconds,
     set_commands_mode,
     set_webhook_mode,
     show_webhook_info,
@@ -67,6 +71,7 @@ from bot import (
 from config import (
     ConfigError,
     KEY_HEADER_MODES,
+    MAX_REPLY_DELAY,
     Settings,
     describe_supabase_key,
     jwt_role,
@@ -1595,6 +1600,19 @@ class MentionHelperTests(unittest.TestCase):
             load_settings({"WATCH_DEBT_MESSAGES": "no"}, use_env_file=False).watch_debt_messages)
         self.assertTrue(
             load_settings({"WATCH_DEBT_MESSAGES": "да"}, use_env_file=False).watch_debt_messages)
+        # Пауза перед ответом: по умолчанию нет, значение ограничено сверху (0–30 с).
+        self.assertEqual(load_settings({}, use_env_file=False).reply_delay, 0.0)
+        self.assertEqual(
+            load_settings({"REPLY_DELAY_SECONDS": "5"}, use_env_file=False).reply_delay, 5.0)
+        self.assertEqual(
+            load_settings({"REPLY_DELAY_SECONDS": "5,5"}, use_env_file=False).reply_delay, 5.5)
+        self.assertEqual(
+            load_settings({"REPLY_DELAY_SECONDS": "999"}, use_env_file=False).reply_delay,
+            MAX_REPLY_DELAY)
+        self.assertEqual(
+            load_settings({"REPLY_DELAY_SECONDS": "мусор"}, use_env_file=False).reply_delay, 0.0)
+        self.assertEqual(
+            load_settings({"REPLY_DELAY_SECONDS": "-3"}, use_env_file=False).reply_delay, 0.0)
         self.assertEqual(load_settings({"BOT_USERNAME": "@my_bot"}, use_env_file=False).bot_username,
                          "my_bot")
 
@@ -6157,6 +6175,66 @@ class SendRobustnessTests(unittest.TestCase):
         bot.process_update(make_chat_update(11, "/status", chat=7, chat_type="private"))
         self.assertIn("последний ответ в чат не ушёл", telegram.sent[-1][1])
         self.assertIn("Forbidden", telegram.sent[-1][1])
+
+    def test_retry_after_is_waited_and_reply_arrives(self) -> None:
+        """Лимит Telegram: «retry after 2» — бот ждёт указанное время и повторяет отправку."""
+        telegram = FlakyTelegram([], failures=1,
+                                 error="Too Many Requests: retry after 2")
+        bot, storage = self.build(telegram)
+        with mock.patch.object(bot_module.time, "sleep") as sleep:
+            self.watch(bot, "Леша должен Диме 3 рубля")
+        sleep.assert_called_once_with(2.0)
+        self.assertEqual(len(storage.list_debts(GROUP)), 1)
+        assert_saved_debt(self, telegram.sent[0][1])
+
+    def test_reply_delay_is_applied_before_answer(self) -> None:
+        """REPLY_DELAY_SECONDS: пауза перед ответом — запись уже сделана, ответ после паузы."""
+        telegram = FakeTelegram([])
+        bot, storage = self.build(telegram, reply_delay=5)
+        with mock.patch.object(bot_module.time, "sleep") as sleep:
+            self.watch(bot, "Леша должен Диме 3 рубля")
+        sleep.assert_called_once_with(5.0)
+        self.assertEqual(len(storage.list_debts(GROUP)), 1)
+        assert_saved_debt(self, telegram.sent[0][1])
+
+    def test_delay_is_off_by_default(self) -> None:
+        """Без REPLY_DELAY_SECONDS бот не спит: пауза по умолчанию нулевая."""
+        telegram = FakeTelegram([])
+        bot, storage = self.build(telegram)
+        with mock.patch.object(bot_module.time, "sleep") as sleep:
+            self.watch(bot, "Леша должен Диме 3 рубля")
+        sleep.assert_not_called()
+        self.assertEqual(len(telegram.sent), 1)
+
+    def test_retry_after_parsing(self) -> None:
+        """«retry after N» разбирается и ограничивается сверху, чужие ошибки — None."""
+        self.assertEqual(retry_after_seconds(TelegramError("Too Many Requests: retry after 7")),
+                         7.0)
+        self.assertEqual(retry_after_seconds(TelegramError("retry after 999")), MAX_REPLY_DELAY)
+        self.assertIsNone(retry_after_seconds(TelegramError("Forbidden: bot was kicked")))
+
+
+class OffsetResetTests(unittest.TestCase):
+    """Смещение апдейтов: если оно «убежало» вперёд, бот молчит — сбрасываем."""
+
+    def test_clear_offset_lets_new_updates_through(self) -> None:
+        """После сброса апдейт с меньшим id снова обрабатывается, а не считается повтором."""
+        storage = InMemoryStorage(default_currency="BYN")
+        seed_chat(storage, chat=GROUP)
+        telegram = FakeTelegram([])
+        bot = DebtBot(Settings(default_currency="BYN"), storage, HeuristicParser(), telegram)
+        storage.set_state("last_update_id", "999999")
+        bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля", user=101,
+                                            username="clever_hazel66", first_name="Леша"))
+        self.assertEqual(telegram.sent, [])                      # молчит: считает повтором
+        self.assertEqual(storage.list_debts(GROUP), [])
+
+        self.assertTrue(clear_offset(storage))
+        self.assertEqual(storage.get_state("last_update_id"), "0")
+        bot.process_update(make_chat_update(10, "Леша должен Диме 3 рубля", user=101,
+                                            username="clever_hazel66", first_name="Леша"))
+        self.assertEqual(len(storage.list_debts(GROUP)), 1)      # теперь записал
+        assert_saved_debt(self, telegram.sent[-1][1])
 
 
 if __name__ == "__main__":

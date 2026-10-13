@@ -58,6 +58,9 @@ DEFAULT_KEY_HEADER = "apikey"
 # Обычная вставка (новый долг) не повторяется никогда: повтор создал бы вторую запись.
 DEFAULT_SUPABASE_RETRIES = 2
 MAX_SUPABASE_RETRIES = 10
+# Верхняя граница паузы перед ответом (REPLY_DELAY_SECONDS): больше ставить нельзя —
+# на serverless-хостинге функция не успеет ответить и её убьют уже после записи в базу.
+MAX_REPLY_DELAY = 30.0
 
 # Ключ доступа бота к базе. Новый формат — secret-ключ Supabase (sb_secret_…):
 # Project Settings → API Keys → «Publishable and secret API keys» → Secret keys.
@@ -132,6 +135,9 @@ class Settings:
     # «кто кому сколько и в какой валюте» — записываем как обычную запись, не
     # разобралось — бот молчит. WATCH_DEBT_MESSAGES=0 выключает этот режим.
     watch_debt_messages: bool = True
+    # Пауза перед ответом в чат, секунды (REPLY_DELAY_SECONDS). По умолчанию её нет:
+    # на serverless-хостинге пауза съедает время функции, и ответ может не уйти.
+    reply_delay: float = 0.0
     bot_username: str = ""
     # Ежемесячный отчёт на почту (Gmail API): кому отправлять и доступы OAuth-приложения.
     report_email: str = ""
@@ -316,6 +322,25 @@ def _parse_hour(raw: str, default: int) -> int:
     except ValueError:
         return default
     return hour if 0 <= hour <= 23 else default
+
+
+def _parse_delay(raw: str, default: float) -> float:
+    """Пауза перед ответом в секундах: 0–MAX_REPLY_DELAY (мусор — значение по умолчанию).
+
+    Пауза нужна редко (например, чтобы не ловить лимиты Telegram на быстрых ответах),
+    поэтому по умолчанию её нет, а сверху значение ограничено: слишком большая задержка
+    на serverless-хостинге означает, что функцию убьют до отправки ответа.
+    """
+    text = _clean(raw).replace(",", ".")
+    if not text:
+        return default
+    try:
+        delay = float(text)
+    except ValueError:
+        return default
+    if delay < 0:
+        return default
+    return min(delay, MAX_REPLY_DELAY)
 
 
 def _parse_retries(raw: str, default: int) -> int:
@@ -509,6 +534,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_env_file: bool = 
         cron_secret=get("CRON_SECRET"),
         require_mention=_parse_bool(get("REQUIRE_MENTION"), True),
         watch_debt_messages=_parse_bool(get("WATCH_DEBT_MESSAGES"), True),
+        reply_delay=_parse_delay(get("REPLY_DELAY_SECONDS"), 0.0),
         bot_username=get("BOT_USERNAME").lstrip("@"),
         report_email=get("REPORT_EMAIL"),
         gmail_client_id=get("GMAIL_CLIENT_ID"),

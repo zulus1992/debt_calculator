@@ -58,6 +58,7 @@ from typing import Any, Mapping, Sequence
 from config import (
     ConfigError,
     DEFAULT_RATES_HOUR,
+    MAX_REPLY_DELAY,
     Settings,
     describe_supabase_key,
     load_settings,
@@ -157,6 +158,22 @@ LAST_UPDATE_ID_KEY = "last_update_id"
 # иначе выглядит как молчание бота. Ключ состояния общий для всех чатов: причина почти всегда
 # одна и та же (нет прав, бот заблокирован, лимит), и увидеть её можно из любого чата.
 SEND_PROBLEM_KEY = "last_send_error"
+# Telegram при лимитах отвечает «Too Many Requests: retry after N» — столько секунд он
+# просит подождать. Это самая частая причина пропавших ответов при быстрых сообщениях,
+# поэтому такую ошибку бот ждёт и повторяет отправку, а не теряет ответ.
+RETRY_AFTER_RE = re.compile(r"retry after\s+(\d+)", re.IGNORECASE)
+
+
+def retry_after_seconds(exc: Exception) -> float | None:
+    """Сколько секунд просит подождать Telegram («retry after N»); None — не просит.
+
+    Значение ограничено MAX_REPLY_DELAY: ждать больше нельзя — на serverless-хостинге
+    функцию убьют по таймауту, и ответ всё равно не уйдёт.
+    """
+    match = RETRY_AFTER_RE.search(str(exc))
+    if not match:
+        return None
+    return min(float(match.group(1)), MAX_REPLY_DELAY)
 # Что делать с чатом, куда бота добавили: без пароля (CHAT_PASSWORD) он не работает.
 ADDED_REPLY = (
     "👋 Привет! Я калькулятор долгов: «Леша должен Диме 3 рубля», возвраты, общие счета "
@@ -1891,6 +1908,7 @@ class DebtBot:
             reply = "⚠️ Внутренняя ошибка, попробуйте ещё раз."
         logger.info("Сообщение %s обработано за %.2f с", message.get("message_id"),
                     time.monotonic() - started)
+        self._pause_before_reply()
         self._send_reply(chat_id, reply, message)
 
     def _watch_candidate(self, text: str, chat_id: int, user_id: Any) -> bool:
@@ -2061,6 +2079,7 @@ class DebtBot:
         except Exception as exc:  # noqa: BLE001 — бот не должен падать из-за одного нажатия
             logger.exception("Ошибка обработки нажатия кнопки: %s", exc)
             reply = "⚠️ Внутренняя ошибка, попробуйте ещё раз."
+        self._pause_before_reply()
         self._send_reply(chat_id, reply, {})
 
     def _answer_callback(self, query_id: str, text: str = "") -> None:
@@ -2093,17 +2112,37 @@ class DebtBot:
              "reply_markup": inline_commands() if buttons else None},
             {"reply_to": None, "reply_markup": None},          # повтор «проще»
         ]
+        last: Exception | None = None
         for index, attempt in enumerate(tries):
-            try:
-                self._telegram.send_message(chat_id, text, **attempt)
-                if index:
-                    logger.warning("Ответ ушёл только со второй попытки (без кнопок и «ответа»).")
-                return True
-            except TelegramError as exc:
-                logger.error("sendMessage%s: %s", " (повтор)" if index else "", exc)
-                last = exc
+            for repeat in range(2):        # второй заход — после просьбы «retry after N»
+                try:
+                    self._telegram.send_message(chat_id, text, **attempt)
+                    if index or repeat:
+                        logger.warning("Ответ ушёл только со второй попытки.")
+                    return True
+                except TelegramError as exc:
+                    last = exc
+                    logger.error("sendMessage%s: %s", " (повтор)" if index else "", exc)
+                wait = retry_after_seconds(last)
+                if wait is None or repeat:
+                    break                                   # ждать не просят или уже ждали
+                logger.warning("Telegram просит подождать %.0f с — жду и повторяю.", wait)
+                time.sleep(wait)
         self._remember_send_problem(chat_id, last)
         return False
+
+    def _pause_before_reply(self) -> None:
+        """Пауза перед ответом (REPLY_DELAY_SECONDS) — по умолчанию её нет.
+
+        Задержка нужна редко: чтобы не ловить лимиты Telegram, когда бот отвечает очень
+        быстро и подряд. Ставить её на serverless не стоит: пауза съедает время функции
+        (Vercel, PythonAnywhere), и ответ может не уйти вовсе.
+        """
+        delay = float(self._settings.reply_delay or 0.0)
+        if delay <= 0:
+            return
+        logger.info("Пауза перед ответом: %.1f с (REPLY_DELAY_SECONDS).", delay)
+        time.sleep(min(delay, MAX_REPLY_DELAY))
 
     def _remember_send_problem(self, chat_id: Any, exc: Exception) -> None:
         """Запоминает, что ответ не ушёл: причину покажет /status в любом чате.
@@ -2453,6 +2492,9 @@ def check_services(settings: Settings) -> bool:
                   "«/debts@...» или ответ на моё сообщение")
         else:
             print("• REQUIRE_MENTION=0 — в группах отвечаю на любое сообщение")
+        if settings.reply_delay:
+            print(f"• Пауза перед ответом: {settings.reply_delay:.1f} с "
+                  "(REPLY_DELAY_SECONDS) — на serverless-хостинге это съедает время функции")
         info = telegram.get_webhook_info()
         url = str(info.get("url") or "")
         if url:
@@ -2502,6 +2544,13 @@ def check_services(settings: Settings) -> bool:
         rate_points = storage.rates_since(settings.rates_base, date.today().isoformat())
         print(f"✓ Supabase: таблица {settings.rates_table} доступна "
               f"(курсов на сегодня: {len(rate_points)})")
+        offset = storage.get_state(LAST_UPDATE_ID_KEY)
+        print(f"• Смещение апдейтов (bot_state.{LAST_UPDATE_ID_KEY}): {offset or 'не задано'}")
+        if offset and str(offset) not in ("0", "None"):
+            print("  если бот молчит на все сообщения — сбросьте его: python bot.py --reset-offset")
+        send_problem = str(storage.get_state(SEND_PROBLEM_KEY) or "").strip()
+        if send_problem:
+            print(f"  ⚠ последний ответ в чат не ушёл — {send_problem}")
         write_problem = storage.check_write_access()
         if write_problem:
             ok = False
@@ -2656,6 +2705,36 @@ def demo_rates(storage: InMemoryStorage, today: str) -> None:
     ])
 
 
+def clear_offset(storage: Storage) -> bool:
+    """Сбрасывает сохранённое смещение апдейтов (bot_state.last_update_id).
+
+    Смещение — это «докуда я всё прочитал». Если оно оказалось впереди реальных update_id
+    (сменился токен бота, база приехала из другого проекта, старый бот шумел апдейтами),
+    бот молчит на всё: и long polling, и вебхук считают апдейты уже обработанными.
+    Сброс возвращает к «читай всё, что придёт».
+    """
+    try:
+        storage.set_state(LAST_UPDATE_ID_KEY, "0")
+        return True
+    except StorageError as exc:
+        logger.error("Не удалось сбросить смещение апдейтов: %s", exc)
+        return False
+
+
+def reset_offset_mode(settings: Settings) -> int:
+    """Команда --reset-offset: сбрасывает смещение и объясняет, что это было."""
+    storage = _storage_for(settings)
+    before = storage.get_state(LAST_UPDATE_ID_KEY)
+    if not clear_offset(storage):
+        print("✗ Не удалось сбросить смещение — смотрите лог и права базы.")
+        return 1
+    print(f"✓ Смещение апдейтов сброшено (было: {before or 'не задано'}).")
+    print("  Теперь и long polling, и вебхук читают все новые сообщения.")
+    print("  Если сообщения не приходят и после этого — смотрите /status и "
+          "python bot.py --webhook-info.")
+    return 0
+
+
 def configure_stdout() -> None:
     """Переключает вывод в UTF-8: иначе консоль Windows (cp1252/cp866) падает на русском тексте."""
     for stream in (sys.stdout, sys.stderr):
@@ -2718,6 +2797,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="вместе с --set-webhook/--delete-webhook: выбросить накопившиеся апдейты",
     )
+    parser.add_argument(
+        "--reset-offset",
+        action="store_true",
+        help="сбросить сохранённое смещение апдейтов, если бот молчит на все сообщения",
+    )
     return parser
 
 
@@ -2744,6 +2828,13 @@ def main(argv: list[str] | None = None) -> int:
         return show_webhook_info(settings)
     if args.set_commands:
         return set_commands_mode(settings)
+    if args.reset_offset:
+        try:
+            require_settings(settings)
+        except ConfigError as exc:
+            print(f"Ошибка: {exc}", file=sys.stderr)
+            return 1
+        return reset_offset_mode(settings)
 
     try:
         require_settings(settings)
