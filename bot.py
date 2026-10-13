@@ -154,13 +154,9 @@ UNKNOWN_REPLY = (
 )
 DENIED_REPLY = "⛔ Извините, этот бот настроен только для определённых пользователей."
 LAST_UPDATE_ID_KEY = "last_update_id"
-# Что показать в /status, если ответ бота не дошёл в чат: «запись сделана, а подтверждения нет»
-# иначе выглядит как молчание бота. Ключ состояния общий для всех чатов: причина почти всегда
-# одна и та же (нет прав, бот заблокирован, лимит), и увидеть её можно из любого чата.
-SEND_PROBLEM_KEY = "last_send_error"
 # Telegram при лимитах отвечает «Too Many Requests: retry after N» — столько секунд он
-# просит подождать. Это самая частая причина пропавших ответов при быстрых сообщениях,
-# поэтому такую ошибку бот ждёт и повторяет отправку, а не теряет ответ.
+# просит подождать. Такую ошибку бот ждёт и повторяет отправку: это значит, что сообщение
+# не дошло, поэтому повтор безопасен (в отличие от прочих ошибок отправки).
 RETRY_AFTER_RE = re.compile(r"retry after\s+(\d+)", re.IGNORECASE)
 
 
@@ -174,6 +170,8 @@ def retry_after_seconds(exc: Exception) -> float | None:
     if not match:
         return None
     return min(float(match.group(1)), MAX_REPLY_DELAY)
+
+
 # Что делать с чатом, куда бота добавили: без пароля (CHAT_PASSWORD) он не работает.
 ADDED_REPLY = (
     "👋 Привет! Я калькулятор долгов: «Леша должен Диме 3 рубля», возвраты, общие счета "
@@ -778,20 +776,6 @@ def open_report(chat_id: int, storage: Storage, settings: Settings,
     return _with_registration_tip("\n".join(lines), author)
 
 
-def _send_problem(storage: Storage) -> str:
-    """Что записано о последнем неотправленном ответе (пусто — проблем не было).
-
-    Ответ может не дойти, а запись при этом остаться: чат закрыт, бот заблокирован, нет прав
-    писать. Раньше это было видно только в логах хостинга; теперь причина попадает в /status
-    (в тот чат, где бот отвечает), и становится понятно, почему подтверждение не пришло.
-    """
-    try:
-        return str(storage.get_state(SEND_PROBLEM_KEY) or "").strip()
-    except StorageError as exc:
-        logger.debug("Не удалось прочитать последнюю проблему отправки: %s", exc)
-        return ""
-
-
 def status_report(chat_id: int, storage: Storage, settings: Settings,
                   chat_currency: str = "BYN") -> str:
     """Команда /status: что настроено и отвечают ли сервисы — диагностика прямо в чате.
@@ -854,10 +838,6 @@ def status_report(chat_id: int, storage: Storage, settings: Settings,
                  else "• сообщения про долги без обращения: не трогаю")
     lines.append("• пароль чата: задан — этот чат его подтвердил" if settings.password_required
                  else "• пароль чата: не задан")
-    send_problem = _send_problem(storage)
-    if send_problem:
-        lines.append(f"• ⚠️ последний ответ в чат не ушёл — {send_problem}")
-        lines.append("  Записи при этом сохраняются: проверьте, что бот может писать в тот чат.")
     lines.append("")
     lines.append("Проверить все сервисы из консоли: python bot.py --check")
     return "\n".join(lines)
@@ -1879,22 +1859,19 @@ class DebtBot:
 
         prepared: ParsedMessage | None = None
         phrase_reply: str | ChatReply | None = None
-        # «Печатает» отправляем до всякой работы и без права уронить обработку: ответ важнее
-        # индикатора, а записи в этом блоке уже могут появиться.
-        self._send_typing(chat_id)
-        started = time.monotonic()
+        if watched:
+            # Сначала фразы «вернул всё Леше» и «вернул все долги»: в них не названа сумма,
+            # поэтому ИИ не приведёт их к формату «кто кому сколько», — а суммы уже лежат
+            # в записях, и закрыть долги можно тем же кодом, что и по обращению.
+            phrase_reply = self._watch_paid_all(text, int(chat_id), members, author)
+            if phrase_reply is None:
+                prepared = self._parse_watched(text, int(chat_id), members, author)
+                if prepared is None:
+                    logger.info("Сообщение %s похоже на долг, но разбор не удался — молчу.",
+                                message.get("message_id"))
+                    return
+        self._telegram.send_typing(chat_id)
         try:
-            if watched:
-                # Сначала фразы «вернул всё Леше» и «вернул все долги»: в них не названа сумма,
-                # поэтому ИИ не приведёт их к формату «кто кому сколько», — а суммы уже лежат
-                # в записях, и закрыть долги можно тем же кодом, что и по обращению.
-                phrase_reply = self._watch_paid_all(text, int(chat_id), members, author)
-                if phrase_reply is None:
-                    prepared = self._parse_watched(text, int(chat_id), members, author)
-                    if prepared is None:
-                        logger.info("Сообщение %s похоже на долг, но разбор не удался — молчу.",
-                                    message.get("message_id"))
-                        return
             reply = phrase_reply if phrase_reply is not None else handle_text(
                 text, int(chat_id),
                 storage=self._storage, parser=self._parser, settings=self._settings,
@@ -1906,8 +1883,6 @@ class DebtBot:
         except Exception as exc:  # noqa: BLE001 — бот не должен падать из-за одного сообщения
             logger.exception("Ошибка обработки сообщения: %s", exc)
             reply = "⚠️ Внутренняя ошибка, попробуйте ещё раз."
-        logger.info("Сообщение %s обработано за %.2f с", message.get("message_id"),
-                    time.monotonic() - started)
         self._pause_before_reply()
         self._send_reply(chat_id, reply, message)
 
@@ -2064,7 +2039,7 @@ class DebtBot:
             return
 
         self._answer_callback(query_id)
-        self._send_typing(chat_id)
+        self._telegram.send_typing(chat_id)
         author = member_from_telegram(int(chat_id), user)
         members = self._remember_author(author)
         try:
@@ -2096,40 +2071,34 @@ class DebtBot:
             logger.debug("Клиент Telegram не умеет answerCallbackQuery — пропускаю.")
 
     def _send(self, chat_id: Any, text: str, message: Mapping[str, Any],
-              buttons: bool = False) -> bool:
-        """Отправляет ответ, логируя проблемы доставки. True — сообщение ушло.
+              buttons: bool = False) -> None:
+        """Отправляет ответ, логируя проблемы доставки.
 
         `buttons=True` добавляет под сообщением кнопки команд чата (CHAT_BUTTONS):
         после отчёта или записи долга человеку есть что нажать, не набирая команду руками.
 
-        Если Telegram отклонил сообщение (лимиты, кнопки, права в чате), пробуем ещё раз
-        «проще»: без кнопок и без ответа на исходное сообщение. Это важно, потому что запись
-        к этому моменту уже сделана: без повтора человек видел бы «долг записан, а ответа нет».
-        Когда не помогло и это, запоминаем причину — её показывает /status.
+        Повторяем отправку только тогда, когда Telegram явно просит подождать
+        («Too Many Requests: retry after N»): это значит, что сообщение точно не дошло.
+        Прочие ошибки только логируем — повторять их опасно, потому что сообщение могло уже
+        дойти, и человек получил бы два ответа.
         """
-        tries: list[dict[str, Any]] = [
-            {"reply_to": message.get("message_id"),
-             "reply_markup": inline_commands() if buttons else None},
-            {"reply_to": None, "reply_markup": None},          # повтор «проще»
-        ]
-        last: Exception | None = None
-        for index, attempt in enumerate(tries):
-            for repeat in range(2):        # второй заход — после просьбы «retry after N»
-                try:
-                    self._telegram.send_message(chat_id, text, **attempt)
-                    if index or repeat:
-                        logger.warning("Ответ ушёл только со второй попытки.")
-                    return True
-                except TelegramError as exc:
-                    last = exc
-                    logger.error("sendMessage%s: %s", " (повтор)" if index else "", exc)
-                wait = retry_after_seconds(last)
-                if wait is None or repeat:
-                    break                                   # ждать не просят или уже ждали
+        payload: dict[str, Any] = {
+            "reply_to": message.get("message_id"),
+            "reply_markup": inline_commands() if buttons else None,
+        }
+        for attempt in range(2):
+            try:
+                self._telegram.send_message(chat_id, text, **payload)
+                if attempt:
+                    logger.warning("Ответ ушёл со второй попытки (ждали лимит Telegram).")
+                return
+            except TelegramError as exc:
+                logger.error("sendMessage%s: %s", " (повтор)" if attempt else "", exc)
+                wait = retry_after_seconds(exc)
+                if wait is None:
+                    return
                 logger.warning("Telegram просит подождать %.0f с — жду и повторяю.", wait)
                 time.sleep(wait)
-        self._remember_send_problem(chat_id, last)
-        return False
 
     def _pause_before_reply(self) -> None:
         """Пауза перед ответом (REPLY_DELAY_SECONDS) — по умолчанию её нет.
@@ -2143,31 +2112,6 @@ class DebtBot:
             return
         logger.info("Пауза перед ответом: %.1f с (REPLY_DELAY_SECONDS).", delay)
         time.sleep(min(delay, MAX_REPLY_DELAY))
-
-    def _remember_send_problem(self, chat_id: Any, exc: Exception) -> None:
-        """Запоминает, что ответ не ушёл: причину покажет /status в любом чате.
-
-        Иначе неотправленное подтверждение выглядит просто как молчание бота, и причину
-        (бот заблокирован, нет прав писать, лимиты) приходится искать в логах хостинга.
-        """
-        try:
-            self._storage.set_state(SEND_PROBLEM_KEY, f"чат {chat_id}: {exc}"[:200])
-        except StorageError as exc_state:  # база недоступна — уже логируем сам сбой отправки
-            logger.debug("Не удалось запомнить проблему отправки: %s", exc_state)
-
-    def _send_typing(self, chat_id: Any) -> None:
-        """Показывает «печатает» и никогда не мешает ответу.
-
-        Индикатор — украшение: если Telegram на него ругнулся (лимит, нет прав), сообщение
-        всё равно нужно обработать и ответить. Раньше сбой здесь прерывал обработку, и ответ
-        не уходил — как раз «запись есть, а подтверждения нет».
-        """
-        try:
-            self._telegram.send_typing(chat_id)
-        except TelegramError as exc:
-            logger.debug("sendChatAction: %s", exc)
-        except Exception as exc:  # noqa: BLE001 — подменённый клиент без send_typing
-            logger.debug("Индикатор «печатает» не отправился: %s", exc)
 
     def _send_reply(self, chat_id: Any, reply: str | CsvReport,
                     message: Mapping[str, Any]) -> None:
@@ -2548,9 +2492,6 @@ def check_services(settings: Settings) -> bool:
         print(f"• Смещение апдейтов (bot_state.{LAST_UPDATE_ID_KEY}): {offset or 'не задано'}")
         if offset and str(offset) not in ("0", "None"):
             print("  если бот молчит на все сообщения — сбросьте его: python bot.py --reset-offset")
-        send_problem = str(storage.get_state(SEND_PROBLEM_KEY) or "").strip()
-        if send_problem:
-            print(f"  ⚠ последний ответ в чат не ушёл — {send_problem}")
         write_problem = storage.check_write_access()
         if write_problem:
             ok = False

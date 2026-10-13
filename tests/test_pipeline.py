@@ -6082,46 +6082,26 @@ class WatchHelperTests(unittest.TestCase):
 
 
 class FlakyTelegram(FakeTelegram):
-    """Подменяет Telegram: первые отправки (или отправки в указанные чаты) падают.
-
-    Нужен, чтобы проверить поведение при сбое доставки: запись уже сделана, а сообщение
-    с подтверждением Telegram отклонил (кнопки, права в чате, лимиты).
-    """
+    """Подменяет Telegram: первые отправки падают, как это делает реальный Bot API."""
 
     def __init__(self, updates: list[dict], *, failures: int = 0,
-                 fail_chats: set[int] | None = None, typing_fails: bool = False,
                  error: str = "Bad Request: BUTTON_TYPE_INVALID") -> None:
         super().__init__(updates)
         self._failures = failures
-        self._fail_chats = set(fail_chats or set())
-        self._typing_fails = typing_fails
         self._error = error
 
     def send_message(self, chat_id, text: str, *, reply_to=None, silent: bool = False,
                      reply_markup: Any = None) -> list[dict]:
-        """Сначала отвечает ошибкой, как это делает Telegram, потом ведёт себя как обычно."""
+        """Сначала отвечает ошибкой, потом ведёт себя как обычный Telegram."""
         if self._failures > 0:
             self._failures -= 1
-            raise TelegramError(self._error)
-        if int(chat_id) in self._fail_chats:
             raise TelegramError(self._error)
         return super().send_message(chat_id, text, reply_to=reply_to, silent=silent,
                                     reply_markup=reply_markup)
 
-    def send_typing(self, chat_id) -> None:
-        """Индикатор «печатает» тоже может падать — ответ из-за этого теряться не должен."""
-        if self._typing_fails:
-            raise TelegramError("Forbidden: bot was blocked by the user")
-        super().send_typing(chat_id)
 
-
-class SendRobustnessTests(unittest.TestCase):
-    """Ответ должен дойти, даже если Telegram отклонил первую попытку отправки.
-
-    «Сообщение внесено, а подтверждения нет» — ровно про это: запись уже в базе, а сообщение
-    с ответом отклонено (кнопки, права, лимит). Второй попыткой — без кнопок и без «ответа»
-    на исходное сообщение — бот досылает ответ, а если не вышло, причина попадает в /status.
-    """
+class ReplyDeliveryTests(unittest.TestCase):
+    """Доставка ответа: пауза перед отправкой и ожидание лимитов Telegram."""
 
     def build(self, telegram: FakeTelegram, **settings_kwargs):
         """Бот с готовым Telegram-двойником и зарегистрированными участниками чата."""
@@ -6134,47 +6114,6 @@ class SendRobustnessTests(unittest.TestCase):
         """Сообщение от Леши в группе без обращения к боту (режим наблюдения)."""
         bot.process_update(make_chat_update(10, text, user=101, username="clever_hazel66",
                                             first_name="Леша"))
-
-    def test_reply_is_retried_without_buttons(self) -> None:
-        """Первая отправка падает — бот повторяет без кнопок и без reply, ответ доходит."""
-        telegram = FlakyTelegram([], failures=1)
-        bot, storage = self.build(telegram)
-        self.watch(bot, "Леша должен Диме 3 рубля")
-        self.assertEqual(len(storage.list_debts(GROUP)), 1)      # запись сделана
-        self.assertEqual(len(telegram.sent), 1)                  # и ответ всё-таки дошёл
-        assert_saved_debt(self, telegram.sent[0][1])
-        self.assertEqual(telegram.markups, [None])               # повтор был без кнопок
-
-    def test_typing_failure_does_not_break_the_record(self) -> None:
-        """«Печатает» упало — запись и подтверждение всё равно делаются."""
-        telegram = FlakyTelegram([], typing_fails=True)
-        bot, storage = self.build(telegram)
-        self.watch(bot, "Леша должен Диме 3 рубля")
-        self.assertEqual(len(storage.list_debts(GROUP)), 1)
-        assert_saved_debt(self, telegram.sent[0][1])
-
-    def test_typing_failure_in_watch_phrase_keeps_the_reply(self) -> None:
-        """Фраза «вернул всё» закрывает долги и отвечает, даже если индикатор не отправился."""
-        telegram = FlakyTelegram([], typing_fails=True)
-        bot, storage = self.build(telegram)
-        storage.add_debt(GROUP, MEMBER_LEHA.display_name, MEMBER_DIMA.display_name, "BYN", 3.0,
-                         from_user_id=MEMBER_LEHA.user_id, to_user_id=MEMBER_DIMA.user_id)
-        self.watch(bot, "я вернул все долги")
-        self.assertIn("Закрыл все долги", telegram.sent[0][1])
-        self.assertEqual(len(storage.list_debts(GROUP)), 2)      # 1 долг + 1 возврат
-        self.assertIsNotNone(telegram.markups[0])                # ответ ушёл с кнопками
-
-    def test_lost_reply_is_reported_in_status(self) -> None:
-        """Не ушло совсем — запись остаётся, а причину показывает /status в другом чате."""
-        telegram = FlakyTelegram([], fail_chats={GROUP}, error="Forbidden: bot was kicked")
-        bot, storage = self.build(telegram)
-        self.watch(bot, "Леша должен Диме 3 рубля")
-        self.assertEqual(len(storage.list_debts(GROUP)), 1)      # запись сделана
-        self.assertEqual(telegram.sent, [])                      # а в группу ничего не ушло
-        self.assertIn("Forbidden", str(storage.get_state("last_send_error")))
-        bot.process_update(make_chat_update(11, "/status", chat=7, chat_type="private"))
-        self.assertIn("последний ответ в чат не ушёл", telegram.sent[-1][1])
-        self.assertIn("Forbidden", telegram.sent[-1][1])
 
     def test_retry_after_is_waited_and_reply_arrives(self) -> None:
         """Лимит Telegram: «retry after 2» — бот ждёт указанное время и повторяет отправку."""
